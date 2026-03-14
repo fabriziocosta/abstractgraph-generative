@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 REPO_NAME = "abstractgraph-generative"
-SIBLING_REPOS = ("abstractgraph", "abstractgraph-ml", "abstractgraph-generative")
+SIBLING_REPOS = ("abstractgraph", "abstractgraph-ml", "abstractgraph-generative", "abstractgraph-graphicalizer")
 
 
 def _is_repo_root(path: Path) -> bool:

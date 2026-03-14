@@ -1,11 +1,16 @@
 # AbstractGraph Ecosystem
 
-The AbstractGraph stack is split across three sibling repositories:
+The AbstractGraph stack is split across four sibling repositories:
 
 - `abstractgraph`
   Path: `/home/fabrizio/work/abstractgraph`
   Role: core representation, operators, XML, hashing, vectorization, display,
-  preprocessing, and graph adapters
+  compatibility shims, and graph adapters
+
+- `abstractgraph-graphicalizer`
+  Path: `/home/fabrizio/work/abstractgraph-graphicalizer`
+  Role: raw-data-to-NetworkX graphicalizers, including attention-driven
+  preimage induction and chemistry conversion/drawing
 
 - `abstractgraph-ml`
   Path: `/home/fabrizio/work/abstractgraph-ml`
@@ -19,6 +24,7 @@ The AbstractGraph stack is split across three sibling repositories:
 Dependency direction:
 
 - `abstractgraph`
+- `abstractgraph-graphicalizer` depends on no sibling repos
 - `abstractgraph-ml` depends on `abstractgraph`
 - `abstractgraph-generative` depends on `abstractgraph` and `abstractgraph-ml`
 
@@ -26,6 +32,7 @@ Editable install order:
 
 ```bash
 python -m pip install -e /home/fabrizio/work/abstractgraph --no-deps
+python -m pip install -e /home/fabrizio/work/abstractgraph-graphicalizer --no-deps
 python -m pip install -e /home/fabrizio/work/abstractgraph-ml --no-deps
 python -m pip install -e /home/fabrizio/work/abstractgraph-generative --no-deps
 ```
