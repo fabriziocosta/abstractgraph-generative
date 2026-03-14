@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install external dependencies
+        run: python -m pip install --upgrade pip networkx numpy scikit-learn matplotlib
+      - name: Install package
+        run: python -m pip install -e . --no-deps
+      - name: Compile package
+        run: python -m py_compile src/abstractgraph_generative/*.py src/abstractgraph_generative/story/*.py src/abstractgraph_generative/legacy/conditional_v0_1/*.py
+      - name: Optional local sibling smoke
+        run: |
+          if [ -d ../abstractgraph ] && [ -d ../abstractgraph-ml ]; then
+            python -m pip install -e ../abstractgraph --no-deps
+            python -m pip install -e ../abstractgraph-ml --no-deps
+            python scripts/smoke_test.py
+          else
+            echo "Skipping import smoke: sibling core/ml repos not present."
+          fi
