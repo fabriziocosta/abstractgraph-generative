@@ -44,6 +44,8 @@ See [ECOSYSTEM.md](ECOSYSTEM.md) for the dependency graph and install order.
 - `notebooks/examples/` contains copied generative workflows updated to the
   split package names.
 - `notebooks/research/` contains exploratory generation notebooks.
+- Example and research notebooks now bootstrap imports and normalize the
+  working directory automatically for the standard three-repo ecosystem layout.
 
 ## Dependencies
 
