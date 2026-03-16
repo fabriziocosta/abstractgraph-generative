@@ -227,7 +227,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
 
         Args:
             state: Materialized state after committing the branch.
-            node: Expanded image node.
+            node: Expanded interpretation node.
             candidate: Candidate assignment committed for ``node``.
 
         Returns:

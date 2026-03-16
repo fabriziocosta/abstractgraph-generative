@@ -162,11 +162,11 @@ def generate_pruning_sequences(
             method returning vector embeddings per graph.
         use_context_embedding: If True and context_vectorizer is provided,
             compute and store context embeddings in the cut index.
-        association_aware: If True, remove image-node associations while only
-            deleting preimage nodes after their last association is removed.
-            This uses a fixed image graph derived from the initial graph (or
+        association_aware: If True, remove interpretation-node mapped subgraphs while only
+            deleting base-graph nodes after their last mapped subgraph is removed.
+            This uses a fixed interpretation graph derived from the initial graph (or
             the provided `fixed_interpretation_graph`) and does not recompute
-            associations after each step.
+            mapped subgraphs after each step.
         fixed_interpretation_graph: Optional fixed interpretation graph to use
             when association_aware=True. If None, it is built from the initial
             graph using the decomposition_function and nbits.
@@ -183,7 +183,7 @@ def generate_pruning_sequences(
 
     Returns:
         List of NetworkX graphs, strictly non-increasing in size; each successive
-        element is the result of removing an entire association subgraph. If
+        element is the result of removing an entire mapped subgraph. If
         return_cut_index=True, returns a tuple (sequence, cut_index). If the
         input already has `<= min_nodes_for_pruning` nodes, the sequence contains the starting
         graph only (if include_start=True), else is empty.
@@ -279,8 +279,8 @@ def generate_pruning_sequences(
             if not removed:
                 break
     else:
-        # Association-aware pruning: only delete preimage nodes after their last
-        # association is removed; keep the image graph fixed.
+        # Association-aware pruning: only delete base-graph nodes after their last
+        # mapped subgraph is removed; keep the interpretation graph fixed.
         if fixed_interpretation_graph is None:
             ag0 = graph_to_abstract_graph(
                 g,
@@ -390,7 +390,7 @@ class AutoregressiveGraphGenerator(object):
 
         At each step, the generator samples a cut size and cut nodes in the
         current graph, looks up matching donor cuts, and rewrites the graph by
-        inserting a donor association. Feasibility filtering and optional
+        inserting a donor mapped subgraph. Feasibility filtering and optional
         context/similarity scoring select the next graph before the loop
         repeats until the target size or restart/backtrack limits are reached.
 
@@ -592,7 +592,7 @@ class AutoregressiveGraphGenerator(object):
 
         Strategy
             For each training graph, generate a decreasing sequence of subgraphs
-            using image-node association pruning down to `min_nodes_for_pruning`. Concatenate
+            using interpretation-node mapped-subgraph pruning down to `min_nodes_for_pruning`. Concatenate
             all sequences to form the donor pool, then fit the feasibility
             estimator on this pool.
 

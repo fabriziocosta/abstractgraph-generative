@@ -537,33 +537,33 @@ class ConditionalAutoregressiveGenerator:
                 return False
         return True
 
-    def _image_node_type(self, image_graph: nx.Graph, node) -> int:
-        """Compute image-node hash under image cut radius.
+    def _interpretation_node_type(self, interpretation_graph: nx.Graph, node) -> int:
+        """Compute interpretation-node hash under interpretation cut radius.
 
         Args:
-            image_graph: Target image graph.
-            node: Image-node id.
+            interpretation_graph: Target interpretation graph.
+            node: Interpretation-node id.
 
         Returns:
-            int: Image context hash bucket.
+            int: Interpretation context hash bucket.
         """
         return hash_graph(
-            extract_ball(image_graph, node, self.interpretation_cut_radius),
+            extract_ball(interpretation_graph, node, self.interpretation_cut_radius),
             nbits=_GRAPH_HASH_NBITS,
         )
 
-    def _image_node_order_key(
+    def _interpretation_node_order_key(
         self,
-        image_graph: nx.Graph,
+        interpretation_graph: nx.Graph,
         node,
         *,
         target_signatures: Optional[dict] = None,
     ) -> tuple:
-        """Build a structural ordering key for an image node.
+        """Build a structural ordering key for an interpretation node.
 
         Args:
-            image_graph: Image graph containing ``node``.
-            node: Image-node id.
+            interpretation_graph: Interpretation graph containing ``node``.
+            node: Interpretation-node id.
             target_signatures: Optional cached ``(img_type, degree)`` signatures.
 
         Returns:
@@ -573,23 +573,23 @@ class ConditionalAutoregressiveGenerator:
             target_signatures.get(node)
             if target_signatures is not None
             else (
-                self._image_node_type(image_graph, node),
-                int(image_graph.degree(node)),
+                self._interpretation_node_type(interpretation_graph, node),
+                int(interpretation_graph.degree(node)),
             )
         )
         refine_radius = max(int(self.interpretation_cut_radius) + 1, 1)
         refine_hash = hash_graph(
-            extract_ball(image_graph, node, refine_radius),
+            extract_ball(interpretation_graph, node, refine_radius),
             nbits=_GRAPH_HASH_NBITS,
         )
         return (sig[0], sig[1], int(refine_hash))
 
-    def _preimage_node_order_key(self, graph: nx.Graph, node) -> tuple:
-        """Build a structural ordering key for a preimage node.
+    def _base_node_order_key(self, graph: nx.Graph, node) -> tuple:
+        """Build a structural ordering key for a base-graph node.
 
         Args:
-            graph: Preimage graph containing ``node``.
-            node: Preimage node id.
+            graph: Base graph containing ``node``.
+            node: Base-graph node id.
 
         Returns:
             tuple: Structural key independent of concrete node ids.
@@ -625,14 +625,14 @@ class ConditionalAutoregressiveGenerator:
             if anchor_type is None
             else int(anchor_type)
         )
-        return (anchor_type, *self._preimage_node_order_key(graph, node))
+        return (anchor_type, *self._base_node_order_key(graph, node))
 
     def _build_component_instance(self, ag: AbstractGraph, image_node, comp_id: int) -> ComponentInstance:
         """Build one component instance from an interpretation-node occurrence.
 
         Args:
             ag: Source AbstractGraph.
-            image_node: Image-node id.
+            image_node: Interpretation-node id.
             comp_id: Unique component id.
 
         Returns:
@@ -644,7 +644,7 @@ class ConditionalAutoregressiveGenerator:
         if not isinstance(mapped_subgraph_u, nx.Graph):
             mapped_subgraph_u = nx.Graph()
 
-        global_nodes = sorted(list(mapped_subgraph_u.nodes()), key=lambda n: self._preimage_node_order_key(base_graph, n))
+        global_nodes = sorted(list(mapped_subgraph_u.nodes()), key=lambda n: self._base_node_order_key(base_graph, n))
         global_to_local = {g: i for i, g in enumerate(global_nodes)}
         local_subgraph = nx.relabel_nodes(mapped_subgraph_u, global_to_local, copy=True)
 
@@ -672,17 +672,17 @@ class ConditionalAutoregressiveGenerator:
                 aligned_pairs,
                 key=lambda pair: (
                     int(pair[1]),
-                    self._preimage_node_order_key(local_subgraph, pair[0]),
+                    self._base_node_order_key(local_subgraph, pair[0]),
                 ),
             )
             anchor_local_nodes = tuple(local_n for local_n, _ in aligned_pairs)
             anchor_types = tuple(anchor_t for _, anchor_t in aligned_pairs)
             anchor_order_keys = tuple(
-                self._preimage_node_order_key(local_subgraph, local_n)
+                self._base_node_order_key(local_subgraph, local_n)
                 for local_n in anchor_local_nodes
             )
             port_key = (
-                self._image_node_order_key(interpretation_graph, neighbor),
+                self._interpretation_node_order_key(interpretation_graph, neighbor),
                 tuple(sorted(int(t) for t in anchor_types)),
                 tuple(anchor_order_keys),
             )
@@ -710,7 +710,7 @@ class ConditionalAutoregressiveGenerator:
 
         return ComponentInstance(
             comp_id=int(comp_id),
-            img_type=self._image_node_type(interpretation_graph, image_node),
+            img_type=self._interpretation_node_type(interpretation_graph, image_node),
             deg=int(interpretation_graph.degree(image_node)),
             subgraph=local_subgraph,
             ports=ports,
@@ -720,7 +720,7 @@ class ConditionalAutoregressiveGenerator:
         """Fit components and retrieval indexes from training graphs.
 
         Args:
-            graphs: Training preimage graphs.
+            graphs: Training base graphs.
             **_: Ignored compatibility kwargs from previous versions.
 
         Returns:
@@ -749,13 +749,13 @@ class ConditionalAutoregressiveGenerator:
         skipped_missing_anchor_components = 0
 
         comp_id = 0
-        image_pool: list[nx.Graph] = []
+        interpretation_pool: list[nx.Graph] = []
         for ag in abstract_graphs:
-            image_pool.append(ag.interpretation_graph.copy())
+            interpretation_pool.append(ag.interpretation_graph.copy())
             for image_node in ag.interpretation_graph.nodes():
                 comp = self._build_component_instance(ag, image_node, comp_id)
                 if comp.deg > 0 and any(len(port.anchor_types) == 0 for port in comp.ports):
-                    # Enforce decomposition invariant: image-edge interfaces should
+                    # Enforce decomposition invariant: interpretation-edge interfaces should
                     # expose at least one anchor.
                     skipped_missing_anchor_components += 1
                     comp_id += 1
@@ -782,7 +782,7 @@ class ConditionalAutoregressiveGenerator:
         self._bucket = bucket
         self._inv = inv
         self._inv_freq = inv_freq
-        self._interpretation_graph_pool = image_pool
+        self._interpretation_graph_pool = interpretation_pool
         self._fit_skipped_missing_anchor_components = int(skipped_missing_anchor_components)
         self._is_fitted = True
 
@@ -791,32 +791,32 @@ class ConditionalAutoregressiveGenerator:
 
         return self
 
-    def _compute_target_signatures(self, image_graph: nx.Graph) -> dict:
-        """Precompute retrieval signatures for a target image graph.
+    def _compute_target_signatures(self, interpretation_graph: nx.Graph) -> dict:
+        """Precompute retrieval signatures for a target interpretation graph.
 
         Args:
-            image_graph: Target image graph.
+            interpretation_graph: Target interpretation graph.
 
         Returns:
             dict: Mapping image-node -> (img_type, degree).
         """
         out = {}
-        for node in image_graph.nodes():
+        for node in interpretation_graph.nodes():
             out[node] = (
-                self._image_node_type(image_graph, node),
-                int(image_graph.degree(node)),
+                self._interpretation_node_type(interpretation_graph, node),
+                int(interpretation_graph.degree(node)),
             )
         return out
 
     def _select_next_node(self, state: _GenerationState, rng: random.Random):
-        """Pick next image node by fail-first frontier heuristic.
+        """Pick next interpretation node by fail-first frontier heuristic.
 
         Args:
             state: Current generation state.
             rng: Random number generator.
 
         Returns:
-            object: Selected target image node.
+            object: Selected target interpretation node.
         """
         unassigned = [u for u in state.target_image.nodes() if not state.assigned.get(u, False)]
         if not unassigned:
@@ -872,7 +872,7 @@ class ConditionalAutoregressiveGenerator:
             candidate_key = (
                 int(bucket_size),
                 -int(degree),
-                self._image_node_order_key(
+                self._interpretation_node_order_key(
                     state.target_image,
                     node,
                     target_signatures=state.target_signatures,
@@ -892,7 +892,7 @@ class ConditionalAutoregressiveGenerator:
 
         Args:
             state: Current generation state.
-            node: Target image node.
+            node: Target interpretation node.
 
         Returns:
             list[_BoundaryRequirement]: Boundary constraints.
@@ -1177,11 +1177,11 @@ class ConditionalAutoregressiveGenerator:
         node,
         rng: random.Random,
     ) -> tuple[list[_BoundaryRequirement], list[_CandidateAssignment]]:
-        """Retrieve feasible candidate components for a target image node.
+        """Retrieve feasible candidate components for a target interpretation node.
 
         Args:
             state: Current generation state.
-            node: Target image node.
+            node: Target interpretation node.
             rng: Random number generator.
 
         Returns:
@@ -1341,7 +1341,7 @@ class ConditionalAutoregressiveGenerator:
             nbr
             for nbr in sorted(
                 list(state.target_image.neighbors(node)),
-                key=lambda nbr: self._image_node_order_key(
+                key=lambda nbr: self._interpretation_node_order_key(
                     state.target_image,
                     nbr,
                     target_signatures=state.target_signatures,
@@ -1407,7 +1407,7 @@ class ConditionalAutoregressiveGenerator:
 
         Args:
             state: Mutable generation state.
-            node: Target image node.
+            node: Target interpretation node.
             requirements: Boundary requirements for this node.
             candidate: Candidate assignment to commit.
 
@@ -1463,7 +1463,7 @@ class ConditionalAutoregressiveGenerator:
             nbr
             for nbr in sorted(
                 list(state.target_image.neighbors(node)),
-                key=lambda nbr: self._image_node_order_key(
+                key=lambda nbr: self._interpretation_node_order_key(
                     state.target_image,
                     nbr,
                     target_signatures=state.target_signatures,
@@ -1887,7 +1887,7 @@ class ConditionalAutoregressiveGenerator:
                     unseen_count = 0
                     for node in target_local.nodes():
                         sig = (
-                            self._image_node_type(target_local, node),
+                            self._interpretation_node_type(target_local, node),
                             int(target_local.degree(node)),
                         )
                         if sig not in self._bucket:

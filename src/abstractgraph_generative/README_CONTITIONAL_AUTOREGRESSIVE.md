@@ -498,7 +498,7 @@ This creates a practical limitation:
 
 - if two anchors are close enough that each anchor's hash context depends on the
   other being already present,
-- and the required context radius is controlled by `preimage_cut_radius`,
+- and the required context radius is controlled by `base_cut_radius`,
 - then one anchor may fail to match because the other one has not yet been
   materialized.
 
@@ -509,11 +509,11 @@ generator can face a circular dependency:
 - anchor `b` needs anchor `a` for the same reason.
 
 The backtracking search can sometimes work around this by choosing a different
-component ordering, but not always. As `preimage_cut_radius` increases, this
+component ordering, but not always. As `base_cut_radius` increases, this
 kind of dependency becomes more common because anchor compatibility becomes more
 context-sensitive.
 
-This is why larger `preimage_cut_radius` values may improve local specificity
+This is why larger `base_cut_radius` values may improve local specificity
 but also make generation more brittle.
 
 ### Local Compatibility Does Not Guarantee Global Validity
