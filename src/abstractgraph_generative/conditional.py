@@ -1,13 +1,13 @@
 """Simplified conditional autoregressive generator.
 
-`ConditionalAutoregressiveGenerator` learns reusable preimage components from
-training graphs, then assembles new graphs by conditioning on target image
-graphs and matching boundary anchors with backtracking.
+`ConditionalAutoregressiveGenerator` learns reusable base-graph components
+from training graphs, then assembles new graphs by conditioning on target
+interpretation graphs and matching boundary anchors with backtracking.
 
-At fit time, each image node occurrence is converted into a `ComponentInstance`
-with:
-- a local preimage subgraph,
-- one `Port` per incident image edge,
+At fit time, each interpretation-node occurrence is converted into a
+`ComponentInstance` with:
+- a local mapped base subgraph,
+- one `Port` per incident interpretation edge,
 - anchor hashes (`anchor_types`) aligned with local anchor nodes.
 
 The fitted model builds two retrieval structures:
@@ -16,7 +16,7 @@ The fitted model builds two retrieval structures:
   to prune candidates quickly from partial boundary constraints.
 
 At generation time, the solver repeatedly:
-1. selects a frontier image node,
+1. selects a frontier interpretation node,
 2. builds requirements from already-assigned neighbors,
 3. retrieves and matches candidate components with injective port assignment,
 4. commits one candidate by materializing and unifying anchors,
@@ -29,14 +29,14 @@ missing anchors, or non-contracting unifications reject the current branch.
 Detailed execution model
 ------------------------
 Training decomposition:
-- Each training graph is converted to an `AbstractGraph` with a preimage graph
-  and an image graph.
-- For every image node, the associated preimage subgraph becomes one component
-  template (`ComponentInstance`).
-- For each incident image edge, the shared preimage nodes define a port
+- Each training graph is converted to an `AbstractGraph` with a base graph
+  and an interpretation graph.
+- For every interpretation node, the mapped base subgraph becomes one
+  component template (`ComponentInstance`).
+- For each incident interpretation edge, the shared base nodes define a port
   boundary (`Port.anchor_local_nodes`) and aligned anchor hashes
   (`Port.anchor_types`).
-- Components that violate the decomposition invariant (image edge with no
+- Components that violate the decomposition invariant (interpretation edge with no
   anchors) are rejected during fitting.
 
 Retrieval and pruning:
@@ -99,7 +99,7 @@ from typing import Optional, Sequence
 
 import networkx as nx
 
-from abstractgraph.graphs import AbstractGraph, graph_to_abstract_graph
+from abstractgraph.graphs import AbstractGraph, get_mapped_subgraph, graph_to_abstract_graph
 from abstractgraph.hashing import hash_graph
 from abstractgraph_generative.rewrite import (
     anchor_type_current,
@@ -129,14 +129,14 @@ class Port:
 
 @dataclass(frozen=True)
 class ComponentInstance:
-    """Swappable unit extracted from one image-node occurrence.
+    """Swappable unit extracted from one interpretation-node occurrence.
 
     Args:
         comp_id: Unique component id.
-        img_type: Image-neighborhood hash bucket.
-        deg: Image-node degree.
-        subgraph: Local preimage component graph.
-        ports: Port definitions for all incident image edges.
+        img_type: Interpretation-neighborhood hash bucket.
+        deg: Interpretation-node degree.
+        subgraph: Local mapped base-graph component.
+        ports: Port definitions for all incident interpretation edges.
     """
 
     comp_id: int
@@ -151,7 +151,7 @@ class _BoundaryRequirement:
     """Boundary constraints induced by already assigned neighbors.
 
     Args:
-        neighbor: Assigned neighbor image node.
+        neighbor: Assigned neighbor interpretation node.
         global_nodes: Current materialized boundary nodes.
         global_node_types: Anchor types aligned with ``global_nodes``.
         global_order_keys: Structural ordering keys aligned with ``global_nodes``.
@@ -183,16 +183,16 @@ class _CandidateAssignment:
 
 @dataclass
 class _GenerationState:
-    """Mutable generation state for one target image graph.
+    """Mutable generation state for one target interpretation graph.
 
     Args:
-        target_image: Target image graph.
-        target_signatures: Node signatures with image hashes and degrees.
-        graph: Current materialized preimage graph.
-        assigned: Assigned flags per target image node.
-        comp_of: Selected component id per target image node.
-        node_maps: Local-to-global mapping per assigned image node.
-        edge_bindings: Boundary payload per image edge. Each entry stores:
+        target_image: Target interpretation graph.
+        target_signatures: Node signatures with interpretation hashes and degrees.
+        graph: Current materialized base graph.
+        assigned: Assigned flags per target interpretation node.
+        comp_of: Selected component id per target interpretation node.
+        node_maps: Local-to-global mapping per assigned interpretation node.
+        edge_bindings: Boundary payload per interpretation edge. Each entry stores:
             - ``global_nodes``: boundary global node ids
             - ``required_types``: stable anchor-type multiset for matching
     """
@@ -210,6 +210,35 @@ _WORKER_GENERATOR: Optional["ConditionalAutoregressiveGenerator"] = None
 _GRAPH_HASH_NBITS = 19
 
 
+def _warn_deprecated_name(old_name: str, new_name: str) -> None:
+    warnings.warn(
+        f"`{old_name}` is deprecated and will be removed in a future release; use `{new_name}` instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _resolve_alias(
+    *,
+    canonical_name: str,
+    canonical_value,
+    deprecated_name: str,
+    deprecated_value,
+    default,
+):
+    if canonical_value is not None and deprecated_value is not None and canonical_value != deprecated_value:
+        raise ValueError(
+            f"Conflicting values provided for `{canonical_name}` and deprecated alias "
+            f"`{deprecated_name}`."
+        )
+    if canonical_value is not None:
+        return canonical_value
+    if deprecated_value is not None:
+        _warn_deprecated_name(deprecated_name, canonical_name)
+        return deprecated_value
+    return default
+
+
 def _init_generate_worker(generator: "ConditionalAutoregressiveGenerator") -> None:
     """Initialize per-process generator snapshot for sample generation."""
     global _WORKER_GENERATOR
@@ -217,7 +246,7 @@ def _init_generate_worker(generator: "ConditionalAutoregressiveGenerator") -> No
 
 
 def _generate_one_worker(
-    target_image_graph: nx.Graph,
+    target_interpretation_graph: nx.Graph,
     seed: int,
     max_backtracks: int,
 ) -> tuple[Optional[nx.Graph], dict]:
@@ -227,7 +256,7 @@ def _generate_one_worker(
     rng = random.Random(int(seed))
     attempt_trace: dict = {}
     generated = _WORKER_GENERATOR._generate_one(
-        target_image_graph,
+        target_interpretation_graph,
         rng,
         max_backtracks=int(max_backtracks),
         attempt_trace=attempt_trace,
@@ -244,8 +273,10 @@ class ConditionalAutoregressiveGenerator:
         decomposition_function,
         nbits: int,
         feasibility_estimator=None,
-        preimage_cut_radius: int = 1,
-        image_cut_radius: int = 1,
+        base_cut_radius: Optional[int] = None,
+        interpretation_cut_radius: Optional[int] = None,
+        preimage_cut_radius: Optional[int] = None,
+        image_cut_radius: Optional[int] = None,
         n_jobs: int = -1,
         debug: bool = False,
         debug_level: int = 1,
@@ -254,10 +285,12 @@ class ConditionalAutoregressiveGenerator:
 
         Args:
             decomposition_function: Decomposition function for AbstractGraph conversion.
-            nbits: Hash bit width for hashing preimage and image neighborhoods.
+            nbits: Hash bit width for hashing base and interpretation neighborhoods.
             feasibility_estimator: Optional final-graph feasibility estimator.
-            preimage_cut_radius: Radius for anchor neighborhood hashes.
-            image_cut_radius: Radius for image-node neighborhood hashes.
+            base_cut_radius: Canonical radius for anchor neighborhood hashes.
+            interpretation_cut_radius: Canonical radius for interpretation-node neighborhood hashes.
+            preimage_cut_radius: Deprecated alias for ``base_cut_radius``.
+            image_cut_radius: Deprecated alias for ``interpretation_cut_radius``.
             n_jobs: Reserved for API compatibility.
             debug: If True, print generation diagnostics.
             debug_level: Debug verbosity level.
@@ -275,8 +308,24 @@ class ConditionalAutoregressiveGenerator:
         self.decomposition_function = decomposition_function
         self.nbits = int(nbits)
         self.feasibility_estimator = feasibility_estimator
-        self.preimage_cut_radius = int(preimage_cut_radius)
-        self.image_cut_radius = int(image_cut_radius)
+        self._base_cut_radius = int(
+            _resolve_alias(
+                canonical_name="base_cut_radius",
+                canonical_value=base_cut_radius,
+                deprecated_name="preimage_cut_radius",
+                deprecated_value=preimage_cut_radius,
+                default=1,
+            )
+        )
+        self._interpretation_cut_radius = int(
+            _resolve_alias(
+                canonical_name="interpretation_cut_radius",
+                canonical_value=interpretation_cut_radius,
+                deprecated_name="image_cut_radius",
+                deprecated_value=image_cut_radius,
+                default=1,
+            )
+        )
         self.n_jobs = int(n_jobs)
         requested_debug_level = max(0, int(debug_level))
         self.debug = bool(debug) or requested_debug_level > 0
@@ -290,12 +339,66 @@ class ConditionalAutoregressiveGenerator:
         self._bucket: dict[tuple[int, int], list[int]] = {}
         self._inv: dict[tuple[int, int, int, int], set[int]] = {}
         self._inv_freq: dict[tuple[int, int, int, int], int] = {}
-        self._image_graph_pool: list[nx.Graph] = []
+        self._interpretation_graph_pool: list[nx.Graph] = []
         self._is_fitted: bool = False
         self._zero_generation_streak: int = 0
         self._missing_anchor_sentinel = -1
         self._max_future_port_assignment_branches = 24
         self._fit_skipped_missing_anchor_components: int = 0
+
+    @property
+    def base_cut_radius(self) -> int:
+        return self._base_cut_radius
+
+    @base_cut_radius.setter
+    def base_cut_radius(self, value: int) -> None:
+        self._base_cut_radius = int(value)
+
+    @property
+    def interpretation_cut_radius(self) -> int:
+        return self._interpretation_cut_radius
+
+    @interpretation_cut_radius.setter
+    def interpretation_cut_radius(self, value: int) -> None:
+        self._interpretation_cut_radius = int(value)
+
+    @property
+    def preimage_cut_radius(self) -> int:
+        _warn_deprecated_name("preimage_cut_radius", "base_cut_radius")
+        return self._base_cut_radius
+
+    @preimage_cut_radius.setter
+    def preimage_cut_radius(self, value: int) -> None:
+        _warn_deprecated_name("preimage_cut_radius", "base_cut_radius")
+        self._base_cut_radius = int(value)
+
+    @property
+    def image_cut_radius(self) -> int:
+        _warn_deprecated_name("image_cut_radius", "interpretation_cut_radius")
+        return self._interpretation_cut_radius
+
+    @image_cut_radius.setter
+    def image_cut_radius(self, value: int) -> None:
+        _warn_deprecated_name("image_cut_radius", "interpretation_cut_radius")
+        self._interpretation_cut_radius = int(value)
+
+    @property
+    def interpretation_graph_pool(self) -> list[nx.Graph]:
+        return self._interpretation_graph_pool
+
+    @interpretation_graph_pool.setter
+    def interpretation_graph_pool(self, value: list[nx.Graph]) -> None:
+        self._interpretation_graph_pool = value
+
+    @property
+    def image_graph_pool(self) -> list[nx.Graph]:
+        _warn_deprecated_name("image_graph_pool", "interpretation_graph_pool")
+        return self._interpretation_graph_pool
+
+    @image_graph_pool.setter
+    def image_graph_pool(self, value: list[nx.Graph]) -> None:
+        _warn_deprecated_name("image_graph_pool", "interpretation_graph_pool")
+        self._interpretation_graph_pool = value
 
     def _dbg(self, level: int, event: str, **fields) -> None:
         """Emit one structured debug line when enabled at requested level.
@@ -383,7 +486,7 @@ class ConditionalAutoregressiveGenerator:
             bucket_keys=len(self._bucket),
             inv_keys=len(self._inv),
             inv_freq_keys=len(self._inv_freq),
-            image_pool=len(self._image_graph_pool),
+            image_pool=len(self._interpretation_graph_pool),
             skipped_missing_anchor_components=self._fit_skipped_missing_anchor_components,
         )
         self._dbg(
@@ -445,7 +548,7 @@ class ConditionalAutoregressiveGenerator:
             int: Image context hash bucket.
         """
         return hash_graph(
-            extract_ball(image_graph, node, self.image_cut_radius),
+            extract_ball(image_graph, node, self.interpretation_cut_radius),
             nbits=_GRAPH_HASH_NBITS,
         )
 
@@ -474,7 +577,7 @@ class ConditionalAutoregressiveGenerator:
                 int(image_graph.degree(node)),
             )
         )
-        refine_radius = max(int(self.image_cut_radius) + 1, 1)
+        refine_radius = max(int(self.interpretation_cut_radius) + 1, 1)
         refine_hash = hash_graph(
             extract_ball(image_graph, node, refine_radius),
             nbits=_GRAPH_HASH_NBITS,
@@ -492,11 +595,11 @@ class ConditionalAutoregressiveGenerator:
             tuple: Structural key independent of concrete node ids.
         """
         near_hash = hash_graph(
-            extract_ball(graph, node, max(int(self.preimage_cut_radius), 0)),
+            extract_ball(graph, node, max(int(self.base_cut_radius), 0)),
             nbits=_GRAPH_HASH_NBITS,
         )
         refine_hash = hash_graph(
-            extract_ball(graph, node, max(int(self.preimage_cut_radius) + 1, 1)),
+            extract_ball(graph, node, max(int(self.base_cut_radius) + 1, 1)),
             nbits=_GRAPH_HASH_NBITS,
         )
         return (int(near_hash), int(refine_hash), int(graph.degree(node)))
@@ -518,14 +621,14 @@ class ConditionalAutoregressiveGenerator:
             tuple: Structural key aligned with anchor matching.
         """
         anchor_type = (
-            int(anchor_type_current(graph, node, self.preimage_cut_radius, nbits=self.nbits))
+            int(anchor_type_current(graph, node, self.base_cut_radius, nbits=self.nbits))
             if anchor_type is None
             else int(anchor_type)
         )
         return (anchor_type, *self._preimage_node_order_key(graph, node))
 
     def _build_component_instance(self, ag: AbstractGraph, image_node, comp_id: int) -> ComponentInstance:
-        """Build one component instance from an image-node occurrence.
+        """Build one component instance from an interpretation-node occurrence.
 
         Args:
             ag: Source AbstractGraph.
@@ -535,22 +638,22 @@ class ConditionalAutoregressiveGenerator:
         Returns:
             ComponentInstance: Extracted component payload.
         """
-        image_graph = ag.image_graph
-        preimage_graph = ag.preimage_graph
-        assoc_u = image_graph.nodes[image_node].get("association")
-        if not isinstance(assoc_u, nx.Graph):
-            assoc_u = nx.Graph()
+        interpretation_graph = ag.interpretation_graph
+        base_graph = ag.base_graph
+        mapped_subgraph_u = get_mapped_subgraph(interpretation_graph.nodes[image_node])
+        if not isinstance(mapped_subgraph_u, nx.Graph):
+            mapped_subgraph_u = nx.Graph()
 
-        global_nodes = sorted(list(assoc_u.nodes()), key=lambda n: self._preimage_node_order_key(preimage_graph, n))
+        global_nodes = sorted(list(mapped_subgraph_u.nodes()), key=lambda n: self._preimage_node_order_key(base_graph, n))
         global_to_local = {g: i for i, g in enumerate(global_nodes)}
-        local_subgraph = nx.relabel_nodes(assoc_u, global_to_local, copy=True)
+        local_subgraph = nx.relabel_nodes(mapped_subgraph_u, global_to_local, copy=True)
 
         ports_with_keys: list[tuple[tuple, Port]] = []
-        for neighbor in image_graph.neighbors(image_node):
-            assoc_v = image_graph.nodes[neighbor].get("association")
-            if not isinstance(assoc_v, nx.Graph):
-                assoc_v = nx.Graph()
-            shared_global = [n for n in global_nodes if n in assoc_v]
+        for neighbor in interpretation_graph.neighbors(image_node):
+            mapped_subgraph_v = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
+            if not isinstance(mapped_subgraph_v, nx.Graph):
+                mapped_subgraph_v = nx.Graph()
+            shared_global = [n for n in global_nodes if n in mapped_subgraph_v]
             # Build local ids and types from the same traversal to guarantee
             # one-to-one alignment between anchor_local_nodes and anchor_types.
             aligned_pairs: list[tuple[object, int]] = []
@@ -558,9 +661,9 @@ class ConditionalAutoregressiveGenerator:
                 local_n = global_to_local[n]
                 anchor_t = int(
                     anchor_type_train(
-                        preimage_graph,
+                        base_graph,
                         n,
-                        self.preimage_cut_radius,
+                        self.base_cut_radius,
                         nbits=self.nbits,
                     )
                 )
@@ -579,7 +682,7 @@ class ConditionalAutoregressiveGenerator:
                 for local_n in anchor_local_nodes
             )
             port_key = (
-                self._image_node_order_key(image_graph, neighbor),
+                self._image_node_order_key(interpretation_graph, neighbor),
                 tuple(sorted(int(t) for t in anchor_types)),
                 tuple(anchor_order_keys),
             )
@@ -607,8 +710,8 @@ class ConditionalAutoregressiveGenerator:
 
         return ComponentInstance(
             comp_id=int(comp_id),
-            img_type=self._image_node_type(image_graph, image_node),
-            deg=int(image_graph.degree(image_node)),
+            img_type=self._image_node_type(interpretation_graph, image_node),
+            deg=int(interpretation_graph.degree(image_node)),
             subgraph=local_subgraph,
             ports=ports,
         )
@@ -648,8 +751,8 @@ class ConditionalAutoregressiveGenerator:
         comp_id = 0
         image_pool: list[nx.Graph] = []
         for ag in abstract_graphs:
-            image_pool.append(ag.image_graph.copy())
-            for image_node in ag.image_graph.nodes():
+            image_pool.append(ag.interpretation_graph.copy())
+            for image_node in ag.interpretation_graph.nodes():
                 comp = self._build_component_instance(ag, image_node, comp_id)
                 if comp.deg > 0 and any(len(port.anchor_types) == 0 for port in comp.ports):
                     # Enforce decomposition invariant: image-edge interfaces should
@@ -679,7 +782,7 @@ class ConditionalAutoregressiveGenerator:
         self._bucket = bucket
         self._inv = inv
         self._inv_freq = inv_freq
-        self._image_graph_pool = image_pool
+        self._interpretation_graph_pool = image_pool
         self._fit_skipped_missing_anchor_components = int(skipped_missing_anchor_components)
         self._is_fitted = True
 
@@ -887,7 +990,7 @@ class ConditionalAutoregressiveGenerator:
                                 anchor_type_current(
                                     state.graph,
                                     g,
-                                    self.preimage_cut_radius,
+                                    self.base_cut_radius,
                                     nbits=self.nbits,
                                 )
                             )
@@ -1606,16 +1709,16 @@ class ConditionalAutoregressiveGenerator:
 
     def _generate_one(
         self,
-        target_image_graph: nx.Graph,
+        target_interpretation_graph: nx.Graph,
         rng: random.Random,
         *,
         max_backtracks: int,
         attempt_trace: Optional[dict] = None,
     ) -> Optional[nx.Graph]:
-        """Generate one graph from a fixed target image graph.
+        """Generate one graph from a fixed target interpretation graph.
 
         Args:
-            target_image_graph: Target image graph.
+            target_interpretation_graph: Target interpretation graph.
             rng: Random number generator.
             max_backtracks: Maximum backtracking attempts.
             attempt_trace: Optional mutable dictionary updated with attempt diagnostics.
@@ -1623,10 +1726,10 @@ class ConditionalAutoregressiveGenerator:
         Returns:
             Optional[nx.Graph]: Generated graph when successful.
         """
-        assigned = {node: False for node in target_image_graph.nodes()}
+        assigned = {node: False for node in target_interpretation_graph.nodes()}
         state = _GenerationState(
-            target_image=target_image_graph,
-            target_signatures=self._compute_target_signatures(target_image_graph),
+            target_image=target_interpretation_graph,
+            target_signatures=self._compute_target_signatures(target_interpretation_graph),
             graph=nx.Graph(),
             assigned=assigned,
             comp_of={},
@@ -1699,6 +1802,7 @@ class ConditionalAutoregressiveGenerator:
         self,
         n_samples: int = 1,
         *,
+        interpretation_graphs: Optional[Sequence[nx.Graph]] = None,
         image_graphs: Optional[Sequence[nx.Graph]] = None,
         random_state: Optional[int] = None,
         max_backtracks: int = 5000,
@@ -1708,11 +1812,12 @@ class ConditionalAutoregressiveGenerator:
         progress_every_seconds: float = 10.0,
         parallel_queue_factor: int = 4,
     ) -> list[nx.Graph]:
-        """Generate new preimage graphs by component assembly and backtracking.
+        """Generate new base graphs by component assembly and backtracking.
 
         Args:
             n_samples: Number of graphs to generate.
-            image_graphs: Optional explicit pool of target image graphs.
+            interpretation_graphs: Optional explicit pool of target interpretation graphs.
+            image_graphs: Deprecated alias for ``interpretation_graphs``.
             random_state: Optional deterministic seed.
             max_backtracks: Maximum backtracking branches per sample.
             max_attempts_per_sample: Max retries with different targets per sample.
@@ -1735,7 +1840,18 @@ class ConditionalAutoregressiveGenerator:
         if n_samples <= 0:
             return []
 
-        pool = list(image_graphs) if image_graphs is not None else list(self._image_graph_pool)
+        resolved_interpretation_graphs = _resolve_alias(
+            canonical_name="interpretation_graphs",
+            canonical_value=interpretation_graphs,
+            deprecated_name="image_graphs",
+            deprecated_value=image_graphs,
+            default=None,
+        )
+        pool = (
+            list(resolved_interpretation_graphs)
+            if resolved_interpretation_graphs is not None
+            else list(self._interpretation_graph_pool)
+        )
         if not pool:
             return []
 
@@ -2063,12 +2179,12 @@ class ConditionalAutoregressiveGenerator:
             self._zero_generation_streak = 0
         else:
             self._zero_generation_streak += 1
-            if self.preimage_cut_radius > 0 and self._zero_generation_streak >= 2:
+            if self.base_cut_radius > 0 and self._zero_generation_streak >= 2:
                 warnings.warn(
                     "ConditionalAutoregressiveGenerator.generate returned 0 samples "
                     f"for {self._zero_generation_streak} consecutive calls with "
-                    f"preimage_cut_radius={self.preimage_cut_radius}. This may be "
-                    "over-constraining anchor matching. Consider preimage_cut_radius=0 "
+                    f"base_cut_radius={self.base_cut_radius}. This may be "
+                    "over-constraining anchor matching. Consider base_cut_radius=0 "
                     "or larger generator sets / attempt budgets.",
                     RuntimeWarning,
                 )

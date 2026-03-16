@@ -2,16 +2,16 @@
 Graph rewriting utilities for AbstractGraph.
 
 Overview
-- AbstractGraph represents a graph at two levels: an image graph (coarse) and a
-  preimage graph (fine). Each image node carries an "association" subgraph from
-  the preimage.
-- Rewiring "swaps" an association subgraph in a source graph with a compatible
-  association taken from donor graphs, reconnecting the boundary so structure is
-  preserved.
+- AbstractGraph represents a graph at two levels: an interpretation graph
+  (coarse) and a base graph (fine). Each interpretation node carries a
+  mapped-subgraph payload from the base graph.
+- Rewiring "swaps" a mapped subgraph in a source graph with a compatible
+  mapped subgraph taken from donor graphs, reconnecting the boundary so
+  structure is preserved.
 
 Compatibility via cut signatures
-- For any association, we compute its boundary cut: all edges crossing from the
-  association's inner nodes to the rest of the preimage graph.
+- For any mapped subgraph, we compute its boundary cut: all edges crossing from the
+  mapped subgraph's inner nodes to the rest of the base graph.
 - Each boundary edge is mapped to a per-edge context key that encodes enough
   local information to ensure compatibility:
   - If `cut_radius is None`: key = (edge_label_hash,) or () when
@@ -24,7 +24,7 @@ Compatibility via cut signatures
     - cut_scope="outer": key = (edge_label_hash, outer_hash)
     - cut_scope="both": key = (edge_label_hash, inner_hash, outer_hash)
 - The cut signature is the order-independent multiset of these per-edge keys
-  (represented as a sorted tuple). Two associations are compatible iff their
+  (represented as a sorted tuple). Two mapped subgraphs are compatible iff their
   cut signatures are identical. This ensures that, for each key, the number of
   boundary edges and their local contexts match.
 
@@ -37,23 +37,23 @@ Context-aware selection (optional)
 Rewrite algorithm (rewrite)
 1) Build/cached AGs: Construct AbstractGraph for source and donors (via the
    provided `decomposition_function` and `nbits`) or reuse cached AGs.
-2) Index donors: For every donor association, compute its cut signature and a
-   map from per-edge keys to the list of inner endpoints (with edge attrs) that
-   can accept a boundary edge of that key. Also store the association hash for
-   no-op checks.
-3) Index source: For every source association, compute its cut signature and a
+2) Index donors: For every donor mapped subgraph, compute its cut signature and
+   a map from per-edge keys to the list of inner endpoints (with edge attrs)
+   that can accept a boundary edge of that key. Also store the
+   mapped-subgraph hash for no-op checks.
+3) Index source: For every source mapped subgraph, compute its cut signature and a
    map from per-edge keys to the list of (outer_endpoint, edge_attr) boundary
-   edges that must be reconnected when this association is replaced.
+   edges that must be reconnected when this mapped subgraph is replaced.
 4) Match: Intersect source and donor indices by cut signature. For each matching
    signature, pair each source candidate with all donor candidates whose
-   association hash differs (to avoid swapping an association with an identical
+   mapped-subgraph hash differs (to avoid swapping a mapped subgraph with an identical
    copy).
 5) Choose a pair: Randomly pick one (source_assoc, donor_assoc) pair among the
    compatible pairs. The donor and source per-edge key maps guarantee, per key,
    equal cardinality of edges (validated again in replacement).
 6) Replace subgraph:
-   - Remove the source association's inner nodes from a copy of the source.
-- Add donor association nodes/edges, remapping donor node ids to a fresh,
+   - Remove the source mapped subgraph's inner nodes from a copy of the source.
+- Add donor mapped-subgraph nodes/edges, remapping donor node ids to a fresh,
   contiguous integer block to avoid collisions with heterogeneous node ids.
    - For each per-edge key, connect donor inner endpoints to the source outer
      endpoints. If `single_replacement=True`, one random pairing per key is
@@ -85,7 +85,7 @@ Key functions
 See also
 - `cut_radius` and `cut_scope` in `rewrite` for signature semantics.
 - `abstractgraph.graphs` and `abstractgraph.hashing` for label hashing
-  and association hashing used in compatibility and no-op avoidance.
+  and mapped-subgraph hashing used in compatibility and no-op avoidance.
 """
 
 import random
@@ -98,6 +98,7 @@ import networkx as nx
 
 from abstractgraph.graphs import (
     AbstractGraph,
+    get_mapped_subgraph,
     graph_to_abstract_graph,
     graphs_to_abstract_graphs,
 )
@@ -129,13 +130,13 @@ def rewrite(
     replace_with_smaller_or_equal_size: bool = False,
 ) -> Sequence[nx.Graph]:
     """
-    Perform a single random swap on source using image nodes from donors.
+    Perform a single random swap on source using interpretation nodes from donors.
 
     Args:
         source: Input graph to mutate via swaps.
-        donors: Sequence of input graphs providing candidate image nodes.
+        donors: Sequence of input graphs providing candidate interpretation nodes.
         rng: Optional Random instance for deterministic sampling.
-        decomposition_function: AbstractGraph decomposition function to build image nodes.
+        decomposition_function: AbstractGraph decomposition function to build interpretation nodes.
         nbits: Hash bit width used by graph_to_abstract_graph.
         n_samples: Number of rewrites to attempt.
         donor_ags: Optional cached AbstractGraph donors matching the donors sequence.
@@ -173,7 +174,7 @@ def rewrite(
         A list of graphs with swaps applied when possible.
     """
     if decomposition_function is None:
-        raise ValueError("decomposition_function is required to build image nodes.")
+        raise ValueError("decomposition_function is required to build interpretation nodes.")
     rng = rng or random.Random()
     if not donors:
         return [source.copy() for _ in range(n_samples)]
@@ -1329,16 +1330,16 @@ def _build_cut_index(
     cut_index = defaultdict(list)
     use_context = bool(use_context_embedding and context_vectorizer is not None)
     for donor in donors:
-        for node_id, data in donor.image_graph.nodes(data=True):
-            assoc = data.get("association")
+        for node_id, data in donor.interpretation_graph.nodes(data=True):
+            assoc = get_mapped_subgraph(data)
             if assoc is None:
                 continue
             inner_nodes = set(assoc.nodes())
             if not inner_nodes:
                 continue
-            donor_cut = _cut_edges(donor.preimage_graph, inner_nodes)
+            donor_cut = _cut_edges(donor.base_graph, inner_nodes)
             cut_key, donor_edge_map = _cut_signature_and_donor_map(
-                donor.preimage_graph,
+                donor.base_graph,
                 inner_nodes,
                 donor_cut,
                 cut_radius=cut_radius,
@@ -1348,7 +1349,7 @@ def _build_cut_index(
             assoc_hash = hash_graph(assoc)
             if use_context:
                 outer_ctx, inner_ctx = _context_embeddings_for_cut(
-                    donor.preimage_graph,
+                    donor.base_graph,
                     inner_nodes,
                     donor_cut,
                     cut_context_radius=cut_context_radius,
@@ -1389,16 +1390,16 @@ def _build_source_cut_index(
     """
     source_index = defaultdict(list)
     use_context = bool(use_context_embedding and context_vectorizer is not None)
-    for node_id, data in source.image_graph.nodes(data=True):
-        assoc = data.get("association")
+    for node_id, data in source.interpretation_graph.nodes(data=True):
+        assoc = get_mapped_subgraph(data)
         if assoc is None:
             continue
         inner_nodes = set(assoc.nodes())
         if not inner_nodes:
             continue
-        source_cut = _cut_edges(source.preimage_graph, inner_nodes)
+        source_cut = _cut_edges(source.base_graph, inner_nodes)
         cut_key, source_edge_map = _cut_signature_and_source_map(
-            source.preimage_graph,
+            source.base_graph,
             inner_nodes,
             source_cut,
             cut_radius=cut_radius,
@@ -1407,7 +1408,7 @@ def _build_source_cut_index(
         )
         if use_context:
             outer_ctx, inner_ctx = _context_embeddings_for_cut(
-                source.preimage_graph,
+                source.base_graph,
                 inner_nodes,
                 source_cut,
                 cut_context_radius=cut_context_radius,

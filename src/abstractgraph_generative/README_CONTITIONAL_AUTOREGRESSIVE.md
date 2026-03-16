@@ -5,47 +5,54 @@ This note explains the active conditional autoregressive generator implemented i
 - `abstractgraph_generative.conditional`
 - `abstractgraph_generative.conditional_batch`
 
-The goal of the model is to generate a new preimage graph while respecting a
-target image-graph structure learned through `AbstractGraph` decomposition.
+The goal of the model is to generate a new base graph while respecting a
+target interpretation-graph structure learned through `AbstractGraph`
+decomposition.
 
 ## Core Idea
 
 The generator does not create a graph node-by-node from scratch. Instead, it:
 
-1. decomposes training graphs into image nodes and their associated preimage
+1. decomposes training graphs into interpretation nodes and their mapped base
    subgraphs,
-2. stores those associated subgraphs as reusable components,
+2. stores those mapped subgraphs as reusable components,
 3. learns how components connect through shared boundary nodes,
-4. generates a new graph by selecting components that match the target image
-   graph and merging them consistently.
+4. generates a new graph by selecting components that match the target
+   interpretation graph and merging them consistently.
 
-The target image graph acts as a structural scaffold. The generator fills in
-that scaffold with concrete preimage components taken from training examples.
+The target interpretation graph acts as a structural scaffold. The generator
+fills in that scaffold with concrete base-graph components taken from training
+examples.
 
 ## Two Spaces
 
 There are two graph spaces in the design:
 
-- `preimage graph`
+- `base graph`
   The concrete graph we ultimately want to generate.
 
-- `image graph`
-  The abstract graph produced by the decomposition function. Each image node
-  represents a subgraph of the preimage graph through its `association`.
+- `interpretation graph`
+  The structural graph produced by the decomposition function. Each
+  interpretation node represents a subgraph of the base graph through its
+  `mapped_subgraph`.
 
-During training, each image node occurrence becomes one reusable component.
-During generation, the solver chooses one component for each target image node.
+An `AbstractGraph` is the pair of these two objects: the base graph and its
+interpretation graph.
+
+During training, each interpretation-node occurrence becomes one reusable
+component. During generation, the solver chooses one component for each target
+interpretation node.
 
 ## Training Phase
 
 During `fit(graphs)` the generator processes each training graph as follows:
 
 1. Convert the graph into an `AbstractGraph`.
-2. Read its image graph.
-3. For each image node:
-   - extract the associated preimage subgraph,
-   - compute an image-node signature,
-   - record one port for each incident image edge,
+2. Read its interpretation graph.
+3. For each interpretation node:
+   - extract the mapped base subgraph,
+   - compute an interpretation-node signature,
+   - record one port for each incident interpretation edge,
    - hash the boundary anchor types for each port.
 
 The result is a library of `ComponentInstance` objects.
@@ -53,9 +60,9 @@ The result is a library of `ComponentInstance` objects.
 Each component stores:
 
 - `comp_id`: unique component id,
-- `img_type`: hash representing the local image-node context,
-- `deg`: image-node degree,
-- `subgraph`: the reusable preimage fragment,
+- `img_type`: hash representing the local interpretation-node context,
+- `deg`: interpretation-node degree,
+- `subgraph`: the reusable base-graph fragment,
 - `ports`: the exposed interfaces used to connect this component to neighbors.
 
 ## Retrieval Indexes
@@ -68,8 +75,8 @@ The coarse retrieval structure is a bucket keyed by:
 
 - `(img_type, degree)`
 
-This says: for a target image node with a given abstract type and degree, these
-are the candidate components that could fit.
+This says: for a target interpretation node with a given abstract type and
+degree, these are the candidate components that could fit.
 
 ### Inverted Anchor Index
 
@@ -85,12 +92,12 @@ This reduces expensive search over clearly incompatible components.
 
 ## Generation Phase
 
-Generation takes a target image graph and tries to materialize a consistent
-preimage graph.
+Generation takes a target interpretation graph and tries to materialize a
+consistent base graph.
 
 At a high level, the solver repeats:
 
-1. pick a target image node to assign,
+1. pick a target interpretation node to assign,
 2. derive boundary requirements from already-assigned neighbors,
 3. retrieve candidate components from the indexes,
 4. test exact port matching,
@@ -105,7 +112,7 @@ partial graph built so far.
 
 The process is conditional in two senses:
 
-- it is conditioned on a target image graph,
+- it is conditioned on a target interpretation graph,
 - each local choice is conditioned on already committed neighboring structure.
 
 The generator is not sampling arbitrary components independently. It is solving
@@ -132,35 +139,35 @@ The attributed variant adds:
   embedding vectors.
 
 - `preimage_context_radius`
-  The radius used to extract local preimage context around anchor nodes.
+  The radius used to extract local base-graph context around anchor nodes.
 
 - `num_context_rewirings`
   A cap on how many legal rewiring branches are materialized and scored before
   one is sampled.
 
 There is intentionally no `image_context_radius` in this variant. The added
-signal comes only from the preimage-side attributed context.
+signal comes only from the base-graph-side attributed context.
 
 ### Training-Time Context Embeddings
 
 During `fit(graphs)`, after the usual component library has been extracted, the
 generator computes one extra embedding for each component:
 
-1. collect the anchor nodes of that component in the training preimage graph,
+1. collect the anchor nodes of that component in the training base graph,
 2. extract the union of radius-`preimage_context_radius` neighborhoods centered
    on those anchors,
 3. vectorize that union subgraph with `context_vectorizer`,
 4. store the resulting embedding alongside the component id.
 
-So every reusable association now carries not only its structural interface
-(ports and anchor types), but also a summary of the preimage context in which
-it originally appeared.
+So every reusable mapped subgraph now carries not only its structural interface
+(ports and anchor types), but also a summary of the base-graph context in
+which it originally appeared.
 
 ### Generation-Time Context Scoring
 
 At generation time, the solver still:
 
-1. selects the next target image node,
+1. selects the next target interpretation node,
 2. retrieves structurally legal candidate components,
 3. checks exact anchor compatibility.
 
@@ -174,17 +181,17 @@ does the following:
    those anchors in the current partially built graph,
 4. vectorize that partial context,
 5. compute cosine similarity against the stored training-time embedding of the
-   candidate association,
+   candidate mapped subgraph,
 6. convert the similarity into a non-negative sampling weight,
 7. sample one branch with probability proportional to that weight.
 
-If the current partial graph looks more similar to the original context in which
-that association was observed during training, that rewiring is more likely to
-be chosen.
+If the current partial graph looks more similar to the original context in
+which that mapped subgraph was observed during training, that rewiring is more
+likely to be chosen.
 
 ### Why This Helps
 
-The base generator enforces structural compatibility through image-node type,
+The base generator enforces structural compatibility through interpretation-node type,
 degree, and anchor multiset matching. That is necessary, but it can still leave
 multiple legal components that are locally interchangeable from a pure boundary
 point of view.
@@ -192,7 +199,7 @@ point of view.
 The attributed variant adds a softer preference:
 
 - not just "can this component connect here?"
-- but also "does this component appear in a preimage context similar to the one
+- but also "does this component appear in a base-graph context similar to the one
   we have built so far?"
 
 This biases generation toward reusing associations in contexts that resemble
@@ -228,7 +235,7 @@ same port, and inconsistent pairings are rejected.
 
 ### What A Requirement Really Means
 
-Suppose the target image graph contains three image nodes:
+Suppose the target interpretation graph contains three interpretation nodes:
 
 - `X`
 - `Y`
@@ -238,9 +245,9 @@ Assume:
 
 - `X` has already been assigned a component,
 - `Y` has already been assigned a component,
-- `Z` is the next image node we want to materialize.
+- `Z` is the next interpretation node we want to materialize.
 
-Also assume that in the target image graph:
+Also assume that in the target interpretation graph:
 
 - `Z` is connected to `X`,
 - `Z` is connected to `Y`.
@@ -448,7 +455,7 @@ The generator uses a backtracking search.
 Important heuristics:
 
 - `frontier-first`
-  Prefer unassigned image nodes that touch already assigned neighbors.
+  Prefer unassigned interpretation nodes that touch already assigned neighbors.
 
 - `fail-first`
   Prefer nodes with more assigned neighbors and stronger constraints.
@@ -479,7 +486,7 @@ This gives two layers of control:
 ## Limitations
 
 The generator is structurally disciplined, but it is not complete. There are
-important situations where valid-looking target image graphs are still hard or
+important situations where valid-looking target interpretation graphs are still hard or
 impossible to realize.
 
 ### Nearby Anchors Can Create Ordering Deadlocks
@@ -513,8 +520,8 @@ but also make generation more brittle.
 
 The generator makes decisions using mostly local information:
 
-- image-node type,
-- image-node degree,
+- interpretation-node type,
+- interpretation-node degree,
 - boundary anchor-type multisets,
 - local port compatibility.
 
@@ -544,7 +551,7 @@ In practice, this often shows up as:
 The generator does not invent arbitrary new interfaces. It recombines component
 interfaces seen in training.
 
-So even if a target image graph is valid in principle, it may be unrealizable
+So even if a target interpretation graph is valid in principle, it may be unrealizable
 in practice when:
 
 - the needed `(img_type, degree)` bucket is sparse,
@@ -562,22 +569,22 @@ incomplete.
 
 As a result:
 
-- a realizable target image graph may still fail within the attempt budget,
+- a realizable target interpretation graph may still fail within the attempt budget,
 - some targets are intrinsically harder because they create wider branching,
 - some failures come from search complexity rather than impossible constraints.
 
-So differences in success frequency across target image graphs do not
+So differences in success frequency across target interpretation graphs do not
 necessarily imply hidden bias. They can arise from genuine differences in search
 difficulty.
 
 ### Pool Frequency Still Matters
 
 Even with permutation-invariant matching inside the solver, generation still
-samples target image graphs from the available image-graph pool.
+samples target interpretation graphs from the available interpretation-graph pool.
 
 This means two distinct effects must be separated:
 
-- `proposal frequency`: how often a target image graph is attempted,
+- `proposal frequency`: how often a target interpretation graph is attempted,
 - `realization difficulty`: how often that target succeeds and survives
   feasibility filtering.
 
@@ -603,7 +610,7 @@ This is useful when generation should preserve or target a label distribution.
 
 A good mental model is:
 
-- the image graph is the blueprint,
+- the interpretation graph is the blueprint,
 - each component is a reusable building block,
 - each port is a doorway on that block,
 - each anchor is a typed attachment point on that doorway,
@@ -613,8 +620,8 @@ A good mental model is:
 ## Glossary
 
 - `AbstractGraph`
-  A pair of graphs: a preimage graph and an image graph, where image nodes carry
-  associated preimage subgraphs.
+  A pair of graphs: a base graph and an interpretation graph, where
+  interpretation nodes carry mapped base subgraphs.
 
 - `anchor`
   A boundary node used to connect one component to already materialized graph
@@ -624,9 +631,9 @@ A good mental model is:
   A hashed description of an anchor's local neighborhood. It is used to decide
   whether two anchors are compatible.
 
-- `association`
-  The preimage subgraph stored on an image node. It is the concrete fragment
-  represented by that image node.
+- `mapped subgraph`
+  The base subgraph stored on an interpretation node. It is the concrete
+  fragment represented by that interpretation node.
 
 - `backtracking`
   Search procedure that undoes a tentative decision when it leads to
@@ -643,39 +650,39 @@ A good mental model is:
 
 - `bucket`
   A coarse candidate set keyed by `(img_type, degree)`. Buckets group reusable
-  components by target image-node signature.
+  components by target interpretation-node signature.
 
 - `component`
-  A reusable preimage subgraph extracted from one training image-node
-  occurrence.
+  A reusable base-graph subgraph extracted from one training
+  interpretation-node occurrence.
 
 - `ComponentInstance`
-  The concrete stored record for one reusable component, including its subgraph,
-  image signature, and ports.
+  The concrete stored record for one reusable component, including its
+  subgraph, interpretation signature, and ports.
 
 - `degree`
-  Here, usually the degree of an image node in the target image graph or in a
-  training image graph.
+  Here, usually the degree of an interpretation node in the target
+  interpretation graph or in a training interpretation graph.
 
 - `edge binding`
-  Stored payload for an image edge during generation. It records the currently
-  exposed global boundary nodes and the required anchor-type multiset.
+  Stored payload for an interpretation edge during generation. It records the
+  currently exposed global boundary nodes and the required anchor-type multiset.
 
 - `feasibility estimator`
   Optional model that filters generated graphs based on learned global
   constraints.
 
 - `frontier`
-  The set of unassigned target image nodes adjacent to already assigned nodes.
-  These nodes are the most constrained next choices.
+  The set of unassigned target interpretation nodes adjacent to already
+  assigned nodes. These nodes are the most constrained next choices.
 
-- `image graph`
-  The abstract graph produced by decomposition. Its nodes represent associated
-  preimage subgraphs.
+- `interpretation graph`
+  The structural graph produced by decomposition. Its nodes represent mapped
+  base subgraphs.
 
 - `img_type`
-  Hash summarizing the local image-node context. It is part of the coarse
-  retrieval key.
+  Hash summarizing the local interpretation-node context. It is part of the
+  coarse retrieval key.
 
 - `injective port assignment`
   Matching rule requiring that distinct boundary requirements map to distinct
@@ -692,25 +699,25 @@ A good mental model is:
   The number of times a given anchor type appears in a boundary multiset.
 
 - `port`
-  A component interface corresponding to one incident image edge. A port exposes
-  anchor nodes and anchor types that can be matched to neighbors.
+  A component interface corresponding to one incident interpretation edge. A
+  port exposes anchor nodes and anchor types that can be matched to neighbors.
 
 - `Port`
   The dataclass storing one port's slot id, local anchor nodes, and anchor
   types.
 
-- `preimage graph`
+- `base graph`
   The concrete graph being generated.
 
-- `target image graph`
-  The image graph given to the generator as the structure it should realize in
-  preimage space.
+- `target interpretation graph`
+  The interpretation graph given to the generator as the structure it should
+  realize in base-graph space.
 
 - `unification`
   Merging two graph nodes that represent the same anchor during assembly.
 
 - `working graph`
-  The partially constructed preimage graph maintained during one generation
+  The partially constructed base graph maintained during one generation
   attempt.
 
 ## Public Entry Points

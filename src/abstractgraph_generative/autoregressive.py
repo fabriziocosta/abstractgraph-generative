@@ -2,16 +2,16 @@
 Autoregressive graph generation utilities.
 
 Components
-- Image-node pruning helper: `generate_pruning_sequences` removes
-  entire image-node associations from an AbstractGraph decomposition.
+- Interpretation-node pruning helper: `generate_pruning_sequences` removes
+  entire interpretation-node mapped subgraphs from an AbstractGraph decomposition.
 - Generator: `AutoregressiveGraphGenerator` grows graphs by repeatedly proposing
   virtual-cut insertions derived from the pruning index and selecting a next
   state based on similarity to the original training graphs (rather than donors),
   reducing pruning bias.
 
 Workflow
-1) fit(): Build the donor pool by pruning down to `min_nodes_for_pruning` via image-node
-   association removals, fit the feasibility
+1) fit(): Build the donor pool by pruning down to `min_nodes_for_pruning` via interpretation-node
+   mapped-subgraph removals, fit the feasibility
    estimator on donors, then embed the original training graphs
    (`self.generator_graphs`) with an `AbstractGraphTransformer` and cache
    unit‑normalized features for similarity (skipped if
@@ -122,12 +122,12 @@ def generate_pruning_sequences(
     include_start: bool = False,
 ) -> list[nx.Graph] | tuple[list[nx.Graph], dict]:
     """
-    Produce a sequence by removing image-node associations.
+    Produce a sequence by removing interpretation-node mapped subgraphs.
 
     Summary
         Starting from a copy of `graph`, repeatedly decompose into an
-        AbstractGraph and remove one entire association subgraph (the preimage
-        subgraph tied to an image node). A removal is accepted only if the
+        AbstractGraph and remove one entire mapped subgraph (the base
+        subgraph tied to an interpretation node). A removal is accepted only if the
         resulting graph does not drop below `min_nodes_for_pruning`.
         The decomposition is recomputed after each accepted removal.
 
@@ -196,20 +196,20 @@ def generate_pruning_sequences(
                 nbits=nbits,
             )
             candidates = []
-            for _node_id, data in ag.image_graph.nodes(data=True):
-                assoc = data.get("association")
-                if assoc is None:
+            for _node_id, data in ag.interpretation_graph.nodes(data=True):
+                mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
+                if mapped_subgraph is None:
                     continue
-                inner_nodes = set(assoc.nodes())
+                inner_nodes = set(mapped_subgraph.nodes())
                 if not inner_nodes:
                     continue
                 if len(inner_nodes) >= g.number_of_nodes():
                     continue
-                candidates.append((inner_nodes, assoc))
+                candidates.append((inner_nodes, mapped_subgraph))
 
             rng.shuffle(candidates)
             removed = False
-            for inner_nodes, assoc in candidates:
+            for inner_nodes, mapped_subgraph in candidates:
                 if g.number_of_nodes() - len(inner_nodes) < min_nodes_for_pruning:
                     continue
                 g2 = g.copy()
@@ -227,14 +227,14 @@ def generate_pruning_sequences(
                     )
                     if entry is not None:
                         cut_key, donor_edge_map, donor_cut, outer_ctx, inner_ctx = entry
-                        assoc_hash = hash_graph(assoc)
+                        assoc_hash = hash_graph(mapped_subgraph)
                         if use_context_embedding and context_vectorizer is not None:
                             local_cut_index.setdefault(cut_key, []).append(
-                                (assoc.copy(), donor_cut, donor_edge_map, assoc_hash, outer_ctx, inner_ctx)
+                                (mapped_subgraph.copy(), donor_cut, donor_edge_map, assoc_hash, outer_ctx, inner_ctx)
                             )
                         else:
                             local_cut_index.setdefault(cut_key, []).append(
-                                (assoc.copy(), donor_cut, donor_edge_map, assoc_hash)
+                                (mapped_subgraph.copy(), donor_cut, donor_edge_map, assoc_hash)
                             )
                 g = g2
                 out.append(g.copy())
@@ -251,12 +251,12 @@ def generate_pruning_sequences(
                 decomposition_function=decomposition_function,
                 nbits=nbits,
             )
-            fixed_image_graph = ag0.image_graph.copy()
+            fixed_image_graph = ag0.interpretation_graph.copy()
         assoc_nodes_by_image = {}
         assoc_count = defaultdict(int)
         for img_node, data in fixed_image_graph.nodes(data=True):
-            assoc = data.get("association")
-            nodes = set(assoc.nodes()) if isinstance(assoc, nx.Graph) else set()
+            mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
+            nodes = set(mapped_subgraph.nodes()) if isinstance(mapped_subgraph, nx.Graph) else set()
             assoc_nodes_by_image[img_node] = nodes
             for node in nodes:
                 assoc_count[node] += 1
@@ -291,13 +291,16 @@ def generate_pruning_sequences(
             if return_image_steps:
                 img_step = fixed_image_graph.copy()
                 for inode, data in img_step.nodes(data=True):
-                    assoc = data.get("association")
-                    if not isinstance(assoc, nx.Graph):
+                    mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
+                    if not isinstance(mapped_subgraph, nx.Graph):
                         continue
                     if inode in removed_images:
+                        data["mapped_subgraph"] = nx.Graph()
                         data["association"] = nx.Graph()
                     else:
-                        data["association"] = assoc.subgraph(remaining_nodes).copy()
+                        next_subgraph = mapped_subgraph.subgraph(remaining_nodes).copy()
+                        data["mapped_subgraph"] = next_subgraph
+                        data["association"] = next_subgraph
                 img_step.graph["removed_images"] = set(removed_images)
                 image_steps.append(img_step)
             if local_cut_index is not None:
@@ -311,12 +314,16 @@ def generate_pruning_sequences(
                 )
                 if entry is not None:
                     cut_key, donor_edge_map, donor_cut, outer_ctx, inner_ctx = entry
-                    assoc = fixed_image_graph.nodes[img_node].get("association")
-                    assoc = assoc.subgraph(inner_nodes).copy() if isinstance(assoc, nx.Graph) else nx.Graph()
-                    assoc_hash = hash_graph(assoc)
+                    mapped_subgraph = fixed_image_graph.nodes[img_node].get("mapped_subgraph")
+                    if mapped_subgraph is None:
+                        mapped_subgraph = fixed_image_graph.nodes[img_node].get("association")
+                    mapped_subgraph = (
+                        mapped_subgraph.subgraph(inner_nodes).copy() if isinstance(mapped_subgraph, nx.Graph) else nx.Graph()
+                    )
+                    assoc_hash = hash_graph(mapped_subgraph)
                     if use_context_embedding and context_vectorizer is not None:
                         local_cut_index.setdefault(cut_key, []).append(
-                            (assoc.copy(), donor_cut, donor_edge_map, assoc_hash, outer_ctx, inner_ctx)
+                            (mapped_subgraph.copy(), donor_cut, donor_edge_map, assoc_hash, outer_ctx, inner_ctx)
                         )
                     else:
                         local_cut_index.setdefault(cut_key, []).append(

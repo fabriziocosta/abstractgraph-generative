@@ -1,13 +1,13 @@
 """Context-aware conditional autoregressive generation for attributed graphs.
 
 This module extends the simplified conditional autoregressive generator with a
-preimage-context scorer. Each fitted component caches an embedding computed by
-vectorizing either the union of radius-limited neighborhoods around its anchor
-nodes in the original training preimage graph, or the full graph when
+base-graph context scorer. Each fitted component caches an embedding computed
+by vectorizing either the union of radius-limited neighborhoods around its
+anchor nodes in the original training base graph, or the full graph when
 ``preimage_context_radius=None``. During generation, a bounded set of legal
-rewiring branches is materialized on the current partial graph, embedded through
-the same context vectorizer, and sampled with probability proportional to their
-cosine similarity to the stored component context. When
+rewiring branches is materialized on the current partial graph, embedded
+through the same context vectorizer, and sampled with probability proportional
+to their cosine similarity to the stored component context. When
 ``context_vectorizer=None``, the generator cleanly falls back to the base
 conditional autoregressive search with no probabilistic context scoring.
 """
@@ -31,7 +31,7 @@ from abstractgraph_generative.rewrite import (
     _cosine_similarity,
     _transform_context_graphs,
 )
-from abstractgraph.graphs import graph_to_abstract_graph
+from abstractgraph.graphs import get_mapped_subgraph, graph_to_abstract_graph
 from abstractgraph.hashing import hash_graph
 
 
@@ -64,8 +64,10 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         decomposition_function,
         nbits: int,
         feasibility_estimator=None,
-        preimage_cut_radius: int = 1,
-        image_cut_radius: int = 1,
+        base_cut_radius: Optional[int] = None,
+        interpretation_cut_radius: Optional[int] = None,
+        preimage_cut_radius: Optional[int] = None,
+        image_cut_radius: Optional[int] = None,
         context_vectorizer=None,
         preimage_context_radius: Optional[int] = None,
         num_context_rewirings: int = 16,
@@ -77,10 +79,12 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
 
         Args:
             decomposition_function: Decomposition function for AbstractGraph conversion.
-            nbits: Hash bit width for hashing preimage and image neighborhoods.
+            nbits: Hash bit width for hashing base and interpretation neighborhoods.
             feasibility_estimator: Optional final-graph feasibility estimator.
-            preimage_cut_radius: Radius for anchor neighborhood hashes.
-            image_cut_radius: Radius for image-node neighborhood hashes.
+            base_cut_radius: Canonical radius for anchor neighborhood hashes.
+            interpretation_cut_radius: Canonical radius for interpretation-node neighborhood hashes.
+            preimage_cut_radius: Deprecated alias for ``base_cut_radius``.
+            image_cut_radius: Deprecated alias for ``interpretation_cut_radius``.
             context_vectorizer: Graph vectorizer used for context embeddings.
             preimage_context_radius: Radius of the anchor-context neighborhood union.
                 If None, embed the whole graph directly instead of extracting a
@@ -98,6 +102,8 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             decomposition_function=decomposition_function,
             nbits=nbits,
             feasibility_estimator=feasibility_estimator,
+            base_cut_radius=base_cut_radius,
+            interpretation_cut_radius=interpretation_cut_radius,
             preimage_cut_radius=preimage_cut_radius,
             image_cut_radius=image_cut_radius,
             n_jobs=n_jobs,
@@ -116,7 +122,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         """Fit components and cache per-component context embeddings.
 
         Args:
-            graphs: Training preimage graphs.
+            graphs: Training base graphs.
             **_: Ignored compatibility kwargs from previous versions.
 
         Returns:
@@ -150,15 +156,15 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         for ag in abstract_graphs:
             graph_embedding = None
             if self.preimage_context_radius is None:
-                graph_embedding = full_graph_embeddings.get(hash_graph(ag.preimage_graph))
-            for image_node in ag.image_graph.nodes():
+                graph_embedding = full_graph_embeddings.get(hash_graph(ag.base_graph))
+            for image_node in ag.interpretation_graph.nodes():
                 if comp_id in self._components:
                     if self.preimage_context_radius is None:
                         self._component_context_embeddings[comp_id] = graph_embedding
                     else:
-                        anchor_nodes = self._training_anchor_nodes(ag.image_graph, image_node)
+                        anchor_nodes = self._training_anchor_nodes(ag.interpretation_graph, image_node)
                         self._component_context_embeddings[comp_id] = self._embed_anchor_context(
-                            ag.preimage_graph,
+                            ag.base_graph,
                             anchor_nodes,
                         )
                 comp_id += 1
@@ -189,27 +195,27 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             return None
         return max(0.0, (float(similarity) + 1.0) * 0.5)
 
-    def _training_anchor_nodes(self, image_graph: nx.Graph, image_node) -> list:
-        """Collect training-time anchor nodes for one image-node association.
+    def _training_anchor_nodes(self, interpretation_graph: nx.Graph, image_node) -> list:
+        """Collect training-time anchor nodes for one interpretation-node mapping.
 
         Args:
-            image_graph: Training image graph.
-            image_node: Image node whose anchors are requested.
+            interpretation_graph: Training interpretation graph.
+            image_node: Interpretation node whose anchors are requested.
 
         Returns:
-            list: Sorted anchor nodes in the original preimage graph.
+            list: Sorted anchor nodes in the original base graph.
         """
-        assoc = image_graph.nodes[image_node].get("association")
-        if not isinstance(assoc, nx.Graph):
+        mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[image_node])
+        if not isinstance(mapped_subgraph, nx.Graph):
             return []
         anchor_nodes = set()
-        assoc_nodes = set(assoc.nodes())
-        for neighbor in image_graph.neighbors(image_node):
-            neighbor_assoc = image_graph.nodes[neighbor].get("association")
-            if not isinstance(neighbor_assoc, nx.Graph):
+        mapped_nodes = set(mapped_subgraph.nodes())
+        for neighbor in interpretation_graph.neighbors(image_node):
+            neighbor_mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
+            if not isinstance(neighbor_mapped_subgraph, nx.Graph):
                 continue
-            anchor_nodes.update(assoc_nodes & set(neighbor_assoc.nodes()))
-        return sorted(anchor_nodes, key=lambda node: self._preimage_node_order_key(assoc, node))
+            anchor_nodes.update(mapped_nodes & set(neighbor_mapped_subgraph.nodes()))
+        return sorted(anchor_nodes, key=lambda node: self._preimage_node_order_key(mapped_subgraph, node))
 
     def _materialized_anchor_nodes(
         self,

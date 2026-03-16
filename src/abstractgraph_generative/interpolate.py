@@ -3,13 +3,13 @@ This module provides graph interpolation and generation utilities built upon the
 AbstractGraph formalism, which enables meaningful, structure-preserving mutations
 of graphs.
 
-The fundamental operation is the "image-node rewrite." An AbstractGraph is a
-two-level graph representation where a high-level "image graph" summarizes a
-more detailed "preimage graph." Each node in the image graph corresponds to a
-subgraph in the preimage, known as an "association." A rewrite operation
-involves identifying compatible associations between a source graph and a set of
+The fundamental operation is the "interpretation-node rewrite." An AbstractGraph is a
+two-level graph representation where a high-level interpretation graph summarizes a
+more detailed base graph. Each node in the interpretation graph corresponds to a
+mapped subgraph in the base graph. A rewrite operation
+involves identifying compatible mapped subgraphs between a source graph and a set of
 "donor" graphs and swapping them. Compatibility is determined by a configurable
-"cut signature" over the boundary between the association and the rest of the graph.
+"cut signature" over the boundary between the mapped subgraph and the rest of the graph.
 With `cut_radius=None`, the signature uses only the edge label. With
 `cut_radius=0`, it includes the edge label and the two endpoint node labels
 (internal first, external second). With `cut_radius=n>0`, it includes the edge
@@ -84,7 +84,7 @@ class InterpolationEstimator:
     """Estimate interpolation paths between graphs using donor-based rewrites.
 
     Args:
-        graph_transformer: Transformer used to embed graphs and build image nodes.
+        graph_transformer: Transformer used to embed graphs and build interpretation nodes.
         rng: Optional random generator for rewrite sampling.
         n_samples: Number of candidate rewrites per step.
         n_iterations: Number of rewrite iterations per step.
@@ -116,7 +116,7 @@ class InterpolationEstimator:
         """Initialize the interpolation estimator with transformer and rewrite options.
 
         Args:
-            graph_transformer: Transformer used to embed graphs and build image nodes.
+            graph_transformer: Transformer used to embed graphs and build interpretation nodes.
             rng: Optional random generator for rewrite sampling.
             n_samples: Number of candidate rewrites per step.
             n_iterations: Number of rewrite iterations per step.
@@ -172,7 +172,7 @@ class InterpolationEstimator:
             Self for chaining.
         """
         if self.decomposition_function is None:
-            raise ValueError("graph_transformer.decomposition_function is required to build image nodes.")
+            raise ValueError("graph_transformer.decomposition_function is required to build interpretation nodes.")
         self.donors = list(donors)
         if self.donors:
             self.donor_vectors = self.graph_transformer.transform(self.donors)
