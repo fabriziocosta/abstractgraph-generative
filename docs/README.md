@@ -41,6 +41,12 @@ This repo owns:
 
 - [AUTOREGRESSIVE_GENERATOR_AND_REWRITE.md](AUTOREGRESSIVE_GENERATOR_AND_REWRITE.md)
 
+Compatibility note:
+- active code is migrating to `base_graph`, `interpretation_graph`, and
+  `mapped_subgraph`
+- `abstractgraph_generative.legacy.*` intentionally preserves the older
+  terminology for backward compatibility
+
 ## Dependencies
 
 - `abstractgraph`

@@ -6,22 +6,22 @@ rewrite utilities in `abstractgraph_generative.rewrite`. It focuses on the
 end-to-end flow, data structures, and selection logic rather than every
 parameter.
 
-## Concepts: image nodes and associations
+## Concepts: interpretation nodes and mapped subgraphs
 
 `abstractgraph` uses two levels:
-- Preimage graph: the original NetworkX graph.
-- Image graph: nodes represent subgraphs of the preimage graph. Each image node
-  stores an `association` subgraph in its node attributes.
+- Base graph: the original NetworkX graph.
+- Interpretation graph: nodes represent subgraphs of the base graph. Each
+  interpretation node stores a `mapped_subgraph` in its node attributes.
 
-Graph rewriting swaps one association subgraph for another compatible
-association and reconnects the boundary to preserve structure.
+Graph rewriting swaps one mapped subgraph for another compatible mapped
+subgraph and reconnects the boundary to preserve structure.
 
 ## Graph rewrite in `abstractgraph_generative.rewrite`
 
 ### Compatibility via cut signatures
 
-For any association, the rewrite logic builds a boundary cut:
-- Inner nodes: nodes belonging to the association.
+For any mapped subgraph, the rewrite logic builds a boundary cut:
+- Inner nodes: nodes belonging to the mapped subgraph.
 - Cut edges: edges that cross from inner nodes to the outer graph.
 
 Each cut edge is mapped to a per-edge key that captures local context:
@@ -32,18 +32,18 @@ Each cut edge is mapped to a per-edge key that captures local context:
   outer only, or both.
 
 The cut signature is the multiset of per-edge keys (stored as a sorted tuple).
-Two associations are compatible if their signatures are identical. This ensures
+Two mapped subgraphs are compatible if their signatures are identical. This ensures
 boundary edges can be reconnected one-to-one by key.
 
 ### Rewrite algorithm (single step)
 
-`rewrite(source, donors, ...)` performs one association swap:
+`rewrite(source, donors, ...)` performs one mapped-subgraph swap:
 1. Build or reuse `AbstractGraph` for source and donors.
 2. Index donors by cut signature.
-3. Index source associations by cut signature.
+3. Index source mapped subgraphs by cut signature.
 4. Match source and donor entries by cut signature.
-5. Pick a compatible source association and donor association.
-6. Replace the source association with the donor association while preserving
+5. Pick a compatible source mapped subgraph and donor mapped subgraph.
+6. Replace the source mapped subgraph with the donor mapped subgraph while preserving
    cut compatibility.
 7. Repeat to produce `n_samples` rewrites.
 
@@ -60,7 +60,7 @@ filtering each batch with a feasibility estimator.
 
 ## Autoregressive generator in `abstractgraph_generative.autoregressive`
 
-The autoregressive generator grows graphs by inserting donor associations at
+The autoregressive generator grows graphs by inserting donor mapped subgraphs at
 virtual cuts. It is autoregressive because each step proposes expansions based
 on the current graph state and then selects the next graph from those
 proposals.
@@ -78,7 +78,7 @@ proposals.
 At each step the generator:
 1. samples a cut size
 2. samples compatible cut nodes from the current graph
-3. inserts donor associations compatible with the virtual cut
+3. inserts donor mapped subgraphs compatible with the virtual cut
 
 ### Candidate selection
 

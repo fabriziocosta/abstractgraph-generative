@@ -10,7 +10,7 @@ The AbstractGraph stack is split across four sibling repositories:
 - `abstractgraph-graphicalizer`
   Path: `/home/fabrizio/work/abstractgraph-graphicalizer`
   Role: raw-data-to-NetworkX graphicalizers, including attention-driven
-  preimage induction and chemistry conversion/drawing
+  base-graph induction and chemistry conversion/drawing
 
 - `abstractgraph-ml`
   Path: `/home/fabrizio/work/abstractgraph-ml`
