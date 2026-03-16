@@ -30,8 +30,8 @@ class RepairGenerator:
     """Graph repair via donor-based rewrites and embedding selection.
 
     Args:
-        decomposition_function: Function used to decompose graphs into
-            interpretation/base form when constructing AbstractGraphs.
+        decomposition_function: Function used to decompose graphs into image/preimage
+            form when constructing AbstractGraphs.
         nbits: Hash bit width used when building AbstractGraphs.
         graph_transformer: Transformer used to embed graphs for neighbor search
             and candidate selection. Typically `AbstractGraphTransformer`.
@@ -61,7 +61,7 @@ class RepairGenerator:
         self.graph_transformer = graph_transformer
         self.rng = rng or random.Random()
         self._rewrite_kwargs = dict(rewrite_kwargs)
-        # Default constraint: donor mapped-subgraph size <= source mapped-subgraph size
+        # Default constraint: donor association size <= source association size
         self._rewrite_kwargs.setdefault(
             "replace_with_smaller_or_equal_size", bool(replace_with_smaller_or_equal_size)
         )

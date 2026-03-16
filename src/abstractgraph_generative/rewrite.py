@@ -167,7 +167,7 @@ def rewrite(
             if None, enumerate all combinations.
         preserve_node_ids: If True, do not relabel nodes to a contiguous range.
         replace_with_smaller_or_equal_size: If True, only allow donor associations
-            whose node count is less than or equal to the source mapped subgraph's
+            whose node count is less than or equal to the source association's
             node count (prevents growing the replaced part).
 
     Returns:
@@ -500,7 +500,7 @@ def iterated_rewrite(
         source: Input graph to rewrite.
         donors: Candidate donor graphs to rewrite from.
         rng: Optional Random instance for deterministic sampling.
-        decomposition_function: AbstractGraph decomposition function to build interpretation nodes.
+        decomposition_function: AbstractGraph decomposition function to build image nodes.
         nbits: Hash bit width used by graph_to_abstract_graph.
         n_samples: Number of candidate rewrites per iteration.
         n_iterations: Number of rewrite iterations to run.
@@ -1373,7 +1373,7 @@ def _build_source_cut_index(
     context_vectorizer=None,
     use_context_embedding: bool = True,
 ):
-    """Index source mapped subgraphs by cut signature.
+    """Index source associations by cut signature.
 
     Args:
         source: AbstractGraph source.
@@ -2520,7 +2520,7 @@ def display_cut_index(
     max_per_key: Optional[int] = None,
     sort_by_size: bool = True,
 ) -> list[tuple[tuple, list[nx.Graph]]]:
-    """Display mapped subgraphs per cut key.
+    """Display association subgraphs per cut key.
 
     Args:
         cut_index: Dictionary mapping cut keys to donor entries.
@@ -2551,7 +2551,7 @@ def display_cut_index(
 
 
 def _filter_donor_candidates(donor_candidates, source_hash: int):
-    """Filter donor associations that match the source mapped subgraph hash.
+    """Filter donor associations that match the source association hash.
 
     Args:
         donor_candidates: Donor entry list for a cut key.
@@ -2597,9 +2597,9 @@ def _replace_subgraph(
         source_inner: Nodes in the source subgraph to replace.
         source_cut: Cut edges for the source subgraph.
         source_edge_map: Mapping from cut keys to source edges.
-        donor_assoc: Donor mapped subgraph to insert.
-        donor_inner: Nodes in the donor mapped subgraph.
-        donor_cut: Cut edges for the donor mapped subgraph.
+        donor_assoc: Donor association subgraph to insert.
+        donor_inner: Nodes in the donor association.
+        donor_cut: Cut edges for the donor association.
         donor_edge_map: Mapping from cut keys to donor inner endpoints.
         rng: Random generator used for pairing.
         single_replacement: If True, pick one random pairing per label.
@@ -2760,7 +2760,7 @@ def anchor_type_train(graph_full: nx.Graph, node, radius: int, *, nbits: int = 1
     Compute a training-time anchor hash from a radius-limited neighborhood.
 
     Args:
-        graph_full: Training base graph.
+        graph_full: Training preimage graph.
         node: Anchor node in the training graph.
         radius: Radius used for local context extraction.
         nbits: Bit width for bounded graph hashing.
