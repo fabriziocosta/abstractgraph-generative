@@ -45,6 +45,7 @@ from typing import Callable, Optional, Sequence
 from collections import defaultdict
 import random
 import weakref
+import warnings
 import numpy as np
 import networkx as nx
 from abstractgraph_generative.rewrite import (
@@ -58,6 +59,23 @@ from abstractgraph.graphs import graph_to_abstract_graph
 from abstractgraph.hashing import GraphHashDeduper, hash_graph
 from abstractgraph.vectorize import AbstractGraphTransformer
 from joblib import Parallel, delayed
+
+
+def _warn_deprecated_name(old_name: str, new_name: str) -> None:
+    warnings.warn(
+        f"`{old_name}` is deprecated and will be removed in a future release; use `{new_name}` instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
+def _resolve_alias(canonical, deprecated, deprecated_name: str, canonical_name: str):
+    if deprecated is None:
+        return canonical
+    _warn_deprecated_name(deprecated_name, canonical_name)
+    if canonical is not None:
+        raise ValueError(f"Pass only one of `{canonical_name}` or `{deprecated_name}`.")
+    return deprecated
 
 
 def _top_k_indices(scores: Sequence[float], k: int) -> list[int]:
@@ -114,8 +132,10 @@ def generate_pruning_sequences(
     context_vectorizer=None,
     use_context_embedding: bool = True,
     association_aware: bool = False,
+    fixed_interpretation_graph: Optional[nx.Graph] = None,
     fixed_image_graph: Optional[nx.Graph] = None,
-    return_image_steps: bool = False,
+    return_interpretation_steps: bool = False,
+    return_image_steps: Optional[bool] = None,
     cut_index: Optional[dict] = None,
     return_cut_index: bool = False,
     seed: Optional[int] = None,
@@ -145,13 +165,16 @@ def generate_pruning_sequences(
         association_aware: If True, remove image-node associations while only
             deleting preimage nodes after their last association is removed.
             This uses a fixed image graph derived from the initial graph (or
-            the provided `fixed_image_graph`) and does not recompute
+            the provided `fixed_interpretation_graph`) and does not recompute
             associations after each step.
-        fixed_image_graph: Optional fixed image graph to use when
-            association_aware=True. If None, it is built from the initial
+        fixed_interpretation_graph: Optional fixed interpretation graph to use
+            when association_aware=True. If None, it is built from the initial
             graph using the decomposition_function and nbits.
-        return_image_steps: If True and association_aware, also return a list
-            of image graphs per pruning step reflecting removed associations.
+        fixed_image_graph: Deprecated alias for `fixed_interpretation_graph`.
+        return_interpretation_steps: If True and association_aware, also
+            return a list of interpretation graphs per pruning step reflecting
+            removed mapped subgraphs.
+        return_image_steps: Deprecated alias for `return_interpretation_steps`.
         cut_index: Optional dictionary to append cut signatures to.
         return_cut_index: If True, return a tuple (sequence, cut_index).
         seed: Optional random seed for reproducibility.
@@ -167,15 +190,28 @@ def generate_pruning_sequences(
 
     Notes:
         - Assumes `graph` is an undirected simple NetworkX Graph.
-        - Image-node associations are recomputed after each accepted removal.
+        - Interpretation-node mapped subgraphs are recomputed after each
+          accepted removal.
         - Node and edge attributes are preserved for retained parts.
         - Recorded cut signatures use outer subgraph hashes with edge labels omitted.
     """
+    fixed_interpretation_graph = _resolve_alias(
+        fixed_interpretation_graph,
+        fixed_image_graph,
+        "fixed_image_graph",
+        "fixed_interpretation_graph",
+    )
+    return_interpretation_steps = _resolve_alias(
+        return_interpretation_steps,
+        return_image_steps,
+        "return_image_steps",
+        "return_interpretation_steps",
+    )
     if decomposition_function is None:
         raise ValueError("decomposition_function is required for image-node pruning.")
     g = graph.copy()
     out: list[nx.Graph] = []
-    image_steps: list[nx.Graph] = []
+    interpretation_steps: list[nx.Graph] = []
     if include_start:
         out.append(g.copy())
 
@@ -218,7 +254,7 @@ def generate_pruning_sequences(
                     continue
                 if local_cut_index is not None:
                     entry = virtual_cut_entry(
-                        ag.preimage_graph,
+                        ag.base_graph,
                         inner_nodes,
                         cut_radius=cut_radius,
                         cut_context_radius=cut_context_radius,
@@ -245,24 +281,24 @@ def generate_pruning_sequences(
     else:
         # Association-aware pruning: only delete preimage nodes after their last
         # association is removed; keep the image graph fixed.
-        if fixed_image_graph is None:
+        if fixed_interpretation_graph is None:
             ag0 = graph_to_abstract_graph(
                 g,
                 decomposition_function=decomposition_function,
                 nbits=nbits,
             )
-            fixed_image_graph = ag0.interpretation_graph.copy()
+            fixed_interpretation_graph = ag0.interpretation_graph.copy()
         assoc_nodes_by_image = {}
         assoc_count = defaultdict(int)
-        for img_node, data in fixed_image_graph.nodes(data=True):
+        for img_node, data in fixed_interpretation_graph.nodes(data=True):
             mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
             nodes = set(mapped_subgraph.nodes()) if isinstance(mapped_subgraph, nx.Graph) else set()
             assoc_nodes_by_image[img_node] = nodes
             for node in nodes:
                 assoc_count[node] += 1
         removed_images = set()
-        if include_start and return_image_steps:
-            image_steps.append(fixed_image_graph.copy())
+        if include_start and return_interpretation_steps:
+            interpretation_steps.append(fixed_interpretation_graph.copy())
         while g.number_of_nodes() > 0:
             candidates = [
                 img_node
@@ -288,8 +324,8 @@ def generate_pruning_sequences(
                 if not (nodes & remaining_nodes):
                     removed_images.add(inode)
             g2 = g.subgraph(remaining_nodes).copy()
-            if return_image_steps:
-                img_step = fixed_image_graph.copy()
+            if return_interpretation_steps:
+                img_step = fixed_interpretation_graph.copy()
                 for inode, data in img_step.nodes(data=True):
                     mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
                     if not isinstance(mapped_subgraph, nx.Graph):
@@ -302,7 +338,7 @@ def generate_pruning_sequences(
                         data["mapped_subgraph"] = next_subgraph
                         data["association"] = next_subgraph
                 img_step.graph["removed_images"] = set(removed_images)
-                image_steps.append(img_step)
+                interpretation_steps.append(img_step)
             if local_cut_index is not None:
                 entry = virtual_cut_entry(
                     g,
@@ -314,9 +350,9 @@ def generate_pruning_sequences(
                 )
                 if entry is not None:
                     cut_key, donor_edge_map, donor_cut, outer_ctx, inner_ctx = entry
-                    mapped_subgraph = fixed_image_graph.nodes[img_node].get("mapped_subgraph")
+                    mapped_subgraph = fixed_interpretation_graph.nodes[img_node].get("mapped_subgraph")
                     if mapped_subgraph is None:
-                        mapped_subgraph = fixed_image_graph.nodes[img_node].get("association")
+                        mapped_subgraph = fixed_interpretation_graph.nodes[img_node].get("association")
                     mapped_subgraph = (
                         mapped_subgraph.subgraph(inner_nodes).copy() if isinstance(mapped_subgraph, nx.Graph) else nx.Graph()
                     )
@@ -327,15 +363,15 @@ def generate_pruning_sequences(
                         )
                     else:
                         local_cut_index.setdefault(cut_key, []).append(
-                            (assoc.copy(), donor_cut, donor_edge_map, assoc_hash)
+                            (mapped_subgraph.copy(), donor_cut, donor_edge_map, assoc_hash)
                         )
             g = g2
             out.append(g.copy())
 
-    if return_image_steps and association_aware:
+    if return_interpretation_steps and association_aware:
         if return_cut_index:
-            return out, image_steps, local_cut_index
-        return out, image_steps
+            return out, interpretation_steps, local_cut_index
+        return out, interpretation_steps
     if return_cut_index:
         return out, local_cut_index
     return out

@@ -6,6 +6,7 @@ import networkx as nx
 
 from abstractgraph import node as node_operator
 from abstractgraph.graphs import AbstractGraph
+from abstractgraph_generative.autoregressive import generate_pruning_sequences
 from abstractgraph_generative.conditional import ConditionalAutoregressiveGenerator
 
 
@@ -65,3 +66,28 @@ def test_generate_accepts_interpretation_graphs_alias() -> None:
         max_total_attempts=1,
     )
     assert isinstance(outputs, list)
+
+
+def test_generate_pruning_sequences_supports_canonical_interpretation_aliases() -> None:
+    graph = nx.path_graph(3)
+    for node in graph.nodes:
+        graph.nodes[node]["label"] = str(node)
+
+    interpretation_graph = AbstractGraph(graph=graph)
+    interpretation_graph.create_interpretation_node_with_subgraph_from_nodes([0, 1])
+    fixed_interpretation_graph = interpretation_graph.interpretation_graph.copy()
+
+    outputs, interpretation_steps = generate_pruning_sequences(
+        graph,
+        min_nodes_for_pruning=1,
+        decomposition_function=node_operator(),
+        nbits=6,
+        association_aware=True,
+        fixed_interpretation_graph=fixed_interpretation_graph,
+        return_interpretation_steps=True,
+        include_start=True,
+        seed=0,
+    )
+    assert isinstance(outputs, list)
+    assert isinstance(interpretation_steps, list)
+    assert interpretation_steps
