@@ -1,7 +1,7 @@
 # abstractgraph-generative docs
 
-`abstractgraph-generative` contains generation and rewrite workflows built on
-top of `abstractgraph` and `abstractgraph-ml`.
+`abstractgraph-generative` contains graph generation and rewrite workflows
+built on top of `abstractgraph` and `abstractgraph-ml`.
 
 ## Scope
 
@@ -12,7 +12,7 @@ This repo owns:
 - graph rewrite and repair utilities
 - graph optimization helpers
 - backend-specific generators such as VGAE, GRAN, and DiGress wrappers
-- story-graph generation and text/graph round-tripping
+- graph-only generative workflows
 
 ## Module map
 
@@ -32,10 +32,11 @@ This repo owns:
   optimization helpers
 - `abstractgraph_generative.repair`
   repair-style generation
-- `abstractgraph_generative.story`
-  story-graph extraction, validation, rendering, and packaging
 - `abstractgraph_generative.legacy.conditional_v0_1`
   preserved legacy conditional pipeline
+
+Text and story-graph workflows now live in the sibling repo
+`/home/fabrizio/code/abstractgraph-text`.
 
 ## Related docs
 

@@ -1,12 +1,14 @@
 # Generative notebooks
 
-This folder contains notebooks centered on autoregressive, interpolation,
-optimization, and story-graph generation workflows built on top of
-`abstractgraph` and `abstractgraph-ml`.
+This folder contains notebooks centered on autoregressive, interpolation, and
+optimization workflows built on top of `abstractgraph` and
+`abstractgraph-ml`.
 
 Layout:
 - `examples/` for supported generator workflows
 - `research/` for exploratory generation notebooks
+
+Text-oriented notebooks were extracted to `/home/fabrizio/code/abstractgraph-text`.
 
 Bootstrap behavior:
 - Notebooks use `notebooks/_bootstrap.py` to locate the repo root.

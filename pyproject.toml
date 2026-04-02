@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "abstractgraph-generative"
 version = "0.1.0"
-description = "Generative AbstractGraph models, rewrite/interpolation/autoregressive pipelines, and story graph tooling."
+description = "Generative AbstractGraph models, rewrite/interpolation/autoregressive pipelines, and graph-generation tooling."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -17,9 +17,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-story = [
-  "pydot>=2.0",
-]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -31,7 +28,5 @@ where = ["src"]
 [tool.setuptools.package-data]
 abstractgraph_generative = [
   "README_CONTITIONAL_AUTOREGRESSIVE.md",
-  "story/README.md",
-  "story/resources/*.json",
   "legacy/conditional_v0_1/README.md",
 ]

@@ -1,11 +1,13 @@
 # abstractgraph-generative
 
-`abstractgraph-generative` is the generation and rewriting layer built on top
-of `abstractgraph` and `abstractgraph-ml`.
+`abstractgraph-generative` is the graph generation and rewriting layer built on
+top of `abstractgraph` and `abstractgraph-ml`.
 
 It contains graph rewriting, autoregressive and conditional generation,
-interpolation, optimization/repair workflows, backend-specific generators, and
-story-graph tooling.
+interpolation, optimization/repair workflows, and backend-specific generators.
+
+Text and story-graph workflows were extracted into the sibling repo
+`abstractgraph-text`.
 
 ## Ecosystem
 
@@ -30,7 +32,6 @@ See [ECOSYSTEM.md](ECOSYSTEM.md) for the dependency graph and install order.
 - `src/abstractgraph_generative/interpolation.py`
 - `src/abstractgraph_generative/optimize.py`
 - `src/abstractgraph_generative/repair.py`
-- `src/abstractgraph_generative/story/`
 - `src/abstractgraph_generative/legacy/conditional_v0_1/`
 
 ## Documentation
@@ -43,6 +44,7 @@ See [ECOSYSTEM.md](ECOSYSTEM.md) for the dependency graph and install order.
 
 - `notebooks/examples/` contains copied generative workflows updated to the
   split package names.
+- Text-oriented notebooks now live in `/home/fabrizio/code/abstractgraph-text`.
 - `notebooks/research/` contains exploratory generation notebooks.
 - Example and research notebooks now bootstrap imports and normalize the
   working directory automatically for the standard three-repo ecosystem layout.
