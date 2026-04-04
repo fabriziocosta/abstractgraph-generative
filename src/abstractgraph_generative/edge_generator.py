@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import time
 from itertools import combinations, permutations
@@ -11,6 +12,66 @@ from joblib import Parallel, delayed
 
 
 DrawGraphsFn = Callable[[list[nx.Graph]], object]
+
+
+def mix_connected_components(
+    graph1: nx.Graph,
+    graph2: nx.Graph,
+    *,
+    target_n_nodes: int | None = None,
+    n_trials: int = 128,
+    seed: int | None = None,
+):
+    if graph1.number_of_nodes() < 1 or graph2.number_of_nodes() < 1:
+        raise ValueError("Both input graphs must contain at least one node")
+    if nx.is_directed(graph1) != nx.is_directed(graph2):
+        raise ValueError("Both input graphs must have the same directedness")
+    if graph1.is_multigraph() != graph2.is_multigraph():
+        raise ValueError("Both input graphs must both be simple or both multigraphs")
+    if n_trials < 1:
+        raise ValueError("n_trials must be >= 1")
+
+    rng = random.Random(seed)
+    component_graphs1 = _connected_component_subgraphs(graph1)
+    component_graphs2 = _connected_component_subgraphs(graph2)
+
+    max_pairs = min(len(component_graphs1), len(component_graphs2))
+    if max_pairs < 1:
+        raise ValueError("Both graphs must expose at least one connected component")
+
+    if target_n_nodes is None:
+        target_n_nodes = int(round((graph1.number_of_nodes() + graph2.number_of_nodes()) / 2))
+    target_n_nodes = max(1, int(target_n_nodes))
+
+    best_choice = None
+    best_score = None
+
+    for n_components_per_graph in range(1, max_pairs + 1):
+        trial_count = 1 if (
+            n_components_per_graph == len(component_graphs1)
+            and n_components_per_graph == len(component_graphs2)
+        ) else n_trials
+        for _ in range(trial_count):
+            selected1 = _sample_components(component_graphs1, n_components_per_graph, rng)
+            selected2 = _sample_components(component_graphs2, n_components_per_graph, rng)
+            total_nodes = sum(g.number_of_nodes() for g in selected1) + sum(
+                g.number_of_nodes() for g in selected2
+            )
+            score = abs(total_nodes - target_n_nodes)
+            tie_break = total_nodes
+            if best_score is None or (score, tie_break) < best_score:
+                best_score = (score, tie_break)
+                best_choice = (selected1, selected2)
+                if score == 0:
+                    break
+        if best_score is not None and best_score[0] == 0:
+            break
+
+    if best_choice is None:
+        raise ValueError("Could not select connected components from the input graphs")
+
+    selected1, selected2 = best_choice
+    return _merge_component_graphs(selected1 + selected2, graph1)
 
 
 def edge_neighbors(
@@ -120,6 +181,41 @@ def make_edge_regression_dataset(
     return positives, negatives, dataset
 
 
+def _connected_component_subgraphs(graph: nx.Graph):
+    if nx.is_directed(graph):
+        components = nx.weakly_connected_components(graph)
+    else:
+        components = nx.connected_components(graph)
+    return [graph.subgraph(nodes).copy() for nodes in components]
+
+
+def _sample_components(component_graphs, n_components, rng: random.Random):
+    if n_components >= len(component_graphs):
+        return list(component_graphs)
+    indices = rng.sample(range(len(component_graphs)), k=n_components)
+    return [component_graphs[idx] for idx in indices]
+
+
+def _merge_component_graphs(component_graphs, template_graph: nx.Graph):
+    merged = template_graph.__class__()
+    next_node_id = 0
+    for component in component_graphs:
+        relabel_map = {}
+        for node, node_attrs in component.nodes(data=True):
+            relabel_map[node] = next_node_id
+            merged.add_node(next_node_id, **dict(node_attrs))
+            next_node_id += 1
+        relabeled_component = nx.relabel_nodes(component, relabel_map, copy=True)
+        if merged.is_multigraph():
+            for u, v, key, edge_attrs in relabeled_component.edges(keys=True, data=True):
+                merged.add_edge(u, v, key=key, **dict(edge_attrs))
+        else:
+            for u, v, edge_attrs in relabeled_component.edges(data=True):
+                merged.add_edge(u, v, **dict(edge_attrs))
+    merged.graph.update(dict(template_graph.graph))
+    return merged
+
+
 class EdgeGenerator:
     def __init__(
         self,
@@ -130,6 +226,10 @@ class EdgeGenerator:
         n_replicates: int = 1,
         beam_size: int = 10,
         max_restarts: int = 3,
+        fallback_base_steps: int = 2,
+        fallback_growth_factor: float = 2.0,
+        beam_growth_factor: float = 1.5,
+        max_beam_size: int | None = None,
         allow_self_loops: bool = False,
         fit_n_jobs: int = -1,
         fit_backend: str = "loky",
@@ -142,6 +242,10 @@ class EdgeGenerator:
         self.n_replicates = n_replicates
         self.beam_size = beam_size
         self.max_restarts = max_restarts
+        self.fallback_base_steps = fallback_base_steps
+        self.fallback_growth_factor = fallback_growth_factor
+        self.beam_growth_factor = beam_growth_factor
+        self.max_beam_size = max_beam_size
         self.allow_self_loops = allow_self_loops
         self.fit_n_jobs = fit_n_jobs
         self.fit_backend = fit_backend
@@ -187,10 +291,13 @@ class EdgeGenerator:
         self.feasibility_estimator.fit(fit_graphs)
         feasibility_fit_time = time.perf_counter() - feasibility_fit_start
         if self.verbose:
+            feasibility_fit_min = int(feasibility_fit_time // 60)
+            feasibility_fit_sec = feasibility_fit_time - 60 * feasibility_fit_min
             print(
                 f"[fit] feasibility_graphs={len(fit_graphs)} "
                 f"positives={len(self.positives_)} negatives={len(self.negatives_)} "
-                f"dataset={len(self.dataset_)} time={feasibility_fit_time:.3f}s"
+                f"dataset={len(self.dataset_)} "
+                f"time={feasibility_fit_min}m {feasibility_fit_sec:.1f}s"
             )
 
         self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
@@ -201,10 +308,12 @@ class EdgeGenerator:
         if self.verbose:
             n_positive = int(np.sum(self.targets_ == 1))
             n_negative = int(np.sum(self.targets_ == 0))
+            graph_estimator_fit_min = int(graph_estimator_fit_time // 60)
+            graph_estimator_fit_sec = graph_estimator_fit_time - 60 * graph_estimator_fit_min
             print(
                 f"[fit] graph_estimator_graphs={len(train_graphs)} "
                 f"positive_labels={n_positive} negative_labels={n_negative} "
-                f"time={graph_estimator_fit_time:.3f}s"
+                f"time={graph_estimator_fit_min}m {graph_estimator_fit_sec:.1f}s"
             )
 
         self.edge_attribute_templates_ = self._collect_edge_attribute_templates(
@@ -233,17 +342,28 @@ class EdgeGenerator:
         if len(graph_list) != len(edge_counts):
             raise ValueError("graphs and n_edges must have the same length")
 
-        paths = [
-            self._generate_one(
-                graph,
-                target_n_edges,
-                draw_graphs_fn=draw_graphs_fn,
-                verbose=verbose,
-                graph_index=i,
-            )
-            for i, (graph, target_n_edges) in enumerate(zip(graph_list, edge_counts))
-        ]
-        return paths[0] if self._is_single_graph_input(graphs) else paths
+        paths = []
+        for i, (graph, target_n_edges) in enumerate(zip(graph_list, edge_counts)):
+            try:
+                path = self._generate_one(
+                    graph,
+                    target_n_edges,
+                    draw_graphs_fn=draw_graphs_fn,
+                    verbose=verbose,
+                    graph_index=i,
+                )
+            except ValueError as exc:
+                if verbose:
+                    print(
+                        f"[graph {i}] failed target_edges={target_n_edges} "
+                        f"reason={exc}"
+                    )
+                continue
+            paths.append(path)
+
+        if self._is_single_graph_input(graphs):
+            return paths[0] if paths else []
+        return paths
 
     def _generate_one(
         self,
@@ -260,7 +380,8 @@ class EdgeGenerator:
 
         self.n_tried_ = 0
         self.max_depth_ = 0
-        n_attempts = max(1, self.max_restarts)
+        n_fallbacks = max(0, self.max_restarts)
+        total_phases = n_fallbacks + 1
         start_time = time.perf_counter()
         if verbose:
             remaining_edges = n_edges - start_graph.number_of_edges()
@@ -279,103 +400,142 @@ class EdgeGenerator:
                 )
             return [start_graph]
 
-        for attempt in range(1, n_attempts + 1):
-            beam = [self._make_state(start_graph, parent=None, score=1.0)]
-            visited = {self._state_key(start_graph)}
-            depth = 0
-            step_start_time = time.perf_counter()
+        beam = [self._make_state(start_graph, parent=None, score=1.0)]
+        beam_history = [self._copy_beam(beam)]
+        blocked_state_keys_by_depth: dict[int, set] = {}
+        tabu_path_signatures = set()
+        visited = self._rebuild_visited_from_history(beam_history)
+        depth = 0
+        fallback_index = -1
+        beam_limit = self._beam_limit_for_fallback(fallback_index)
+        self.top_k_ = beam_limit
+        step_start_time = time.perf_counter()
 
-            if verbose and n_attempts > 1:
-                print(f"[graph {graph_index}] attempt={attempt}/{n_attempts}")
+        if verbose and total_phases > 1:
+            print(
+                f"[graph {graph_index}] phase=1/{total_phases} "
+                f"beam_limit={beam_limit} fallback=0/{n_fallbacks}"
+            )
 
-            while beam:
-                if depth >= n_edges:
-                    break
+        while beam:
+            if depth >= n_edges:
+                break
 
-                generated = []
-                for state in beam:
-                    generated.extend(self._expand_state(state))
+            generated = []
+            for state in beam:
+                generated.extend(self._expand_state(state))
 
-                self.n_tried_ += len(generated)
-                feasible_candidates = [
-                    cand
-                    for cand in generated
-                    if bool(self.feasibility_estimator.predict([cand["graph"]])[0])
-                ]
-                if feasible_candidates:
-                    positive_scores = self._positive_scores(
-                        [cand["graph"] for cand in feasible_candidates]
-                    )
-                    for cand, score in zip(feasible_candidates, positive_scores):
-                        cand["score"] = float(score)
-                    feasible_candidates.sort(
-                        key=lambda cand: cand["score"], reverse=True
-                    )
+            self.n_tried_ += len(generated)
+            feasible_candidates = [
+                cand
+                for cand in generated
+                if bool(self.feasibility_estimator.predict([cand["graph"]])[0])
+            ]
+            if feasible_candidates:
+                positive_scores = self._positive_scores(
+                    [cand["graph"] for cand in feasible_candidates]
+                )
+                for cand, score in zip(feasible_candidates, positive_scores):
+                    cand["score"] = float(score)
+                feasible_candidates.sort(key=lambda cand: cand["score"], reverse=True)
 
-                unseen_candidates = []
-                for cand in feasible_candidates:
-                    state_key = self._state_key(cand["graph"])
-                    if state_key in visited:
-                        continue
-                    unseen_candidates.append(cand)
+            next_depth = depth + 1
+            blocked_state_keys = blocked_state_keys_by_depth.get(next_depth, set())
+            unseen_candidates = []
+            for cand in feasible_candidates:
+                state_key = cand["key"]
+                if state_key in visited or state_key in blocked_state_keys:
+                    continue
+                if cand["path_signature"] in tabu_path_signatures:
+                    continue
+                unseen_candidates.append(cand)
 
-                retained = self._select_beam_candidates(unseen_candidates)
+            retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
+
+            if verbose:
+                best_score = retained[0]["score"] if retained else None
+                step_elapsed = time.perf_counter() - step_start_time
+                step_elapsed_str = self._format_minutes_seconds(step_elapsed)
+                best_score_str = f"{best_score:.4f}" if best_score is not None else "None"
+                current_edges = (
+                    retained[0]["graph"].number_of_edges()
+                    if retained
+                    else start_graph.number_of_edges() + next_depth
+                )
+                remaining_edges = max(0, n_edges - current_edges)
+                eta = remaining_edges * step_elapsed
+                eta_str = self._format_minutes_seconds(eta)
+                print(
+                    f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
+                    f"depth={next_depth} beam={len(beam)} generated={len(generated)} "
+                    f"feasible={len(feasible_candidates)} retained={len(retained)} "
+                    f"tried={self.n_tried_} best_score={best_score_str} "
+                    f"remaining_edges={remaining_edges} "
+                    f"step_time={step_elapsed_str} eta={eta_str} "
+                    f"beam_limit={beam_limit}"
+                )
+                if retained:
+                    self._draw_graphs(draw_graphs_fn, [retained[0]["graph"]])
+
+            if retained:
                 for cand in retained:
-                    visited.add(self._state_key(cand["graph"]))
-
-                depth += 1
+                    visited.add(cand["key"])
+                depth = next_depth
                 self.max_depth_ = max(self.max_depth_, depth)
-
-                if verbose:
-                    best_score = retained[0]["score"] if retained else None
-                    step_elapsed = time.perf_counter() - step_start_time
-                    step_elapsed_min = int(step_elapsed // 60)
-                    step_elapsed_sec = step_elapsed - 60 * step_elapsed_min
-                    best_score_str = (
-                        f"{best_score:.4f}" if best_score is not None else "None"
-                    )
-                    current_edges = (
-                        retained[0]["graph"].number_of_edges()
-                        if retained
-                        else start_graph.number_of_edges() + depth
-                    )
-                    remaining_edges = max(0, n_edges - current_edges)
-                    eta = remaining_edges * step_elapsed
-                    eta_min = int(eta // 60)
-                    eta_sec = eta - 60 * eta_min
-                    print(
-                        f"[graph {graph_index}] attempt={attempt}/{n_attempts} "
-                        f"depth={depth} beam={len(beam)} generated={len(generated)} "
-                        f"feasible={len(feasible_candidates)} retained={len(retained)} "
-                        f"tried={self.n_tried_} best_score={best_score_str} "
-                        f"remaining_edges={remaining_edges} "
-                        f"step_time={step_elapsed_min}m {step_elapsed_sec:.1f}s "
-                        f"eta={eta_min}m {eta_sec:.1f}s"
-                    )
-                    if retained:
-                        self._draw_graphs(draw_graphs_fn, [retained[0]["graph"]])
-                    step_start_time = time.perf_counter()
+                beam = retained
+                if len(beam_history) > depth:
+                    beam_history[depth] = self._copy_beam(retained)
+                    del beam_history[depth + 1 :]
+                else:
+                    beam_history.append(self._copy_beam(retained))
+                step_start_time = time.perf_counter()
 
                 for state in retained:
                     if state["graph"].number_of_edges() == n_edges:
                         path = self._reconstruct_path(state)
                         if verbose:
                             elapsed = time.perf_counter() - start_time
-                            elapsed_min = int(elapsed // 60)
-                            elapsed_sec = elapsed - 60 * elapsed_min
+                            elapsed_str = self._format_minutes_seconds(elapsed)
                             print(
-                                f"[graph {graph_index}] solved attempt={attempt}/{n_attempts} "
+                                f"[graph {graph_index}] solved phase={fallback_index + 2}/{total_phases} "
                                 f"depth={depth} max_depth={self.max_depth_} "
                                 f'edges={state["graph"].number_of_edges()} remaining_edges=0 '
-                                f"tried={self.n_tried_} elapsed={elapsed_min}m "
-                                f"{elapsed_sec:.1f}s eta=0m 0.0s"
+                                f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
                             )
                         return path
+                continue
 
-                beam = retained
+            blocked_state_keys_by_depth.setdefault(depth, set()).update(
+                state["key"] for state in beam
+            )
+            tabu_path_signatures.update(state["path_signature"] for state in beam)
 
-            if verbose and attempt < n_attempts:
-                print(f"[graph {graph_index}] restart attempt={attempt + 1}/{n_attempts}")
+            if fallback_index + 1 >= n_fallbacks:
+                break
+
+            fallback_index += 1
+            rollback_steps = self._rollback_steps_for_fallback(fallback_index)
+            fallback_depth = max(0, depth - rollback_steps)
+            beam_limit = self._beam_limit_for_fallback(fallback_index)
+            self.top_k_ = beam_limit
+            beam_history = beam_history[: fallback_depth + 1]
+            beam = self._copy_beam(beam_history[fallback_depth])
+            depth = fallback_depth
+            visited = self._rebuild_visited_from_history(beam_history)
+            step_start_time = time.perf_counter()
+
+            if verbose:
+                print(
+                    f"[graph {graph_index}] fallback={fallback_index + 1}/{n_fallbacks} "
+                    f"rollback_steps={rollback_steps} to_depth={fallback_depth} "
+                    f"beam_limit={beam_limit}"
+                )
+
+            if verbose and total_phases > 1:
+                print(
+                    f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
+                    f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
+                )
 
         raise ValueError("Could not generate a feasible graph with the requested number of edges")
 
@@ -391,13 +551,25 @@ class EdgeGenerator:
         return candidates
 
     def _make_state(self, graph, parent, score):
-        return {"graph": graph, "parent": parent, "score": score}
+        state_key = self._state_key(graph)
+        if parent is None:
+            path_signature = (state_key,)
+        else:
+            path_signature = parent["path_signature"] + (state_key,)
+        return {
+            "graph": graph,
+            "parent": parent,
+            "score": score,
+            "key": state_key,
+            "path_signature": path_signature,
+        }
 
-    def _select_beam_candidates(self, candidates):
+    def _select_beam_candidates(self, candidates, *, beam_limit: int | None = None):
         if not candidates:
             return []
 
-        n_keep = min(self.top_k_, len(candidates))
+        current_beam_limit = self.top_k_ if beam_limit is None else beam_limit
+        n_keep = min(current_beam_limit, len(candidates))
         n_top = 1 if n_keep == 1 else max(1, n_keep // 2)
         n_random = n_keep - n_top
 
@@ -411,6 +583,39 @@ class EdgeGenerator:
         retained = top_candidates + random_candidates
         retained.sort(key=lambda cand: cand["score"], reverse=True)
         return retained
+
+    def _rollback_steps_for_fallback(self, fallback_index: int) -> int:
+        steps = self.fallback_base_steps * (self.fallback_growth_factor**fallback_index)
+        return max(1, int(math.ceil(steps)))
+
+    def _beam_limit_for_fallback(self, fallback_index: int) -> int:
+        if fallback_index < 0:
+            beam_limit = self.beam_size
+        else:
+            beam_limit = int(
+                math.ceil(
+                    self.beam_size * (self.beam_growth_factor ** (fallback_index + 1))
+                )
+            )
+        beam_limit = max(1, beam_limit)
+        if self.max_beam_size is not None:
+            beam_limit = min(beam_limit, self.max_beam_size)
+        return beam_limit
+
+    def _copy_beam(self, beam):
+        return list(beam)
+
+    def _rebuild_visited_from_history(self, beam_history):
+        visited = set()
+        for beam in beam_history:
+            for state in beam:
+                visited.add(state["key"])
+        return visited
+
+    def _format_minutes_seconds(self, elapsed: float) -> str:
+        elapsed_min = int(elapsed // 60)
+        elapsed_sec = elapsed - 60 * elapsed_min
+        return f"{elapsed_min}m {elapsed_sec:.1f}s"
 
     def _reconstruct_path(self, state):
         path = []

@@ -28,6 +28,7 @@ from abstractgraph_generative.edge_generator import (  # noqa: F401
     EdgeGenerator,
     edge_neighbors,
     make_edge_regression_dataset,
+    mix_connected_components,
     remove_edges,
 )
 try:
@@ -115,6 +116,7 @@ __all__ = [
     "EdgeGenerator",
     "edge_neighbors",
     "make_edge_regression_dataset",
+    "mix_connected_components",
     "remove_edges",
 ]
 
