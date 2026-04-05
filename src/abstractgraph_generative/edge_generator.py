@@ -12,7 +12,7 @@ from joblib import Parallel, delayed
 from abstractgraph.hashing import hash_graph
 
 
-DrawGraphsFn = Callable[[list[nx.Graph]], object]
+DrawGraphsFn = Callable[..., object]
 
 
 def mix_connected_components(
@@ -222,6 +222,8 @@ class EdgeGenerator:
         self,
         feasibility_estimator,
         graph_estimator,
+        target_estimator=None,
+        target_estimator_mode: str = "classification",
         *,
         n_negative_per_positive: int = 3,
         n_replicates: int = 1,
@@ -243,6 +245,12 @@ class EdgeGenerator:
     ):
         self.feasibility_estimator = feasibility_estimator
         self.graph_estimator = graph_estimator
+        self.target_estimator = target_estimator
+        if target_estimator_mode not in {"classification", "regression"}:
+            raise ValueError(
+                "target_estimator_mode must be 'classification' or 'regression'"
+            )
+        self.target_estimator_mode = target_estimator_mode
         self.n_negative_per_positive = n_negative_per_positive
         self.n_replicates = n_replicates
         self.beam_size = beam_size
@@ -266,6 +274,8 @@ class EdgeGenerator:
         self.negatives_ = None
         self.dataset_ = None
         self.targets_ = None
+        self.target_graphs_ = None
+        self.target_values_ = None
         self.edge_attribute_templates_ = None
         self.top_k_ = beam_size
         self.n_tried_ = 0
@@ -274,9 +284,14 @@ class EdgeGenerator:
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
 
-    def fit(self, graphs):
+    def fit(self, graphs, targets=None):
         graph_list = self._as_graph_list(graphs)
         self.seed_graphs_ = [graph.copy() for graph in graph_list]
+        target_list = self._coerce_optional_per_graph_argument(
+            targets,
+            self.seed_graphs_,
+            name="targets",
+        )
 
         dataset_seeds = [self.rng.randrange(10**9) for _ in self.seed_graphs_]
         dataset_parts = Parallel(n_jobs=self.fit_n_jobs, backend=self.fit_backend)(
@@ -293,10 +308,18 @@ class EdgeGenerator:
         self.positives_ = []
         self.negatives_ = []
         self.dataset_ = []
-        for positives, negatives, dataset in dataset_parts:
+        self.target_graphs_ = []
+        self.target_values_ = []
+        for graph_targets, (positives, negatives, dataset) in zip(
+            target_list if target_list is not None else [None] * len(dataset_parts),
+            dataset_parts,
+        ):
             self.positives_.extend(positives)
             self.negatives_.extend(negatives)
             self.dataset_.extend(dataset)
+            if graph_targets is not None:
+                self.target_graphs_.extend(positives)
+                self.target_values_.extend([graph_targets] * len(positives))
 
         fit_graphs = [graph for graph in self.positives_ if graph.number_of_edges() > 0]
         feasibility_fit_start = time.perf_counter()
@@ -328,6 +351,32 @@ class EdgeGenerator:
                 f"time={graph_estimator_fit_min}m {graph_estimator_fit_sec:.1f}s"
             )
 
+        if target_list is not None:
+            if self.target_estimator is None:
+                raise ValueError(
+                    "targets were provided to fit(), but target_estimator is None"
+                )
+            target_fit_start = time.perf_counter()
+            self.target_estimator.fit(self.target_graphs_, self.target_values_)
+            target_fit_time = time.perf_counter() - target_fit_start
+            if self.verbose:
+                target_fit_min = int(target_fit_time // 60)
+                target_fit_sec = target_fit_time - 60 * target_fit_min
+                target_label = (
+                    "target_classes"
+                    if self.target_estimator_mode == "classification"
+                    else "target_values"
+                )
+                print(
+                    f"[fit] target_estimator_graphs={len(self.target_graphs_)} "
+                    f"{target_label}={len(set(self.target_values_))} "
+                    f"mode={self.target_estimator_mode} "
+                    f"time={target_fit_min}m {target_fit_sec:.1f}s"
+                )
+        else:
+            self.target_graphs_ = None
+            self.target_values_ = None
+
         self.edge_attribute_templates_ = self._collect_edge_attribute_templates(
             self.seed_graphs_
         )
@@ -341,6 +390,8 @@ class EdgeGenerator:
         graphs,
         n_edges,
         *,
+        target=None,
+        target_lambda: float = 1.0,
         draw_graphs_fn: DrawGraphsFn | None = None,
         verbose: bool | None = None,
     ):
@@ -353,16 +404,25 @@ class EdgeGenerator:
             edge_counts = [n_edges]
         else:
             edge_counts = list(n_edges)
+        target_values = self._coerce_optional_per_graph_argument(
+            target,
+            graph_list,
+            name="target",
+        )
 
         if len(graph_list) != len(edge_counts):
             raise ValueError("graphs and n_edges must have the same length")
 
         paths = []
-        for i, (graph, target_n_edges) in enumerate(zip(graph_list, edge_counts)):
+        for i, (graph, target_n_edges, target_value) in enumerate(
+            zip(graph_list, edge_counts, target_values if target_values is not None else [None] * len(graph_list))
+        ):
             try:
                 path = self._generate_one(
                     graph,
                     target_n_edges,
+                    target=target_value,
+                    target_lambda=target_lambda,
                     draw_graphs_fn=draw_graphs_fn,
                     verbose=verbose,
                     graph_index=i,
@@ -385,6 +445,8 @@ class EdgeGenerator:
         graph: nx.Graph,
         n_edges: int,
         *,
+        target=None,
+        target_lambda: float = 1.0,
         draw_graphs_fn: DrawGraphsFn | None = None,
         verbose: bool = False,
         graph_index: int = 0,
@@ -402,7 +464,8 @@ class EdgeGenerator:
             remaining_edges = n_edges - start_graph.number_of_edges()
             print(
                 f"[graph {graph_index}] start start_edges={start_graph.number_of_edges()} "
-                f"target_edges={n_edges} remaining_edges={remaining_edges}"
+                f"target_edges={n_edges} remaining_edges={remaining_edges} "
+                f"target={target} target_lambda={target_lambda:.3f}"
             )
             self._draw_graphs(draw_graphs_fn, [start_graph])
 
@@ -451,8 +514,15 @@ class EdgeGenerator:
                 positive_scores = self._positive_scores(
                     [cand["graph"] for cand in feasible_candidates]
                 )
-                for cand, score in zip(feasible_candidates, positive_scores):
+                target_scores = self._target_scores(
+                    [cand["graph"] for cand in feasible_candidates],
+                    target=target,
+                )
+                for cand, score, target_score in zip(
+                    feasible_candidates, positive_scores, target_scores
+                ):
                     cand["score"] = float(score)
+                    cand["target_score"] = float(target_score)
                 repulsions, repulsion_lambda = self._repulsion_values(
                     [cand["graph"] for cand in feasible_candidates],
                     fallback_index=fallback_index,
@@ -460,7 +530,9 @@ class EdgeGenerator:
                 for cand, repulsion in zip(feasible_candidates, repulsions):
                     cand["repulsion"] = float(repulsion)
                     cand["selection_score"] = float(
-                        cand["score"] - repulsion_lambda * cand["repulsion"]
+                        cand["score"]
+                        + target_lambda * cand.get("target_score", 0.0)
+                        - repulsion_lambda * cand["repulsion"]
                     )
                 feasible_candidates.sort(
                     key=lambda cand: cand["selection_score"], reverse=True
@@ -484,13 +556,21 @@ class EdgeGenerator:
                 best_selection_score = (
                     retained[0]["selection_score"] if retained else None
                 )
+                best_target_score = (
+                    retained[0].get("target_score") if retained else None
+                )
                 best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
                 step_elapsed = time.perf_counter() - step_start_time
                 step_elapsed_str = self._format_minutes_seconds(step_elapsed)
-                best_score_str = f"{best_score:.4f}" if best_score is not None else "None"
+                best_score_str = f"{best_score:.3f}" if best_score is not None else "None"
                 best_selection_score_str = (
-                    f"{best_selection_score:.4f}"
+                    f"{best_selection_score:.3f}"
                     if best_selection_score is not None
+                    else "None"
+                )
+                best_target_score_str = (
+                    f"{best_target_score:.3f}"
+                    if best_target_score is not None
                     else "None"
                 )
                 current_edges = (
@@ -506,15 +586,41 @@ class EdgeGenerator:
                     f"depth={next_depth} beam={len(beam)} generated={len(generated)} "
                     f"feasible={len(feasible_candidates)} retained={len(retained)} "
                     f"tried={self.n_tried_} best_score={best_score_str} "
+                    f"best_target_score={best_target_score_str} "
                     f"best_selection_score={best_selection_score_str} "
-                    f"best_repulsion={best_repulsion:.4f} "
-                    f"lambda={repulsion_lambda:.4f} "
+                    f"best_repulsion={best_repulsion:.3f} "
+                    f"target_lambda={target_lambda:.3f} "
+                    f"repulsion_lambda={repulsion_lambda:.3f} "
                     f"remaining_edges={remaining_edges} "
                     f"step_time={step_elapsed_str} eta={eta_str} "
                     f"beam_limit={beam_limit}"
                 )
                 if retained:
-                    self._draw_graphs(draw_graphs_fn, [retained[0]["graph"]])
+                    retained_graphs = [cand["graph"] for cand in retained]
+                    retained_titles = [
+                        f"sel={cand.get('selection_score', cand['score']):.3f} "
+                        f"clf={cand['score']:.3f} "
+                        f"tgt={cand.get('target_score', 0.0):.3f} "
+                        f"rep={cand.get('repulsion', 0.0):.3f}"
+                        for cand in retained
+                    ]
+                    self._draw_graphs(
+                        draw_graphs_fn,
+                        retained_graphs,
+                        n_graphs_per_line=min(len(retained_graphs), 7),
+                        titles=retained_titles,
+                    )
+                    self._draw_graphs(
+                        draw_graphs_fn,
+                        [retained[0]["graph"]],
+                        n_graphs_per_line=1,
+                        titles=[
+                            f"selected sel={retained[0].get('selection_score', retained[0]['score']):.3f} "
+                            f"clf={retained[0]['score']:.3f} "
+                            f"tgt={retained[0].get('target_score', 0.0):.3f} "
+                            f"rep={retained[0].get('repulsion', 0.0):.3f}"
+                        ],
+                    )
 
             if retained:
                 for cand in retained:
@@ -746,15 +852,54 @@ class EdgeGenerator:
         return path
 
     def _positive_scores(self, graphs):
-        probs = self.graph_estimator.predict_proba(graphs)
-        classes = getattr(self.graph_estimator.estimator_, "classes_", None)
+        return self._class_probability(
+            self.graph_estimator,
+            graphs,
+            target=1,
+            estimator_name="graph_estimator",
+        )
+
+    def _target_scores(self, graphs, *, target):
+        if target is None:
+            return np.zeros(len(graphs), dtype=float)
+        if self.target_estimator is None:
+            raise ValueError(
+                "generate(..., target=...) requires a fitted target_estimator"
+            )
+        if self.target_estimator_mode == "classification":
+            return self._class_probability(
+                self.target_estimator,
+                graphs,
+                target=target,
+                estimator_name="target_estimator",
+            )
+        return self._regression_target_score(
+            self.target_estimator,
+            graphs,
+            target=target,
+            estimator_name="target_estimator",
+        )
+
+    def _class_probability(self, estimator, graphs, *, target, estimator_name: str):
+        probs = estimator.predict_proba(graphs)
+        classes = getattr(estimator.estimator_, "classes_", None)
         if classes is None:
-            raise ValueError("graph_estimator does not expose fitted classes_")
+            raise ValueError(f"{estimator_name} does not expose fitted classes_")
         classes = list(classes)
-        if 1 not in classes:
-            raise ValueError("graph_estimator must be trained with positive label 1")
-        pos_idx = classes.index(1)
-        return probs[:, pos_idx]
+        if target not in classes:
+            raise ValueError(
+                f"{estimator_name} was not trained with requested class {target!r}; "
+                f"available classes: {classes!r}"
+            )
+        class_idx = classes.index(target)
+        return probs[:, class_idx]
+
+    def _regression_target_score(self, estimator, graphs, *, target, estimator_name: str):
+        if not hasattr(estimator, "predict"):
+            raise ValueError(f"{estimator_name} does not expose predict()")
+        predictions = np.asarray(estimator.predict(graphs), dtype=float).reshape(-1)
+        target_value = float(target)
+        return 1.0 / (1.0 + np.abs(predictions - target_value))
 
     def _missing_edges(self, graph: nx.Graph):
         nodes = list(graph.nodes())
@@ -782,6 +927,21 @@ class EdgeGenerator:
     def _as_graph_list(self, graphs):
         return [graphs] if self._is_single_graph_input(graphs) else list(graphs)
 
+    def _coerce_optional_per_graph_argument(self, values, graphs, *, name: str):
+        if values is None:
+            return None
+        if self._is_single_graph_input(graphs):
+            return [values]
+        if isinstance(values, (str, bytes)):
+            raise ValueError(f"{name} must be a scalar or a sequence matching graphs")
+        try:
+            value_list = list(values)
+        except TypeError:
+            return [values] * len(graphs)
+        if len(value_list) != len(graphs):
+            raise ValueError(f"{name} and graphs must have the same length")
+        return value_list
+
     def _is_single_graph_input(self, graphs):
         return isinstance(graphs, nx.Graph)
 
@@ -806,7 +966,20 @@ class EdgeGenerator:
         return (tuple(sorted(graph.nodes())), graph.number_of_edges(), edge_key)
 
     def _draw_graphs(
-        self, draw_graphs_fn: DrawGraphsFn | None, graphs: list[nx.Graph]
+        self,
+        draw_graphs_fn: DrawGraphsFn | None,
+        graphs: list[nx.Graph],
+        *,
+        n_graphs_per_line: int | None = None,
+        titles: list[str] | None = None,
     ) -> None:
         if draw_graphs_fn is not None:
-            draw_graphs_fn(graphs)
+            try:
+                kwargs = {}
+                if n_graphs_per_line is not None:
+                    kwargs["n_graphs_per_line"] = n_graphs_per_line
+                if titles is not None:
+                    kwargs["titles"] = titles
+                draw_graphs_fn(graphs, **kwargs)
+            except TypeError:
+                draw_graphs_fn(graphs)

@@ -4,6 +4,7 @@
 
 - a feasibility model to reject invalid partial graphs
 - a graph classifier to rank feasible candidates
+- an optional target model to bias generation toward a requested class or value
 - a beam search over partial constructions
 
 The implementation lives in `abstractgraph_generative.edge_generator`.
@@ -21,7 +22,7 @@ Key helpers:
 Typical usage:
 
 ```python
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_ml.estimators import GraphEstimator
@@ -44,9 +45,23 @@ graph_estimator = GraphEstimator(
     ),
 )
 
+target_estimator = GraphEstimator(
+    transformer=transformer,
+    estimator=RandomForestRegressor(
+        random_state=0,
+        n_estimators=300,
+        n_jobs=-1,
+    ),
+)
+
+# Example target: regress graph max degree.
+fit_targets = [max(dict(graph.degree()).values(), default=0) for graph in fit_graphs]
+
 generator = EdgeGenerator(
     feasibility_estimator=feasibility_estimator,
     graph_estimator=graph_estimator,
+    target_estimator=target_estimator,
+    target_estimator_mode="regression",
     n_negative_per_positive=5,
     n_replicates=10,
     beam_size=2,
@@ -57,11 +72,13 @@ generator = EdgeGenerator(
     max_beam_size=8,
     verbose=True,
     seed=0,
-).fit(fit_graphs)
+).fit(fit_graphs, fit_targets)
 
 generated_path = generator.generate(
     start_graph,
     n_edges=target_n_edges,
+    target=desired_max_degree,
+    target_lambda=0.5,
     draw_graphs_fn=lambda graphs: display_graphs(graphs, n_graphs_per_line=1),
 )
 ```
@@ -104,6 +121,8 @@ At each depth, the generator:
 1. expands the current beam by adding one missing edge
 2. filters expanded graphs with the feasibility estimator
 3. scores feasible survivors with the graph classifier
+4. optionally adds a target-model score from `target_estimator`
+5. subtracts fallback repulsion when that mechanism is active
 4. retains a beam made of:
    - the top-scoring candidates
    - a random sample from the remaining positive candidates
@@ -114,15 +133,56 @@ After the first fallback, the generator can also apply a similarity-based
 repulsion term against previously failed states. In that case candidate ranking
 uses:
 
+For classification mode:
+
 ```text
-selection_score = classifier_score - lambda * repulsion
+target_score = P(target_class | graph)
+selection_score = classifier_score + target_lambda * target_score - repulsion_lambda * repulsion
+```
+
+For regression mode:
+
+```text
+target_score = 1 / (1 + abs(predicted_target - requested_target))
+selection_score = classifier_score + target_lambda * target_score - repulsion_lambda * repulsion
 ```
 
 where:
 
 - `classifier_score` is the downstream graph classifier probability for class 1
+- `target_score` is either the requested class probability or a regression closeness score
+- `target_lambda` is the user-controlled weight of the target objective
 - `repulsion` is the maximum cosine similarity to the failed-memory bank
-- `lambda` grows with the number of fallback stages already used
+- `repulsion_lambda` grows with the number of fallback stages already used
+
+## Target-Conditioned Fitting
+
+`fit()` now accepts optional per-graph targets:
+
+```python
+generator.fit(graphs, targets)
+```
+
+When `targets` are provided:
+
+- `graph_estimator` is still trained on the binary edge-regression dataset
+- `target_estimator` is trained only on positive fragments
+- `target_estimator_mode="classification"` uses class probabilities during generation
+- `target_estimator_mode="regression"` uses distance to the requested numeric target
+- every positive fragment derived from a seed graph inherits that seed graph's target
+
+So if a seed graph has target value `t`, every graph encountered along the
+edge-removal trajectory for that seed graph is also labeled with `t` for the
+target model.
+
+At generation time you can then request a class:
+
+```python
+generator.generate(start_graph, n_edges=target_n_edges, target=c, target_lambda=0.5)
+```
+
+If `target=None`, the target objective is disabled and scoring falls back to the
+original classifier-plus-repulsion behavior.
 
 ## Exponential Fallback
 
@@ -243,6 +303,11 @@ regions.
   Parallelism for dataset generation.
 - `fit_backend`
   Joblib backend for dataset generation.
+- `target_estimator`
+  Optional classifier or regressor trained on positive fragments when
+  `fit(..., targets=...)` is used.
+- `target_estimator_mode`
+  Either `"classification"` or `"regression"` for target scoring.
 
 ### Search
 
@@ -268,6 +333,8 @@ regions.
   Maximum number of failed-memory graph embeddings kept in the repulsion bank.
 - `allow_self_loops`
   Whether self-loop edge additions are allowed.
+- `target_lambda`
+  Weight applied to the requested target-class probability during generation.
 
 ### Logging / control
 
@@ -290,9 +357,11 @@ Search logs report:
 - retained beam size
 - cumulative tried candidates
 - best classifier score
+- best target score
 - best repulsion-adjusted selection score
 - best repulsion value
-- active lambda
+- active target lambda
+- active repulsion lambda
 - remaining edges
 - per-step time
 - ETA
