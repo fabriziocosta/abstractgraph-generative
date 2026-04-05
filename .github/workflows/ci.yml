@@ -17,7 +17,7 @@ jobs:
       - name: Install package
         run: python -m pip install -e . --no-deps
       - name: Compile package
-        run: python -m py_compile src/abstractgraph_generative/*.py src/abstractgraph_generative/story/*.py src/abstractgraph_generative/legacy/conditional_v0_1/*.py
+        run: find src/abstractgraph_generative -name '*.py' -print0 | xargs -0 python -m py_compile
       - name: Optional local sibling smoke
         run: |
           if [ -d ../abstractgraph ] && [ -d ../abstractgraph-ml ]; then
