@@ -9,6 +9,7 @@ from typing import Callable
 import networkx as nx
 import numpy as np
 from joblib import Parallel, delayed
+from abstractgraph.hashing import hash_graph
 
 
 DrawGraphsFn = Callable[[list[nx.Graph]], object]
@@ -230,6 +231,10 @@ class EdgeGenerator:
         fallback_growth_factor: float = 2.0,
         beam_growth_factor: float = 1.5,
         max_beam_size: int | None = None,
+        use_similarity_repulsion: bool = True,
+        repulsion_weight: float = 0.2,
+        repulsion_growth_factor: float = 1.5,
+        max_repulsion_memory: int = 256,
         allow_self_loops: bool = False,
         fit_n_jobs: int = -1,
         fit_backend: str = "loky",
@@ -246,6 +251,10 @@ class EdgeGenerator:
         self.fallback_growth_factor = fallback_growth_factor
         self.beam_growth_factor = beam_growth_factor
         self.max_beam_size = max_beam_size
+        self.use_similarity_repulsion = use_similarity_repulsion
+        self.repulsion_weight = repulsion_weight
+        self.repulsion_growth_factor = repulsion_growth_factor
+        self.max_repulsion_memory = max_repulsion_memory
         self.allow_self_loops = allow_self_loops
         self.fit_n_jobs = fit_n_jobs
         self.fit_backend = fit_backend
@@ -261,6 +270,9 @@ class EdgeGenerator:
         self.top_k_ = beam_size
         self.n_tried_ = 0
         self.max_depth_ = 0
+        self.embedding_cache_ = {}
+        self.failed_memory_hashes_ = []
+        self.failed_memory_hash_set_ = set()
 
     def fit(self, graphs):
         graph_list = self._as_graph_list(graphs)
@@ -319,6 +331,9 @@ class EdgeGenerator:
         self.edge_attribute_templates_ = self._collect_edge_attribute_templates(
             self.seed_graphs_
         )
+        self.embedding_cache_ = {}
+        self.failed_memory_hashes_ = []
+        self.failed_memory_hash_set_ = set()
         return self
 
     def generate(
@@ -431,13 +446,25 @@ class EdgeGenerator:
                 for cand in generated
                 if bool(self.feasibility_estimator.predict([cand["graph"]])[0])
             ]
+            repulsion_lambda = 0.0
             if feasible_candidates:
                 positive_scores = self._positive_scores(
                     [cand["graph"] for cand in feasible_candidates]
                 )
                 for cand, score in zip(feasible_candidates, positive_scores):
                     cand["score"] = float(score)
-                feasible_candidates.sort(key=lambda cand: cand["score"], reverse=True)
+                repulsions, repulsion_lambda = self._repulsion_values(
+                    [cand["graph"] for cand in feasible_candidates],
+                    fallback_index=fallback_index,
+                )
+                for cand, repulsion in zip(feasible_candidates, repulsions):
+                    cand["repulsion"] = float(repulsion)
+                    cand["selection_score"] = float(
+                        cand["score"] - repulsion_lambda * cand["repulsion"]
+                    )
+                feasible_candidates.sort(
+                    key=lambda cand: cand["selection_score"], reverse=True
+                )
 
             next_depth = depth + 1
             blocked_state_keys = blocked_state_keys_by_depth.get(next_depth, set())
@@ -454,9 +481,18 @@ class EdgeGenerator:
 
             if verbose:
                 best_score = retained[0]["score"] if retained else None
+                best_selection_score = (
+                    retained[0]["selection_score"] if retained else None
+                )
+                best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
                 step_elapsed = time.perf_counter() - step_start_time
                 step_elapsed_str = self._format_minutes_seconds(step_elapsed)
                 best_score_str = f"{best_score:.4f}" if best_score is not None else "None"
+                best_selection_score_str = (
+                    f"{best_selection_score:.4f}"
+                    if best_selection_score is not None
+                    else "None"
+                )
                 current_edges = (
                     retained[0]["graph"].number_of_edges()
                     if retained
@@ -470,6 +506,9 @@ class EdgeGenerator:
                     f"depth={next_depth} beam={len(beam)} generated={len(generated)} "
                     f"feasible={len(feasible_candidates)} retained={len(retained)} "
                     f"tried={self.n_tried_} best_score={best_score_str} "
+                    f"best_selection_score={best_selection_score_str} "
+                    f"best_repulsion={best_repulsion:.4f} "
+                    f"lambda={repulsion_lambda:.4f} "
                     f"remaining_edges={remaining_edges} "
                     f"step_time={step_elapsed_str} eta={eta_str} "
                     f"beam_limit={beam_limit}"
@@ -509,6 +548,7 @@ class EdgeGenerator:
                 state["key"] for state in beam
             )
             tabu_path_signatures.update(state["path_signature"] for state in beam)
+            self._remember_failed_graphs([state["graph"] for state in beam])
 
             if fallback_index + 1 >= n_fallbacks:
                 break
@@ -560,6 +600,7 @@ class EdgeGenerator:
             "graph": graph,
             "parent": parent,
             "score": score,
+            "selection_score": score,
             "key": state_key,
             "path_signature": path_signature,
         }
@@ -581,7 +622,10 @@ class EdgeGenerator:
             random_candidates = self.rng.sample(remaining_candidates, k=n_random)
 
         retained = top_candidates + random_candidates
-        retained.sort(key=lambda cand: cand["score"], reverse=True)
+        retained.sort(
+            key=lambda cand: cand.get("selection_score", cand["score"]),
+            reverse=True,
+        )
         return retained
 
     def _rollback_steps_for_fallback(self, fallback_index: int) -> int:
@@ -616,6 +660,81 @@ class EdgeGenerator:
         elapsed_min = int(elapsed // 60)
         elapsed_sec = elapsed - 60 * elapsed_min
         return f"{elapsed_min}m {elapsed_sec:.1f}s"
+
+    def _repulsion_values(self, graphs, *, fallback_index: int):
+        if (
+            not self.use_similarity_repulsion
+            or fallback_index < 0
+            or not self.failed_memory_hashes_
+            or self.repulsion_weight <= 0
+        ):
+            return np.zeros(len(graphs), dtype=float), 0.0
+        candidate_embeddings = self._graph_embeddings(graphs)
+        memory_embeddings = np.vstack(
+            [self.embedding_cache_[graph_hash] for graph_hash in self.failed_memory_hashes_]
+        )
+        candidate_norm = self._normalize_rows(candidate_embeddings)
+        memory_norm = self._normalize_rows(memory_embeddings)
+        similarities = candidate_norm @ memory_norm.T
+        repulsion = np.maximum(0.0, np.max(similarities, axis=1))
+        lam = float(
+            self.repulsion_weight
+            * (self.repulsion_growth_factor ** max(0, fallback_index))
+        )
+        return repulsion, lam
+
+    def _remember_failed_graphs(self, graphs) -> None:
+        if not self.use_similarity_repulsion or self.max_repulsion_memory <= 0:
+            return
+        graph_hashes = self._graph_hashes(graphs)
+        self._graph_embeddings(graphs)
+        for graph_hash in graph_hashes:
+            if graph_hash in self.failed_memory_hash_set_:
+                continue
+            self.failed_memory_hashes_.append(graph_hash)
+            self.failed_memory_hash_set_.add(graph_hash)
+        while len(self.failed_memory_hashes_) > self.max_repulsion_memory:
+            old_hash = self.failed_memory_hashes_.pop(0)
+            self.failed_memory_hash_set_.discard(old_hash)
+
+    def _graph_hashes(self, graphs):
+        return [hash_graph(graph) for graph in graphs]
+
+    def _graph_embeddings(self, graphs):
+        graph_hashes = self._graph_hashes(graphs)
+        missing_graphs = []
+        missing_hashes = []
+        for graph, graph_hash in zip(graphs, graph_hashes):
+            if graph_hash in self.embedding_cache_:
+                continue
+            missing_graphs.append(graph)
+            missing_hashes.append(graph_hash)
+        if missing_graphs:
+            raw_features = self.graph_estimator._transform_raw(missing_graphs)
+            rows = self._matrix_to_rows(raw_features)
+            for graph_hash, row in zip(missing_hashes, rows):
+                self.embedding_cache_[graph_hash] = row
+        if not graph_hashes:
+            return np.empty((0, 0), dtype=float)
+        return np.vstack([self.embedding_cache_[graph_hash] for graph_hash in graph_hashes])
+
+    def _matrix_to_rows(self, features):
+        if hasattr(features, "toarray"):
+            features = features.toarray()
+        rows = []
+        for row in features:
+            if hasattr(row, "toarray"):
+                row = row.toarray()
+            rows.append(np.asarray(row, dtype=float).ravel())
+        return rows
+
+    def _normalize_rows(self, matrix: np.ndarray) -> np.ndarray:
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(1, -1)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms = np.where(norms > 0.0, norms, 1.0)
+        return matrix / norms
 
     def _reconstruct_path(self, state):
         path = []

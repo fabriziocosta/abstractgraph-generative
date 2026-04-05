@@ -110,6 +110,20 @@ At each depth, the generator:
 
 This keeps some exploration while still pushing toward high classifier score.
 
+After the first fallback, the generator can also apply a similarity-based
+repulsion term against previously failed states. In that case candidate ranking
+uses:
+
+```text
+selection_score = classifier_score - lambda * repulsion
+```
+
+where:
+
+- `classifier_score` is the downstream graph classifier probability for class 1
+- `repulsion` is the maximum cosine similarity to the failed-memory bank
+- `lambda` grows with the number of fallback stages already used
+
 ## Exponential Fallback
 
 When the active beam reaches a dead end, the generator does not immediately
@@ -193,6 +207,30 @@ After rollback, a candidate is rejected if:
 This path-level tabu is stricter than depth-local dead-end banning and helps
 avoid cycling back into exactly the same failed branch history after rollback.
 
+## Similarity Repulsion
+
+To avoid returning to the same basin after a rollback, the generator keeps a
+memory of failed states and repels candidates that are too similar to them.
+
+The implementation:
+
+- uses `hash_graph(graph)` as the cache key for vector embeddings
+- caches vectorizer outputs in an embedding cache
+- stores embeddings only for failed-memory states
+- computes cosine similarity between feasible candidates and the failed-memory bank
+- uses the maximum cosine similarity as the repulsion value
+
+Repulsion is activated only after the search has entered fallback mode.
+
+For fallback index `i`:
+
+```text
+lambda_i = repulsion_weight * repulsion_growth_factor**i
+```
+
+So later fallback phases push the search further away from previously failed
+regions.
+
 ## Important Parameters
 
 ### Dataset / fitting
@@ -220,6 +258,14 @@ avoid cycling back into exactly the same failed branch history after rollback.
   Exponential growth factor for beam widening after each fallback.
 - `max_beam_size`
   Optional cap on widened beam size.
+- `use_similarity_repulsion`
+  Whether to activate cosine-similarity repulsion after fallback begins.
+- `repulsion_weight`
+  Base coefficient for similarity repulsion.
+- `repulsion_growth_factor`
+  Geometric growth factor for repulsion strength across fallback stages.
+- `max_repulsion_memory`
+  Maximum number of failed-memory graph embeddings kept in the repulsion bank.
 - `allow_self_loops`
   Whether self-loop edge additions are allowed.
 
@@ -244,6 +290,9 @@ Search logs report:
 - retained beam size
 - cumulative tried candidates
 - best classifier score
+- best repulsion-adjusted selection score
+- best repulsion value
+- active lambda
 - remaining edges
 - per-step time
 - ETA
