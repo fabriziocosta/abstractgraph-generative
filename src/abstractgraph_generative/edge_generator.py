@@ -566,13 +566,15 @@ class EdgeGenerator:
                 eta_str = self._format_minutes_seconds(eta)
                 print(
                     f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-                    f"depth={next_depth} beam={len(beam)} generated={len(generated)} "
+                    f"depth={next_depth}\n"
+                    f"  beam={len(beam)} generated={len(generated)} "
                     f"feasible={len(feasible_candidates)} retained={len(retained)} "
-                    f"tried={self.n_tried_} best_score={best_score_str} "
+                    f"tried={self.n_tried_}\n"
+                    f"  best_score={best_score_str} "
                     f"best_target_score={best_target_score_str} "
                     f"best_selection_score={best_selection_score_str} "
-                    f"best_repulsion={best_repulsion:.3f} "
-                    f"target_lambda={target_lambda:.3f} "
+                    f"best_repulsion={best_repulsion:.3f}\n"
+                    f"  target_lambda={target_lambda:.3f} "
                     f"repulsion_lambda={repulsion_lambda:.3f} "
                     f"remaining_edges={remaining_edges} "
                     f"step_time={step_elapsed_str} eta={eta_str} "
@@ -582,9 +584,9 @@ class EdgeGenerator:
                     retained_graphs = [cand["graph"] for cand in retained]
                     retained_titles = [
                         f"sel={cand.get('selection_score', cand['score']):.3f} "
+                        f"rep={cand.get('repulsion', 0.0):.3f}\n"
                         f"clf={cand['score']:.3f} "
-                        f"tgt={cand.get('target_score', 0.0):.3f} "
-                        f"rep={cand.get('repulsion', 0.0):.3f}"
+                        f"tgt={cand.get('target_score', 0.0):.3f}"
                         for cand in retained
                     ]
                     self._draw_graphs(
@@ -598,10 +600,10 @@ class EdgeGenerator:
                         [retained[0]["graph"]],
                         n_graphs_per_line=1,
                         titles=[
-                            f"selected sel={retained[0].get('selection_score', retained[0]['score']):.3f} "
+                            f"sel={retained[0].get('selection_score', retained[0]['score']):.3f} "
+                            f"rep={retained[0].get('repulsion', 0.0):.3f}\n"
                             f"clf={retained[0]['score']:.3f} "
-                            f"tgt={retained[0].get('target_score', 0.0):.3f} "
-                            f"rep={retained[0].get('repulsion', 0.0):.3f}"
+                            f"tgt={retained[0].get('target_score', 0.0):.3f}"
                         ],
                     )
 
