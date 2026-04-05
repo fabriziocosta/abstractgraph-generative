@@ -287,39 +287,8 @@ class EdgeGenerator:
     def fit(self, graphs, targets=None):
         graph_list = self._as_graph_list(graphs)
         self.seed_graphs_ = [graph.copy() for graph in graph_list]
-        target_list = self._coerce_optional_per_graph_argument(
-            targets,
-            self.seed_graphs_,
-            name="targets",
-        )
-
-        dataset_seeds = [self.rng.randrange(10**9) for _ in self.seed_graphs_]
-        dataset_parts = Parallel(n_jobs=self.fit_n_jobs, backend=self.fit_backend)(
-            delayed(make_edge_regression_dataset)(
-                graph,
-                n_negative_per_positive=self.n_negative_per_positive,
-                n_replicates=self.n_replicates,
-                seed=dataset_seed,
-                allow_self_loops=self.allow_self_loops,
-            )
-            for graph, dataset_seed in zip(self.seed_graphs_, dataset_seeds)
-        )
-
-        self.positives_ = []
-        self.negatives_ = []
-        self.dataset_ = []
-        self.target_graphs_ = []
-        self.target_values_ = []
-        for graph_targets, (positives, negatives, dataset) in zip(
-            target_list if target_list is not None else [None] * len(dataset_parts),
-            dataset_parts,
-        ):
-            self.positives_.extend(positives)
-            self.negatives_.extend(negatives)
-            self.dataset_.extend(dataset)
-            if graph_targets is not None:
-                self.target_graphs_.extend(positives)
-                self.target_values_.extend([graph_targets] * len(positives))
+        dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
+        self._store_graph_estimator_training_data(dataset_parts)
 
         fit_graphs = [graph for graph in self.positives_ if graph.number_of_edges() > 0]
         feasibility_fit_start = time.perf_counter()
@@ -351,28 +320,21 @@ class EdgeGenerator:
                 f"time={graph_estimator_fit_min}m {graph_estimator_fit_sec:.1f}s"
             )
 
-        if target_list is not None:
-            if self.target_estimator is None:
-                raise ValueError(
-                    "targets were provided to fit(), but target_estimator is None"
-                )
-            target_fit_start = time.perf_counter()
-            self.target_estimator.fit(self.target_graphs_, self.target_values_)
-            target_fit_time = time.perf_counter() - target_fit_start
-            if self.verbose:
-                target_fit_min = int(target_fit_time // 60)
-                target_fit_sec = target_fit_time - 60 * target_fit_min
-                target_label = (
-                    "target_classes"
-                    if self.target_estimator_mode == "classification"
-                    else "target_values"
-                )
-                print(
-                    f"[fit] target_estimator_graphs={len(self.target_graphs_)} "
-                    f"{target_label}={len(set(self.target_values_))} "
-                    f"mode={self.target_estimator_mode} "
-                    f"time={target_fit_min}m {target_fit_sec:.1f}s"
-                )
+        if targets is not None:
+            target_list = self._coerce_optional_per_graph_argument(
+                targets,
+                self.seed_graphs_,
+                name="targets",
+            )
+            target_graphs, target_values = self._build_target_fragment_dataset(
+                dataset_parts,
+                target_list,
+            )
+            self._fit_target_estimator_from_fragments(
+                target_graphs,
+                target_values,
+                verbose_prefix="[fit]",
+            )
         else:
             self.target_graphs_ = None
             self.target_values_ = None
@@ -383,6 +345,27 @@ class EdgeGenerator:
         self.embedding_cache_ = {}
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
+        return self
+
+    def fit_target_estimator(self, graphs, targets):
+        if self.target_estimator is None:
+            raise ValueError("target_estimator is None; provide one before fitting")
+        graph_list = [graph.copy() for graph in self._as_graph_list(graphs)]
+        target_list = self._coerce_optional_per_graph_argument(
+            targets,
+            graph_list,
+            name="targets",
+        )
+        dataset_parts = self._build_fragment_datasets(graph_list)
+        target_graphs, target_values = self._build_target_fragment_dataset(
+            dataset_parts,
+            target_list,
+        )
+        self._fit_target_estimator_from_fragments(
+            target_graphs,
+            target_values,
+            verbose_prefix="[fit_target_estimator]",
+        )
         return self
 
     def generate(
@@ -733,6 +716,65 @@ class EdgeGenerator:
             reverse=True,
         )
         return retained
+
+    def _build_fragment_datasets(self, graphs):
+        dataset_seeds = [self.rng.randrange(10**9) for _ in graphs]
+        return Parallel(n_jobs=self.fit_n_jobs, backend=self.fit_backend)(
+            delayed(make_edge_regression_dataset)(
+                graph,
+                n_negative_per_positive=self.n_negative_per_positive,
+                n_replicates=self.n_replicates,
+                seed=dataset_seed,
+                allow_self_loops=self.allow_self_loops,
+            )
+            for graph, dataset_seed in zip(graphs, dataset_seeds)
+        )
+
+    def _store_graph_estimator_training_data(self, dataset_parts):
+        self.positives_ = []
+        self.negatives_ = []
+        self.dataset_ = []
+        for positives, negatives, dataset in dataset_parts:
+            self.positives_.extend(positives)
+            self.negatives_.extend(negatives)
+            self.dataset_.extend(dataset)
+
+    def _build_target_fragment_dataset(self, dataset_parts, targets):
+        target_graphs = []
+        target_values = []
+        for target_value, (positives, _, _) in zip(targets, dataset_parts):
+            target_graphs.extend(positives)
+            target_values.extend([target_value] * len(positives))
+        return target_graphs, target_values
+
+    def _fit_target_estimator_from_fragments(
+        self,
+        target_graphs,
+        target_values,
+        *,
+        verbose_prefix: str,
+    ):
+        if self.target_estimator is None:
+            raise ValueError("target_estimator is None; provide one before fitting")
+        self.target_graphs_ = list(target_graphs)
+        self.target_values_ = list(target_values)
+        target_fit_start = time.perf_counter()
+        self.target_estimator.fit(self.target_graphs_, self.target_values_)
+        target_fit_time = time.perf_counter() - target_fit_start
+        if self.verbose:
+            target_fit_min = int(target_fit_time // 60)
+            target_fit_sec = target_fit_time - 60 * target_fit_min
+            target_label = (
+                "target_classes"
+                if self.target_estimator_mode == "classification"
+                else "target_values"
+            )
+            print(
+                f"{verbose_prefix} target_estimator_graphs={len(self.target_graphs_)} "
+                f"{target_label}={len(set(self.target_values_))} "
+                f"mode={self.target_estimator_mode} "
+                f"time={target_fit_min}m {target_fit_sec:.1f}s"
+            )
 
     def _rollback_steps_for_fallback(self, fallback_index: int) -> int:
         steps = self.fallback_base_steps * (self.fallback_growth_factor**fallback_index)

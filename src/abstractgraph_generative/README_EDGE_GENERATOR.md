@@ -163,6 +163,12 @@ where:
 generator.fit(graphs, targets)
 ```
 
+You can also fit or overwrite the target model independently:
+
+```python
+generator.fit_target_estimator(graphs, targets)
+```
+
 When `targets` are provided:
 
 - `graph_estimator` is still trained on the binary edge-regression dataset
@@ -170,6 +176,10 @@ When `targets` are provided:
 - `target_estimator_mode="classification"` uses class probabilities during generation
 - `target_estimator_mode="regression"` uses distance to the requested numeric target
 - every positive fragment derived from a seed graph inherits that seed graph's target
+
+`fit()` and `fit_target_estimator()` use the same fragment-generation pipeline, so
+the target model always sees the same positive fragments that are derived during
+edge-regression dataset construction.
 
 So if a seed graph has target value `t`, every graph encountered along the
 edge-removal trajectory for that seed graph is also labeled with `t` for the
