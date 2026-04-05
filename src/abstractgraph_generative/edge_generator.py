@@ -566,18 +566,16 @@ class EdgeGenerator:
                 eta_str = self._format_minutes_seconds(eta)
                 print(
                     f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-                    f"depth={next_depth}\n"
-                    f"  beam={len(beam)} generated={len(generated)} "
-                    f"feasible={len(feasible_candidates)} retained={len(retained)} "
-                    f"tried={self.n_tried_}\n"
-                    f"  best_score={best_score_str} "
+                    f"depth={next_depth} remaining_edges={remaining_edges} "
+                    f"step_time={step_elapsed_str} eta={eta_str}\n"
+                    f"generated={len(generated)} feasible={len(feasible_candidates)} "
+                    f"retained={len(retained)} tried={self.n_tried_}\n"
+                    f"best_score={best_score_str} "
                     f"best_target_score={best_target_score_str} "
                     f"best_selection_score={best_selection_score_str} "
                     f"best_repulsion={best_repulsion:.3f}\n"
-                    f"  target_lambda={target_lambda:.3f} "
+                    f"target_lambda={target_lambda:.3f} "
                     f"repulsion_lambda={repulsion_lambda:.3f} "
-                    f"remaining_edges={remaining_edges} "
-                    f"step_time={step_elapsed_str} eta={eta_str} "
                     f"beam_limit={beam_limit}"
                 )
                 if retained:
@@ -594,17 +592,6 @@ class EdgeGenerator:
                         retained_graphs,
                         n_graphs_per_line=min(len(retained_graphs), 7),
                         titles=retained_titles,
-                    )
-                    self._draw_graphs(
-                        draw_graphs_fn,
-                        [retained[0]["graph"]],
-                        n_graphs_per_line=1,
-                        titles=[
-                            f"sel={retained[0].get('selection_score', retained[0]['score']):.3f} "
-                            f"rep={retained[0].get('repulsion', 0.0):.3f}\n"
-                            f"clf={retained[0]['score']:.3f} "
-                            f"tgt={retained[0].get('target_score', 0.0):.3f}"
-                        ],
                     )
 
             if retained:
@@ -713,11 +700,47 @@ class EdgeGenerator:
             random_candidates = self.rng.sample(remaining_candidates, k=n_random)
 
         retained = top_candidates + random_candidates
+        retained = self._deduplicate_retained_candidates(
+            retained,
+            fallback_candidates=remaining_candidates,
+            target_size=n_keep,
+        )
         retained.sort(
             key=lambda cand: cand.get("selection_score", cand["score"]),
             reverse=True,
         )
         return retained
+
+    def _deduplicate_retained_candidates(
+        self,
+        retained,
+        *,
+        fallback_candidates,
+        target_size: int,
+    ):
+        unique_retained = []
+        seen_hashes = set()
+
+        def add_candidate(candidate):
+            graph_hash = hash_graph(candidate["graph"])
+            if graph_hash in seen_hashes:
+                return False
+            seen_hashes.add(graph_hash)
+            unique_retained.append(candidate)
+            return True
+
+        for candidate in retained:
+            add_candidate(candidate)
+
+        if len(unique_retained) >= target_size:
+            return unique_retained[:target_size]
+
+        for candidate in fallback_candidates:
+            if len(unique_retained) >= target_size:
+                break
+            add_candidate(candidate)
+
+        return unique_retained
 
     def _build_fragment_datasets(self, graphs):
         dataset_seeds = [self.rng.randrange(10**9) for _ in graphs]
