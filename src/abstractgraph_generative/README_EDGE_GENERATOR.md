@@ -5,6 +5,8 @@
 - a feasibility model to reject invalid partial graphs
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
+- an optional decomposition-aware training trajectory to bias reconstruction toward complete subgraphs
+- an optional stored retrieval corpus to select path-based fitting subsets from graph pairs
 - a beam search over partial constructions
 
 The implementation lives in `abstractgraph_generative.edge_generator`.
@@ -62,6 +64,7 @@ generator = EdgeGenerator(
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
     target_estimator_mode="regression",
+    decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
     n_negative_per_positive=5,
     n_replicates=10,
     beam_size=2,
@@ -79,7 +82,35 @@ generated_path = generator.generate(
     n_edges=target_n_edges,
     target=desired_max_degree,
     target_lambda=0.5,
+    return_path=True,
     draw_graphs_fn=lambda graphs: display_graphs(graphs, n_graphs_per_line=1),
+)
+```
+
+Stored-corpus pair workflow:
+
+```python
+generator = EdgeGenerator(
+    feasibility_estimator=feasibility_estimator,
+    graph_estimator=graph_estimator,
+    target_estimator=target_estimator,
+    target_estimator_mode="regression",
+    decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
+    verbose=True,
+    seed=0,
+)
+
+generator.store(all_graphs, targets=all_targets)
+
+generation_path = generator.generate_from_pair(
+    graph_a,
+    graph_b,
+    size=0.5,
+    n_paths=3,
+    target=None,
+    target_lambda=0.5,
+    return_path=True,
+    draw_graphs_fn=lambda graphs, **kwargs: display_graphs(graphs, **kwargs),
 )
 ```
 
@@ -101,18 +132,68 @@ whose total node count is closest to the average node count of the two inputs.
 
 For a single input graph:
 
-- returns a generated path on success
-- returns `[]` if no feasible construction can be found
+- with `return_path=True` returns a generated path on success
+- with `return_path=False` returns only the final graph on success
+- returns `[]` if no feasible construction can be found and `return_path=True`
+- returns `None` if no feasible construction can be found and `return_path=False`
 
 For multiple input graphs:
 
 - attempts each graph independently
 - skips graphs that fail generation
-- returns only successful paths
+- returns only successful paths with `return_path=True`
+- returns only successful final graphs with `return_path=False`
 - returns `[]` if all requested graphs fail
 
 With `verbose=True`, failed graphs emit a log line instead of aborting the full
 batch.
+
+`return_path=True` is still the default for compatibility.
+
+## Stored Retrieval Corpus
+
+`EdgeGenerator.store()` prepares a reusable corpus for multiple pair queries:
+
+```python
+generator.store(graphs, targets=None)
+```
+
+This:
+
+- stores the graphs and optional per-graph targets
+- deep-copies the graph-estimator transformer for retrieval use
+- vectorizes the stored graphs once
+- precomputes a dense pairwise distance matrix once
+
+After that, `generate_from_pair()` can reuse the stored corpus:
+
+```python
+generator.generate_from_pair(
+    graph_a,
+    graph_b,
+    size=0.5,
+    n_paths=3,
+    target=None,
+    target_lambda=1.0,
+    return_path=True,
+)
+```
+
+`generate_from_pair()`:
+
+1. resolves `graph_a` and `graph_b` to stored indices when their hashes match
+2. otherwise transforms the query graphs on the fly, appends them to a temporary query corpus, and computes shortest paths there
+3. extracts `n_paths` edge-disjoint shortest paths by removing used path edges after each path
+4. fits the generator on the union of graphs appearing on those paths
+5. removes edges from both endpoints
+6. mixes connected components from the two reduced graphs
+7. starts generation from that mixed graph
+
+If stored targets exist and no explicit `target=` is passed, `generate_from_pair()`
+infers a pair target from the endpoint targets:
+
+- regression mode: mean target
+- classification mode: rounded mean target
 
 ## Search Strategy
 
@@ -184,6 +265,31 @@ edge-regression dataset construction.
 So if a seed graph has target value `t`, every graph encountered along the
 edge-removal trajectory for that seed graph is also labeled with `t` for the
 target model.
+
+## Decomposition-Aware Training
+
+`EdgeGenerator` can also accept an optional `decomposition_function`:
+
+```python
+generator = EdgeGenerator(
+    ...,
+    decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
+)
+```
+
+When provided, the training dataset no longer removes arbitrary edges uniformly.
+Instead it:
+
+- decomposes each training graph into mapped subgraphs using `abstractgraph`
+- treats subgraphs with a `multi_owner` policy
+- allows subgraphs to overlap, but once an edge is removed in one subgraph it is
+  absent for all later subgraphs in that trajectory
+- removes all remaining edges from one chosen subgraph before moving to another
+  subgraph, randomizing order within each subgraph
+
+This only changes the training trajectories. Inference and generation remain
+edge-wise and the `generate()` API does not change. The user nudges the behavior
+indirectly by choosing the decomposition used to build those training paths.
 
 At generation time you can then request a class:
 
@@ -318,6 +424,9 @@ regions.
   `fit(..., targets=...)` is used.
 - `target_estimator_mode`
   Either `"classification"` or `"regression"` for target scoring.
+- `decomposition_function`
+  Optional `abstractgraph` decomposition used to create subgraph-ordered
+  edge-removal trajectories during training only.
 
 ### Search
 

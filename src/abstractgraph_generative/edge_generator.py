@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import random
 import time
@@ -9,7 +10,9 @@ from typing import Callable
 import networkx as nx
 import numpy as np
 from joblib import Parallel, delayed
+from abstractgraph.graphs import graph_to_abstract_graph
 from abstractgraph.hashing import hash_graph
+from sklearn.metrics import pairwise_distances
 
 
 DrawGraphsFn = Callable[..., object]
@@ -182,6 +185,120 @@ def make_edge_regression_dataset(
     return positives, negatives, dataset
 
 
+def make_edge_regression_dataset_subgraph_ordered(
+    seed_graph: nx.Graph,
+    *,
+    decomposition_function,
+    nbits: int,
+    n_negative_per_positive: int,
+    n_replicates: int = 1,
+    seed: int | None = None,
+    allow_self_loops: bool = False,
+):
+    rng = random.Random(seed)
+    positives = []
+    negatives = []
+    dataset = []
+
+    if n_replicates < 1:
+        raise ValueError("n_replicates must be >= 1")
+
+    edge_groups = _decomposition_edge_groups(
+        seed_graph,
+        decomposition_function=decomposition_function,
+        nbits=nbits,
+    )
+
+    for _ in range(n_replicates):
+        current_graph = seed_graph.copy()
+        replicate_groups = [list(group) for group in edge_groups]
+        rng.shuffle(replicate_groups)
+
+        for group in replicate_groups:
+            while True:
+                remaining_group_edges = [
+                    edge for edge in group if _graph_has_canonical_edge(current_graph, edge)
+                ]
+                if not remaining_group_edges:
+                    break
+                edge = rng.choice(remaining_group_edges)
+                positive_graph = current_graph.copy()
+                positive_graph.remove_edge(*edge)
+
+                positives.append(positive_graph)
+                dataset.append((positive_graph, 1))
+
+                if positive_graph.number_of_edges() > 0:
+                    negative_graphs = edge_neighbors(
+                        positive_graph,
+                        n_samples=n_negative_per_positive,
+                        seed=rng.randrange(10**9),
+                        allow_self_loops=allow_self_loops,
+                    )
+                    negatives.extend(negative_graphs)
+                    dataset.extend((negative_graph, 0) for negative_graph in negative_graphs)
+
+                current_graph = positive_graph
+                if current_graph.number_of_edges() == 0:
+                    break
+
+            if current_graph.number_of_edges() == 0:
+                break
+
+    return positives, negatives, dataset
+
+
+def _decomposition_edge_groups(
+    graph: nx.Graph,
+    *,
+    decomposition_function,
+    nbits: int,
+):
+    abstract_graph = graph_to_abstract_graph(
+        graph,
+        decomposition_function=decomposition_function,
+        nbits=nbits,
+    )
+    groups = []
+    seen_groups = set()
+    full_graph_edges = frozenset(_canonicalize_edge(edge, graph) for edge in graph.edges())
+
+    for subgraph in abstract_graph.get_interpretation_nodes_mapped_subgraphs():
+        if subgraph is None or subgraph.number_of_edges() == 0:
+            continue
+        group_edges = frozenset(_canonicalize_edge(edge, graph) for edge in subgraph.edges())
+        if not group_edges:
+            continue
+        # Skip the default full-graph interpretation node; keep only actual decomposition groups.
+        if group_edges == full_graph_edges:
+            continue
+        if group_edges in seen_groups:
+            continue
+        seen_groups.add(group_edges)
+        groups.append(list(group_edges))
+
+    covered_edges = set()
+    for group in groups:
+        covered_edges.update(group)
+    leftover_edges = [edge for edge in full_graph_edges if edge not in covered_edges]
+    if leftover_edges:
+        groups.append(leftover_edges)
+
+    return groups if groups else [list(full_graph_edges)]
+
+
+def _canonicalize_edge(edge, graph: nx.Graph):
+    u, v = edge[:2]
+    if nx.is_directed(graph):
+        return (u, v)
+    return tuple(sorted((u, v)))
+
+
+def _graph_has_canonical_edge(graph: nx.Graph, edge) -> bool:
+    u, v = edge
+    return graph.has_edge(u, v)
+
+
 def _connected_component_subgraphs(graph: nx.Graph):
     if nx.is_directed(graph):
         components = nx.weakly_connected_components(graph)
@@ -224,6 +341,7 @@ class EdgeGenerator:
         graph_estimator,
         target_estimator=None,
         target_estimator_mode: str = "classification",
+        decomposition_function=None,
         *,
         n_negative_per_positive: int = 3,
         n_replicates: int = 1,
@@ -252,6 +370,7 @@ class EdgeGenerator:
                 "target_estimator_mode must be 'classification' or 'regression'"
             )
         self.target_estimator_mode = target_estimator_mode
+        self.decomposition_function = decomposition_function
         self.n_negative_per_positive = n_negative_per_positive
         self.n_replicates = n_replicates
         self.beam_size = beam_size
@@ -287,6 +406,12 @@ class EdgeGenerator:
         self.diversity_memory_hash_set_ = set()
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
+        self.stored_graphs_ = None
+        self.stored_targets_ = None
+        self.stored_graph_hash_to_index_ = {}
+        self.retrieval_transformer_ = None
+        self.stored_retrieval_vectors_ = None
+        self.stored_distance_matrix_ = None
 
     def fit(self, graphs, targets=None):
         graph_list = self._as_graph_list(graphs)
@@ -376,6 +501,40 @@ class EdgeGenerator:
         )
         return self
 
+    def store(self, graphs, targets=None):
+        graph_list = [graph.copy() for graph in self._as_graph_list(graphs)]
+        if len(graph_list) < 2:
+            raise ValueError("store(graphs, ...) requires at least two graphs")
+
+        self.stored_graphs_ = graph_list
+        if targets is None:
+            self.stored_targets_ = None
+        else:
+            self.stored_targets_ = list(
+                self._coerce_optional_per_graph_argument(
+                    targets,
+                    self.stored_graphs_,
+                    name="targets",
+                )
+            )
+
+        self.stored_graph_hash_to_index_ = {}
+        for idx, graph in enumerate(self.stored_graphs_):
+            graph_hash = hash_graph(graph)
+            if graph_hash not in self.stored_graph_hash_to_index_:
+                self.stored_graph_hash_to_index_[graph_hash] = idx
+
+        transformer = self._make_retrieval_transformer()
+        self.retrieval_transformer_ = transformer
+        self.stored_retrieval_vectors_ = self._vectorize_retrieval_graphs(
+            transformer,
+            self.stored_graphs_,
+            fit=True,
+        )
+        self.stored_distance_matrix_ = pairwise_distances(self.stored_retrieval_vectors_)
+        np.fill_diagonal(self.stored_distance_matrix_, 0.0)
+        return self
+
     def generate(
         self,
         graphs,
@@ -383,6 +542,7 @@ class EdgeGenerator:
         *,
         target=None,
         target_lambda: float = 1.0,
+        return_path: bool = True,
         draw_graphs_fn: DrawGraphsFn | None = None,
         verbose: bool | None = None,
     ):
@@ -428,8 +588,83 @@ class EdgeGenerator:
             paths.append(path)
 
         if self._is_single_graph_input(graphs):
-            return paths[0] if paths else []
-        return paths
+            if not paths:
+                return [] if return_path else None
+            return paths[0] if return_path else paths[0][-1]
+        if return_path:
+            return paths
+        return [path[-1] for path in paths]
+
+    def generate_from_pair(
+        self,
+        graph_a,
+        graph_b,
+        *,
+        size=0.5,
+        n_paths: int = 3,
+        target=None,
+        target_lambda: float = 1.0,
+        return_path: bool = True,
+        draw_graphs_fn: DrawGraphsFn | None = None,
+        verbose: bool | None = None,
+    ):
+        self._require_stored_dataset()
+        verbose = self.verbose if verbose is None else verbose
+
+        query = self._build_pair_query_corpus(graph_a, graph_b)
+        paths = self._shortest_paths_from_matrix(
+            query["distance_matrix"],
+            query["source_idx"],
+            query["dest_idx"],
+            n_paths=n_paths,
+        )
+        if not paths:
+            raise ValueError("Could not find shortest paths between the requested graphs")
+
+        selected_indices = sorted({idx for path in paths for idx in path})
+        fit_graphs = [query["graphs"][idx].copy() for idx in selected_indices]
+        fit_targets = None
+        if query["targets"] is not None:
+            fit_targets = [query["targets"][idx] for idx in selected_indices]
+
+        if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
+            self.fit(fit_graphs, targets=fit_targets)
+        else:
+            self.fit(fit_graphs)
+            if self.target_estimator is not None and fit_targets is not None:
+                labeled_pairs = [
+                    (graph, target_value)
+                    for graph, target_value in zip(fit_graphs, fit_targets)
+                    if target_value is not None
+                ]
+                if labeled_pairs:
+                    labeled_graphs, labeled_targets = zip(*labeled_pairs)
+                    self.fit_target_estimator(list(labeled_graphs), list(labeled_targets))
+
+        start_graph_a, target_n_edges_a = remove_edges(graph_a, size=size)
+        start_graph_b, target_n_edges_b = remove_edges(graph_b, size=size)
+        mixed_graph = mix_connected_components(
+            start_graph_a,
+            start_graph_b,
+            seed=self.rng.randrange(10**9),
+        )
+        mixed_target_n_edges = int(round(np.mean([target_n_edges_a, target_n_edges_b])))
+        resolved_target = target
+        if resolved_target is None:
+            resolved_target = self._infer_pair_target(
+                query["targets"][query["source_idx"]] if query["targets"] is not None else None,
+                query["targets"][query["dest_idx"]] if query["targets"] is not None else None,
+            )
+
+        return self.generate(
+            mixed_graph,
+            mixed_target_n_edges,
+            target=resolved_target,
+            target_lambda=target_lambda,
+            return_path=return_path,
+            draw_graphs_fn=draw_graphs_fn,
+            verbose=verbose,
+        )
 
     def _generate_one(
         self,
@@ -757,18 +992,219 @@ class EdgeGenerator:
 
         return unique_retained
 
+    def _require_stored_dataset(self):
+        if self.stored_graphs_ is None or self.stored_distance_matrix_ is None:
+            raise ValueError("Call store(graphs, targets=...) before generate_from_pair")
+
+    def _make_retrieval_transformer(self):
+        transformer = getattr(self.graph_estimator, "transformer", None)
+        if transformer is None:
+            raise ValueError("graph_estimator must expose a transformer for store(...)")
+        return copy.deepcopy(transformer)
+
+    def _vectorize_retrieval_graphs(self, transformer, graphs, *, fit: bool):
+        if fit and hasattr(transformer, "fit_transform"):
+            features = transformer.fit_transform(graphs)
+        elif fit and hasattr(transformer, "fit") and hasattr(transformer, "transform"):
+            transformer.fit(graphs)
+            features = transformer.transform(graphs)
+        elif hasattr(transformer, "transform"):
+            features = transformer.transform(graphs)
+        else:
+            raise ValueError(
+                "retrieval transformer must provide fit_transform(...) or transform(...)"
+            )
+        if hasattr(features, "toarray"):
+            features = features.toarray()
+        return np.asarray(features, dtype=float)
+
+    def _build_pair_query_corpus(self, graph_a, graph_b):
+        graphs = [graph.copy() for graph in self.stored_graphs_]
+        targets = None if self.stored_targets_ is None else list(self.stored_targets_)
+        vectors = np.asarray(self.stored_retrieval_vectors_, dtype=float)
+        distance_matrix = np.asarray(self.stored_distance_matrix_, dtype=float).copy()
+
+        source_idx, graphs, targets, vectors, distance_matrix = self._resolve_or_append_query_graph(
+            graph_a,
+            graphs=graphs,
+            targets=targets,
+            vectors=vectors,
+            distance_matrix=distance_matrix,
+        )
+        dest_idx, graphs, targets, vectors, distance_matrix = self._resolve_or_append_query_graph(
+            graph_b,
+            graphs=graphs,
+            targets=targets,
+            vectors=vectors,
+            distance_matrix=distance_matrix,
+        )
+        if source_idx == dest_idx:
+            raise ValueError("graph_a and graph_b resolve to the same stored/query graph")
+        return {
+            "graphs": graphs,
+            "targets": targets,
+            "vectors": vectors,
+            "distance_matrix": distance_matrix,
+            "source_idx": source_idx,
+            "dest_idx": dest_idx,
+        }
+
+    def _resolve_or_append_query_graph(
+        self,
+        graph,
+        *,
+        graphs,
+        targets,
+        vectors,
+        distance_matrix,
+    ):
+        graph_hash = hash_graph(graph)
+        stored_idx = self.stored_graph_hash_to_index_.get(graph_hash)
+        if stored_idx is not None:
+            return stored_idx, graphs, targets, vectors, distance_matrix
+
+        graph_copy = graph.copy()
+        query_vector = self._vectorize_retrieval_graphs(
+            self.retrieval_transformer_,
+            [graph_copy],
+            fit=False,
+        )[0]
+        idx = len(graphs)
+        graphs.append(graph_copy)
+        if targets is not None:
+            targets.append(None)
+        distance_matrix = self._append_distance_row(distance_matrix, vectors, query_vector)
+        vectors = np.vstack([vectors, query_vector])
+        return idx, graphs, targets, vectors, distance_matrix
+
+    def _append_distance_row(self, distance_matrix, vectors, query_vector):
+        if vectors.size == 0:
+            return np.zeros((1, 1), dtype=float)
+        distances = pairwise_distances(
+            np.asarray(query_vector, dtype=float).reshape(1, -1),
+            np.asarray(vectors, dtype=float),
+        ).ravel()
+        old_n = distance_matrix.shape[0]
+        expanded = np.zeros((old_n + 1, old_n + 1), dtype=float)
+        expanded[:old_n, :old_n] = distance_matrix
+        expanded[-1, :-1] = distances
+        expanded[:-1, -1] = distances
+        expanded[-1, -1] = 0.0
+        return expanded
+
+    def _shortest_paths_from_matrix(self, distance_matrix, source_idx, dest_idx, *, n_paths: int):
+        if n_paths < 1:
+            raise ValueError("n_paths must be >= 1")
+        working_matrix = np.asarray(distance_matrix, dtype=float).copy()
+        paths = []
+        for _ in range(n_paths):
+            path = self._dense_shortest_path(working_matrix, source_idx, dest_idx)
+            if not path:
+                break
+            paths.append(path)
+            self._remove_path_edges_from_matrix(working_matrix, path)
+        return paths
+
+    def _dense_shortest_path(self, distance_matrix: np.ndarray, source_idx: int, dest_idx: int):
+        n_nodes = distance_matrix.shape[0]
+        inf = float("inf")
+        dist = np.full(n_nodes, inf, dtype=float)
+        prev = np.full(n_nodes, -1, dtype=int)
+        visited = np.zeros(n_nodes, dtype=bool)
+        dist[source_idx] = 0.0
+
+        for _ in range(n_nodes):
+            current = -1
+            current_dist = inf
+            for node_idx in range(n_nodes):
+                if visited[node_idx]:
+                    continue
+                if dist[node_idx] < current_dist:
+                    current = node_idx
+                    current_dist = dist[node_idx]
+            if current < 0 or not np.isfinite(current_dist):
+                break
+            if current == dest_idx:
+                break
+            visited[current] = True
+
+            row = distance_matrix[current]
+            for neighbor_idx, weight in enumerate(row):
+                if visited[neighbor_idx] or neighbor_idx == current:
+                    continue
+                if not np.isfinite(weight):
+                    continue
+                candidate_dist = current_dist + weight
+                if candidate_dist < dist[neighbor_idx]:
+                    dist[neighbor_idx] = candidate_dist
+                    prev[neighbor_idx] = current
+
+        if not np.isfinite(dist[dest_idx]):
+            return []
+
+        path = [dest_idx]
+        cursor = dest_idx
+        while cursor != source_idx:
+            cursor = prev[cursor]
+            if cursor < 0:
+                return []
+            path.append(int(cursor))
+        path.reverse()
+        return path
+
+    def _remove_path_edges_from_matrix(self, distance_matrix: np.ndarray, path):
+        for left, right in zip(path[:-1], path[1:]):
+            distance_matrix[left, right] = np.inf
+            distance_matrix[right, left] = np.inf
+
+    def _infer_pair_target(self, target_a, target_b):
+        if target_a is None or target_b is None:
+            return None
+        if not isinstance(target_a, (int, float, np.integer, np.floating)):
+            return None
+        if not isinstance(target_b, (int, float, np.integer, np.floating)):
+            return None
+        mean_target = 0.5 * (float(target_a) + float(target_b))
+        if self.target_estimator_mode == "regression":
+            return mean_target
+        return int(round(mean_target))
+
     def _build_fragment_datasets(self, graphs):
         dataset_seeds = [self.rng.randrange(10**9) for _ in graphs]
+        dataset_builder = self._dataset_builder()
         return Parallel(n_jobs=self.fit_n_jobs, backend=self.fit_backend)(
-            delayed(make_edge_regression_dataset)(
+            delayed(dataset_builder)(
                 graph,
-                n_negative_per_positive=self.n_negative_per_positive,
-                n_replicates=self.n_replicates,
-                seed=dataset_seed,
-                allow_self_loops=self.allow_self_loops,
+                **self._dataset_builder_kwargs(dataset_seed),
             )
             for graph, dataset_seed in zip(graphs, dataset_seeds)
         )
+
+    def _dataset_builder(self):
+        if self.decomposition_function is None:
+            return make_edge_regression_dataset
+        return make_edge_regression_dataset_subgraph_ordered
+
+    def _dataset_builder_kwargs(self, dataset_seed: int):
+        kwargs = dict(
+            n_negative_per_positive=self.n_negative_per_positive,
+            n_replicates=self.n_replicates,
+            seed=dataset_seed,
+            allow_self_loops=self.allow_self_loops,
+        )
+        if self.decomposition_function is not None:
+            kwargs["decomposition_function"] = self.decomposition_function
+            kwargs["nbits"] = self._decomposition_nbits()
+        return kwargs
+
+    def _decomposition_nbits(self) -> int:
+        transformer = getattr(self.graph_estimator, "transformer", None)
+        nbits = getattr(transformer, "nbits", None)
+        if nbits is None:
+            raise ValueError(
+                "decomposition_function requires graph_estimator.transformer.nbits"
+            )
+        return int(nbits)
 
     def _store_graph_estimator_training_data(self, dataset_parts):
         self.positives_ = []
