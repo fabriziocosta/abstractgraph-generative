@@ -636,7 +636,7 @@ class EdgeGenerator:
             )
             print(f"[pair] selected_indices={selected_indices}")
             for path_idx, path in enumerate(paths, start=1):
-                row_indices = [query["source_idx"], *path, query["dest_idx"]]
+                row_indices = list(path)
                 row_graphs = [query["graphs"][idx] for idx in row_indices]
                 row_titles = []
                 for position, idx in enumerate(row_indices):
@@ -728,11 +728,16 @@ class EdgeGenerator:
         start_time = time.perf_counter()
         if verbose:
             remaining_edges = n_edges - start_graph.number_of_edges()
-            print(
-                f"[graph {graph_index}] start start_edges={start_graph.number_of_edges()} "
-                f"target_edges={n_edges} remaining_edges={remaining_edges} "
-                f"target={target} target_lambda={target_lambda:.3f}"
-            )
+            start_parts = [
+                f"[graph {graph_index}] start",
+                f"start_edges={start_graph.number_of_edges()}",
+                f"target_edges={n_edges}",
+                f"remaining_edges={remaining_edges}",
+            ]
+            if target is not None:
+                start_parts.append(f"target={target}")
+                start_parts.append(f"target_lambda={target_lambda:.3f}")
+            print(" ".join(start_parts))
             self._draw_graphs(draw_graphs_fn, [start_graph])
 
         if start_graph.number_of_edges() == n_edges:
@@ -823,12 +828,14 @@ class EdgeGenerator:
             retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
 
             if verbose:
+                target_active = target is not None
+                repulsion_active = repulsion_lambda > 0.0
                 best_score = retained[0]["score"] if retained else None
                 best_selection_score = (
                     retained[0]["selection_score"] if retained else None
-                )
+                ) if (target_active or repulsion_active) else None
                 best_target_score = (
-                    retained[0].get("target_score") if retained else None
+                    retained[0].get("target_score") if retained and target_active else None
                 )
                 best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
                 step_elapsed = time.perf_counter() - step_start_time
@@ -852,29 +859,53 @@ class EdgeGenerator:
                 remaining_edges = max(0, n_edges - current_edges)
                 eta = remaining_edges * step_elapsed
                 eta_str = self._format_minutes_seconds(eta)
-                print(
+                line1 = (
                     f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
                     f"depth={next_depth} remaining_edges={remaining_edges} "
-                    f"step_time={step_elapsed_str} eta={eta_str}\n"
-                    f"generated={len(generated)} feasible={len(feasible_candidates)} "
-                    f"retained={len(retained)} tried={self.n_tried_}\n"
-                    f"best_score={best_score_str} "
-                    f"best_target_score={best_target_score_str} "
-                    f"best_selection_score={best_selection_score_str} "
-                    f"best_repulsion={best_repulsion:.3f}\n"
-                    f"target_lambda={target_lambda:.3f} "
-                    f"repulsion_lambda={repulsion_lambda:.3f} "
-                    f"beam_limit={beam_limit}"
+                    f"step_time={step_elapsed_str} eta={eta_str}"
                 )
+                line2 = (
+                    f"generated={len(generated)} feasible={len(feasible_candidates)} "
+                    f"retained={len(retained)} tried={self.n_tried_}"
+                )
+                line3_parts = [f"best_score={best_score_str}"]
+                if target_active:
+                    line3_parts.append(f"best_target_score={best_target_score_str}")
+                if target_active or repulsion_active:
+                    line3_parts.append(f"best_selection_score={best_selection_score_str}")
+                if repulsion_active:
+                    line3_parts.append(f"best_repulsion={best_repulsion:.3f}")
+                line4_parts = []
+                if target_active:
+                    line4_parts.append(f"target_lambda={target_lambda:.3f}")
+                if repulsion_active:
+                    line4_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
+                line4_parts.append(f"beam_limit={beam_limit}")
+                print("\n".join([line1, line2, " ".join(line3_parts), " ".join(line4_parts)]))
                 if retained:
                     retained_graphs = [cand["graph"] for cand in retained]
-                    retained_titles = [
-                        f"sel={cand.get('selection_score', cand['score']):.3f} "
-                        f"rep={cand.get('repulsion', 0.0):.3f}\n"
-                        f"clf={cand['score']:.3f} "
-                        f"tgt={cand.get('target_score', 0.0):.3f}"
-                        for cand in retained
-                    ]
+                    retained_titles = []
+                    for cand in retained:
+                        title_line1_parts = []
+                        title_line2_parts = [f"clf={cand['score']:.3f}"]
+                        if target_active or repulsion_active:
+                            title_line1_parts.append(
+                                f"sel={cand.get('selection_score', cand['score']):.3f}"
+                            )
+                        if repulsion_active:
+                            title_line1_parts.append(
+                                f"rep={cand.get('repulsion', 0.0):.3f}"
+                            )
+                        if target_active:
+                            title_line2_parts.append(
+                                f"tgt={cand.get('target_score', 0.0):.3f}"
+                            )
+                        if title_line1_parts:
+                            retained_titles.append(
+                                " ".join(title_line1_parts) + "\n" + " ".join(title_line2_parts)
+                            )
+                        else:
+                            retained_titles.append(" ".join(title_line2_parts))
                     self._draw_graphs(
                         draw_graphs_fn,
                         retained_graphs,
