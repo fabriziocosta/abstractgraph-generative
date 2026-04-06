@@ -600,7 +600,7 @@ class EdgeGenerator:
         graph_a,
         graph_b,
         *,
-        size=0.5,
+        size_of_edge_removal=0.5,
         n_paths: int = 3,
         target=None,
         target_lambda: float = 1.0,
@@ -627,6 +627,40 @@ class EdgeGenerator:
         if query["targets"] is not None:
             fit_targets = [query["targets"][idx] for idx in selected_indices]
 
+        if verbose:
+            path_lengths = [len(path) for path in paths]
+            print(
+                f"[pair] source_idx={query['source_idx']} dest_idx={query['dest_idx']} "
+                f"n_paths={len(paths)} selected_graphs={len(fit_graphs)} "
+                f"path_lengths={path_lengths}"
+            )
+            print(f"[pair] selected_indices={selected_indices}")
+            for path_idx, path in enumerate(paths, start=1):
+                row_indices = [query["source_idx"], *path, query["dest_idx"]]
+                row_graphs = [query["graphs"][idx] for idx in row_indices]
+                row_titles = []
+                for position, idx in enumerate(row_indices):
+                    target_value = (
+                        query["targets"][idx]
+                        if query["targets"] is not None and idx < len(query["targets"])
+                        else None
+                    )
+                    label = f"idx={idx}"
+                    if position == 0:
+                        label = f"src\n{label}"
+                    elif position == len(row_indices) - 1:
+                        label = f"dest\n{label}"
+                    if target_value is not None:
+                        label = f"{label}\ntgt={target_value}"
+                    row_titles.append(label)
+                print(f"[pair] path {path_idx}/{len(paths)} indices={path}")
+                self._draw_graphs(
+                    draw_graphs_fn,
+                    row_graphs,
+                    n_graphs_per_line=len(row_graphs),
+                    titles=row_titles,
+                )
+
         if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
             self.fit(fit_graphs, targets=fit_targets)
         else:
@@ -641,8 +675,14 @@ class EdgeGenerator:
                     labeled_graphs, labeled_targets = zip(*labeled_pairs)
                     self.fit_target_estimator(list(labeled_graphs), list(labeled_targets))
 
-        start_graph_a, target_n_edges_a = remove_edges(graph_a, size=size)
-        start_graph_b, target_n_edges_b = remove_edges(graph_b, size=size)
+        start_graph_a, target_n_edges_a = remove_edges(
+            graph_a,
+            size=size_of_edge_removal,
+        )
+        start_graph_b, target_n_edges_b = remove_edges(
+            graph_b,
+            size=size_of_edge_removal,
+        )
         mixed_graph = mix_connected_components(
             start_graph_a,
             start_graph_b,
