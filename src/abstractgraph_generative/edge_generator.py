@@ -233,6 +233,7 @@ class EdgeGenerator:
         fallback_growth_factor: float = 2.0,
         beam_growth_factor: float = 1.5,
         max_beam_size: int | None = None,
+        enforce_diversity: bool = True,
         use_similarity_repulsion: bool = True,
         repulsion_weight: float = 0.2,
         repulsion_growth_factor: float = 1.5,
@@ -259,6 +260,7 @@ class EdgeGenerator:
         self.fallback_growth_factor = fallback_growth_factor
         self.beam_growth_factor = beam_growth_factor
         self.max_beam_size = max_beam_size
+        self.enforce_diversity = enforce_diversity
         self.use_similarity_repulsion = use_similarity_repulsion
         self.repulsion_weight = repulsion_weight
         self.repulsion_growth_factor = repulsion_growth_factor
@@ -281,6 +283,8 @@ class EdgeGenerator:
         self.n_tried_ = 0
         self.max_depth_ = 0
         self.embedding_cache_ = {}
+        self.diversity_memory_hashes_ = []
+        self.diversity_memory_hash_set_ = set()
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
 
@@ -290,7 +294,10 @@ class EdgeGenerator:
         dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
         self._store_graph_estimator_training_data(dataset_parts)
 
-        fit_graphs = [graph for graph in self.positives_ if graph.number_of_edges() > 0]
+        fit_graphs = self._unique_graphs(
+            list(self.seed_graphs_)
+            + [graph for graph in self.positives_ if graph.number_of_edges() > 0]
+        )
         feasibility_fit_start = time.perf_counter()
         self.feasibility_estimator.fit(fit_graphs)
         feasibility_fit_time = time.perf_counter() - feasibility_fit_start
@@ -343,6 +350,7 @@ class EdgeGenerator:
             self.seed_graphs_
         )
         self.embedding_cache_ = {}
+        self._initialize_diversity_memory(self.seed_graphs_)
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
         return self
@@ -530,6 +538,11 @@ class EdgeGenerator:
                     continue
                 if cand["path_signature"] in tabu_path_signatures:
                     continue
+                if (
+                    self.enforce_diversity
+                    and cand["graph_hash"] in self.diversity_memory_hash_set_
+                ):
+                    continue
                 unseen_candidates.append(cand)
 
             retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
@@ -670,12 +683,14 @@ class EdgeGenerator:
 
     def _make_state(self, graph, parent, score):
         state_key = self._state_key(graph)
+        graph_hash = hash_graph(graph)
         if parent is None:
             path_signature = (state_key,)
         else:
             path_signature = parent["path_signature"] + (state_key,)
         return {
             "graph": graph,
+            "graph_hash": graph_hash,
             "parent": parent,
             "score": score,
             "selection_score": score,
@@ -722,7 +737,7 @@ class EdgeGenerator:
         seen_hashes = set()
 
         def add_candidate(candidate):
-            graph_hash = hash_graph(candidate["graph"])
+            graph_hash = candidate.get("graph_hash", hash_graph(candidate["graph"]))
             if graph_hash in seen_hashes:
                 return False
             seen_hashes.add(graph_hash)
@@ -835,26 +850,42 @@ class EdgeGenerator:
         return f"{elapsed_min}m {elapsed_sec:.1f}s"
 
     def _repulsion_values(self, graphs, *, fallback_index: int):
-        if (
-            not self.use_similarity_repulsion
-            or fallback_index < 0
-            or not self.failed_memory_hashes_
-            or self.repulsion_weight <= 0
-        ):
+        memory_hashes = self._repulsion_memory_hashes(fallback_index)
+        if not memory_hashes or self.repulsion_weight <= 0:
             return np.zeros(len(graphs), dtype=float), 0.0
         candidate_embeddings = self._graph_embeddings(graphs)
-        memory_embeddings = np.vstack(
-            [self.embedding_cache_[graph_hash] for graph_hash in self.failed_memory_hashes_]
-        )
+        memory_embeddings = self._graph_embeddings_from_hashes(memory_hashes)
         candidate_norm = self._normalize_rows(candidate_embeddings)
         memory_norm = self._normalize_rows(memory_embeddings)
         similarities = candidate_norm @ memory_norm.T
         repulsion = np.maximum(0.0, np.max(similarities, axis=1))
-        lam = float(
-            self.repulsion_weight
-            * (self.repulsion_growth_factor ** max(0, fallback_index))
-        )
+        if fallback_index < 0:
+            lam = float(self.repulsion_weight)
+        else:
+            lam = float(
+                self.repulsion_weight
+                * (self.repulsion_growth_factor ** max(0, fallback_index))
+            )
         return repulsion, lam
+
+    def _repulsion_memory_hashes(self, fallback_index: int):
+        memory_hashes = []
+        if self.enforce_diversity and self.diversity_memory_hashes_:
+            memory_hashes.extend(self.diversity_memory_hashes_)
+        if (
+            self.use_similarity_repulsion
+            and fallback_index >= 0
+            and self.failed_memory_hashes_
+        ):
+            memory_hashes.extend(self.failed_memory_hashes_)
+        deduped_hashes = []
+        seen_hashes = set()
+        for graph_hash in memory_hashes:
+            if graph_hash in seen_hashes:
+                continue
+            seen_hashes.add(graph_hash)
+            deduped_hashes.append(graph_hash)
+        return deduped_hashes
 
     def _remember_failed_graphs(self, graphs) -> None:
         if not self.use_similarity_repulsion or self.max_repulsion_memory <= 0:
@@ -873,15 +904,31 @@ class EdgeGenerator:
     def _graph_hashes(self, graphs):
         return [hash_graph(graph) for graph in graphs]
 
+    def _unique_graphs(self, graphs):
+        unique_graphs = []
+        seen_hashes = set()
+        for graph in graphs:
+            graph_hash = hash_graph(graph)
+            if graph_hash in seen_hashes:
+                continue
+            seen_hashes.add(graph_hash)
+            unique_graphs.append(graph)
+        return unique_graphs
+
     def _graph_embeddings(self, graphs):
         graph_hashes = self._graph_hashes(graphs)
+        return self._graph_embeddings_from_hashes(graph_hashes, graphs=graphs)
+
+    def _graph_embeddings_from_hashes(self, graph_hashes, *, graphs=None):
+        graph_hashes = list(graph_hashes)
         missing_graphs = []
         missing_hashes = []
-        for graph, graph_hash in zip(graphs, graph_hashes):
-            if graph_hash in self.embedding_cache_:
-                continue
-            missing_graphs.append(graph)
-            missing_hashes.append(graph_hash)
+        if graphs is not None:
+            for graph, graph_hash in zip(graphs, graph_hashes):
+                if graph_hash in self.embedding_cache_:
+                    continue
+                missing_graphs.append(graph)
+                missing_hashes.append(graph_hash)
         if missing_graphs:
             raw_features = self.graph_estimator._transform_raw(missing_graphs)
             rows = self._matrix_to_rows(raw_features)
@@ -890,6 +937,19 @@ class EdgeGenerator:
         if not graph_hashes:
             return np.empty((0, 0), dtype=float)
         return np.vstack([self.embedding_cache_[graph_hash] for graph_hash in graph_hashes])
+
+    def _initialize_diversity_memory(self, graphs):
+        self.diversity_memory_hashes_ = []
+        self.diversity_memory_hash_set_ = set()
+        if not self.enforce_diversity:
+            return
+        diversity_hashes = self._graph_hashes(graphs)
+        self._graph_embeddings(graphs)
+        for graph_hash in diversity_hashes:
+            if graph_hash in self.diversity_memory_hash_set_:
+                continue
+            self.diversity_memory_hashes_.append(graph_hash)
+            self.diversity_memory_hash_set_.add(graph_hash)
 
     def _matrix_to_rows(self, features):
         if hasattr(features, "toarray"):
