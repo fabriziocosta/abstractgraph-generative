@@ -31,6 +31,9 @@ from abstractgraph_generative.edge_generator import (  # noqa: F401
     mix_connected_components,
     remove_edges,
 )
+from abstractgraph_generative.dataset_selection import (  # noqa: F401
+    select_graphs_via_shortest_paths,
+)
 try:
     from abstractgraph_generative.vgae_networkx_wrapper import (  # noqa: F401
         VGAENetworkXGenerator,
@@ -118,6 +121,7 @@ __all__ = [
     "make_edge_regression_dataset",
     "mix_connected_components",
     "remove_edges",
+    "select_graphs_via_shortest_paths",
 ]
 
 if _story_import_error is None:
