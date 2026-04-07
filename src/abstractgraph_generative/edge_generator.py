@@ -412,6 +412,7 @@ class EdgeGenerator:
         self.retrieval_transformer_ = None
         self.stored_retrieval_vectors_ = None
         self.stored_distance_matrix_ = None
+        self.surgical_backtracking_ = True
 
     def fit(self, graphs, targets=None):
         graph_list = self._as_graph_list(graphs)
@@ -612,6 +613,7 @@ class EdgeGenerator:
         self._require_stored_dataset()
         verbose = self.verbose if verbose is None else verbose
 
+        training_set_start = time.perf_counter()
         query = self._build_pair_query_corpus(graph_a, graph_b)
         paths = self._shortest_paths_from_matrix(
             query["distance_matrix"],
@@ -632,13 +634,15 @@ class EdgeGenerator:
         fit_targets = None
         if query["targets"] is not None:
             fit_targets = [query["targets"][idx] for idx in selected_indices]
+        training_set_elapsed = time.perf_counter() - training_set_start
 
         if verbose:
             path_lengths = [len(path) for path in paths]
             print(
                 f"[pair] source_idx={query['source_idx']} dest_idx={query['dest_idx']} "
                 f"n_paths={len(paths)} selected_graphs={len(fit_graphs)} "
-                f"path_lengths={path_lengths}"
+                f"path_lengths={path_lengths} "
+                f"training_set_time={self._format_minutes_seconds(training_set_elapsed)}"
             )
             print(f"[pair] selected_indices={selected_indices}")
             for path_idx, path in enumerate(paths, start=1):
@@ -815,7 +819,7 @@ class EdgeGenerator:
                 )
             return [start_graph]
 
-        beam = [self._make_state(start_graph, parent=None, score=1.0)]
+        beam = [self._make_state(start_graph, parent=None, score=1.0, depth=0)]
         beam_history = [self._copy_beam(beam)]
         blocked_state_keys_by_depth: dict[int, set] = {}
         tabu_path_signatures = set()
@@ -841,25 +845,37 @@ class EdgeGenerator:
                 generated.extend(self._expand_state(state))
 
             self.n_tried_ += len(generated)
-            feasible_candidates = [
-                cand
-                for cand in generated
-                if bool(self.feasibility_estimator.predict([cand["graph"]])[0])
-            ]
+            feasible_candidates = []
+            infeasible_candidates = []
             repulsion_lambda = 0.0
-            if feasible_candidates:
-                positive_scores = self._positive_scores(
-                    [cand["graph"] for cand in feasible_candidates]
+            if generated:
+                generated_graphs = [cand["graph"] for cand in generated]
+                feasibility_mask = np.asarray(
+                    self.feasibility_estimator.predict(generated_graphs),
+                    dtype=bool,
                 )
+                positive_scores = self._positive_scores(generated_graphs)
                 target_scores = self._target_scores(
-                    [cand["graph"] for cand in feasible_candidates],
+                    generated_graphs,
                     target=target,
                 )
-                for cand, score, target_score in zip(
-                    feasible_candidates, positive_scores, target_scores
+                for cand, is_feasible, score, target_score in zip(
+                    generated,
+                    feasibility_mask,
+                    positive_scores,
+                    target_scores,
                 ):
                     cand["score"] = float(score)
                     cand["target_score"] = float(target_score)
+                    cand["selection_score"] = float(
+                        cand["score"] + target_lambda * cand["target_score"]
+                    )
+                    if is_feasible:
+                        feasible_candidates.append(cand)
+                    else:
+                        infeasible_candidates.append(cand)
+
+            if feasible_candidates:
                 repulsions, repulsion_lambda = self._repulsion_values(
                     [cand["graph"] for cand in feasible_candidates],
                     fallback_index=fallback_index,
@@ -867,12 +883,27 @@ class EdgeGenerator:
                 for cand, repulsion in zip(feasible_candidates, repulsions):
                     cand["repulsion"] = float(repulsion)
                     cand["selection_score"] = float(
-                        cand["score"]
-                        + target_lambda * cand.get("target_score", 0.0)
-                        - repulsion_lambda * cand["repulsion"]
+                        cand["selection_score"] - repulsion_lambda * cand["repulsion"]
                     )
                 feasible_candidates.sort(
                     key=lambda cand: cand["selection_score"], reverse=True
+                )
+
+            if infeasible_candidates:
+                violation_counts = np.asarray(
+                    self.feasibility_estimator.number_of_violations(
+                        [cand["graph"] for cand in infeasible_candidates]
+                    ),
+                    dtype=float,
+                ).reshape(-1)
+                for cand, violation_count in zip(infeasible_candidates, violation_counts):
+                    cand["violation_count"] = float(violation_count)
+                infeasible_candidates.sort(
+                    key=lambda cand: (
+                        cand.get("selection_score", cand["score"]),
+                        -cand.get("violation_count", 0.0),
+                    ),
+                    reverse=True,
                 )
 
             next_depth = depth + 1
@@ -1018,9 +1049,45 @@ class EdgeGenerator:
 
             fallback_index += 1
             rollback_steps = self._rollback_steps_for_fallback(fallback_index)
-            fallback_depth = max(0, depth - rollback_steps)
             beam_limit = self._beam_limit_for_fallback(fallback_index)
             self.top_k_ = beam_limit
+            repaired_beam = self._repair_beam_from_infeasible_candidates(
+                beam,
+                infeasible_candidates,
+                rollback_steps=rollback_steps,
+                beam_limit=beam_limit,
+            )
+            if repaired_beam:
+                repaired_depth = repaired_beam[0]["depth"]
+                beam_history = beam_history[: repaired_depth + 1]
+                beam_history[repaired_depth] = self._copy_beam(repaired_beam)
+                beam = repaired_beam
+                depth = repaired_depth
+                visited = self._rebuild_visited_from_history(beam_history)
+                step_start_time = time.perf_counter()
+
+                if verbose:
+                    removed_descriptions = [
+                        ",".join(str(edge) for edge in state.get("repair_removed_edges", ()))
+                        for state in repaired_beam
+                    ]
+                    print(
+                        f"[graph {graph_index}] fallback={fallback_index + 1}/{n_fallbacks} "
+                        f"rollback_steps={rollback_steps} surgical_repairs={len(repaired_beam)} "
+                        f"to_depth={repaired_depth} beam_limit={beam_limit}"
+                    )
+                    print(
+                        f"[graph {graph_index}] surgical_removed_edges={removed_descriptions}"
+                    )
+
+                if verbose and total_phases > 1:
+                    print(
+                        f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
+                        f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
+                    )
+                continue
+
+            fallback_depth = max(0, depth - rollback_steps)
             beam_history = beam_history[: fallback_depth + 1]
             beam = self._copy_beam(beam_history[fallback_depth])
             depth = fallback_depth
@@ -1049,17 +1116,36 @@ class EdgeGenerator:
             for edge_attrs in self.edge_attribute_templates_:
                 candidate_graph = graph.copy()
                 candidate_graph.add_edge(*edge, **edge_attrs)
-                candidates.append(self._make_state(candidate_graph, parent=state, score=None))
+                candidates.append(
+                    self._make_state(
+                        candidate_graph,
+                        parent=state,
+                        score=None,
+                        added_edge=edge,
+                        depth=state["depth"] + 1,
+                    )
+                )
         self.rng.shuffle(candidates)
         return candidates
 
-    def _make_state(self, graph, parent, score):
+    def _make_state(self, graph, parent, score, *, added_edge=None, depth: int | None = None, edge_order=None):
         state_key = self._state_key(graph)
         graph_hash = hash_graph(graph)
         if parent is None:
             path_signature = (state_key,)
         else:
             path_signature = parent["path_signature"] + (state_key,)
+        if edge_order is None:
+            if parent is not None and added_edge is not None:
+                edge_order = parent["edge_order"] + (
+                    _canonicalize_edge(added_edge, graph),
+                )
+            else:
+                edge_order = self._canonical_graph_edges(graph)
+        if depth is None:
+            depth = 0 if parent is None else parent.get("depth", 0)
+            if added_edge is not None:
+                depth += 1
         return {
             "graph": graph,
             "graph_hash": graph_hash,
@@ -1068,7 +1154,171 @@ class EdgeGenerator:
             "selection_score": score,
             "key": state_key,
             "path_signature": path_signature,
+            "added_edge": None if added_edge is None else _canonicalize_edge(added_edge, graph),
+            "repair_removed_edges": (),
+            "edge_order": tuple(edge_order),
+            "depth": int(depth),
         }
+
+    def _repair_beam_from_infeasible_candidates(
+        self,
+        beam,
+        infeasible_candidates,
+        *,
+        rollback_steps: int,
+        beam_limit: int,
+    ):
+        if not self.surgical_backtracking_ or rollback_steps < 1 or not infeasible_candidates:
+            return []
+
+        selected_candidates = self._select_infeasible_candidates_for_repair(
+            beam,
+            infeasible_candidates,
+            beam_limit=beam_limit,
+        )
+        if not selected_candidates:
+            return []
+
+        violating_edge_sets = self.feasibility_estimator.violating_edge_sets(
+            [cand["graph"] for cand in selected_candidates]
+        )
+        for cand, edge_sets in zip(selected_candidates, violating_edge_sets):
+            cand["violating_edge_sets"] = edge_sets
+
+        grouped_candidates: dict[tuple, list] = {}
+        for cand in selected_candidates:
+            grouped_candidates.setdefault(cand["parent"]["key"], []).append(cand)
+
+        repaired_states = []
+        for state in beam:
+            state_candidates = grouped_candidates.get(state["key"], [])
+            removed_edges, repair_score = self._select_edges_for_surgical_repair(
+                state,
+                state_candidates,
+                rollback_steps=rollback_steps,
+            )
+            if not removed_edges:
+                continue
+            repaired_states.append(
+                self._make_repaired_state(
+                    state,
+                    removed_edges,
+                    score=repair_score,
+                )
+            )
+
+        if not repaired_states:
+            return []
+
+        repaired_states.sort(
+            key=lambda state: state.get("selection_score", 0.0),
+            reverse=True,
+        )
+        repaired_states = self._deduplicate_retained_candidates(
+            repaired_states,
+            fallback_candidates=[],
+            target_size=min(beam_limit, len(repaired_states)),
+        )
+        return repaired_states
+
+    def _select_infeasible_candidates_for_repair(self, beam, infeasible_candidates, *, beam_limit: int):
+        if not infeasible_candidates:
+            return []
+        by_parent = {state["key"]: [] for state in beam}
+        for cand in infeasible_candidates:
+            parent = cand.get("parent")
+            if parent is None:
+                continue
+            if parent["key"] not in by_parent:
+                continue
+            by_parent[parent["key"]].append(cand)
+        per_parent_limit = max(1, beam_limit)
+        selected = []
+        for state in beam:
+            state_candidates = by_parent.get(state["key"], [])
+            state_candidates.sort(
+                key=lambda cand: (
+                    cand.get("selection_score", cand.get("score", 0.0)),
+                    -cand.get("violation_count", 0.0),
+                ),
+                reverse=True,
+            )
+            selected.extend(state_candidates[:per_parent_limit])
+        return selected
+
+    def _select_edges_for_surgical_repair(self, state, candidates, *, rollback_steps: int):
+        if rollback_steps < 1:
+            return [], 0.0
+
+        parent_edges = set(self._canonical_graph_edges(state["graph"]))
+        if not parent_edges:
+            return [], 0.0
+
+        edge_counts = {}
+        edge_weights = {}
+        recency = self._edge_recency_map(state)
+        for cand in candidates:
+            candidate_score = max(
+                0.0,
+                float(cand.get("selection_score", cand.get("score", 0.0))),
+            )
+            for edge_set in cand.get("violating_edge_sets", []):
+                relevant_edges = [edge for edge in edge_set if edge in parent_edges]
+                if not relevant_edges:
+                    continue
+                increment = 1.0 / float(len(relevant_edges))
+                for edge in relevant_edges:
+                    edge_counts[edge] = edge_counts.get(edge, 0.0) + 1.0
+                    edge_weights[edge] = edge_weights.get(edge, 0.0) + candidate_score * increment
+
+        ranked_edges = sorted(
+            parent_edges,
+            key=lambda edge: (
+                edge_counts.get(edge, 0.0),
+                edge_weights.get(edge, 0.0),
+                recency.get(edge, 0),
+            ),
+            reverse=True,
+        )
+        if not any(edge_counts.get(edge, 0.0) > 0.0 for edge in ranked_edges):
+            return [], 0.0
+        selected = [
+            edge for edge in ranked_edges if edge_counts.get(edge, 0.0) > 0.0
+        ][:rollback_steps]
+
+        if len(selected) < min(rollback_steps, len(parent_edges)):
+            for edge in sorted(parent_edges, key=lambda edge: recency.get(edge, 0), reverse=True):
+                if edge in selected:
+                    continue
+                selected.append(edge)
+                if len(selected) >= min(rollback_steps, len(parent_edges)):
+                    break
+
+        repair_score = float(
+            sum(edge_counts.get(edge, 0.0) for edge in selected)
+            + sum(edge_weights.get(edge, 0.0) for edge in selected)
+        )
+        return selected, repair_score
+
+    def _make_repaired_state(self, state, removed_edges, *, score: float):
+        repaired_graph = state["graph"].copy()
+        for edge in removed_edges:
+            if repaired_graph.has_edge(*edge):
+                repaired_graph.remove_edge(*edge)
+        removed_edge_set = set(removed_edges)
+        repaired_edge_order = tuple(
+            edge for edge in state["edge_order"] if edge not in removed_edge_set
+        )
+        repaired_state = self._make_state(
+            repaired_graph,
+            parent=state,
+            score=score,
+            depth=max(0, state["depth"] - len(removed_edges)),
+            edge_order=repaired_edge_order,
+        )
+        repaired_state["repair_removed_edges"] = tuple(removed_edges)
+        repaired_state["selection_score"] = float(score)
+        return repaired_state
 
     def _select_beam_candidates(self, candidates, *, beam_limit: int | None = None):
         if not candidates:
@@ -1611,6 +1861,17 @@ class EdgeGenerator:
             candidate_edges += [(node, node) for node in nodes]
         occupied = {tuple(edge) for edge in graph.edges()}
         return [edge for edge in candidate_edges if edge not in occupied]
+
+    def _canonical_graph_edges(self, graph: nx.Graph):
+        return tuple(
+            sorted(_canonicalize_edge(edge, graph) for edge in graph.edges())
+        )
+
+    def _edge_recency_map(self, state):
+        return {
+            edge: idx + 1
+            for idx, edge in enumerate(state.get("edge_order", ()))
+        }
 
     def _collect_edge_attribute_templates(self, graphs):
         templates = []

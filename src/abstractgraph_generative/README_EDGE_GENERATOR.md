@@ -303,12 +303,29 @@ generator.generate(start_graph, n_edges=target_n_edges, target=c, target_lambda=
 If `target=None`, the target objective is disabled and scoring falls back to the
 original classifier-plus-repulsion behavior.
 
-## Exponential Fallback
+## Surgical Backtracking
 
-When the active beam reaches a dead end, the generator does not immediately
-restart from the start graph.
+When the active beam reaches a dead end, the generator first tries to repair
+the blocked frontier instead of immediately rewinding to an older beam.
 
-Instead it uses an exponential fallback schedule.
+It does this by looking at the infeasible one-edge expansions that were just
+considered at the dead end:
+
+1. keep the best-scoring infeasible candidates for each blocked beam state
+2. ask the feasibility estimator for `violating_edge_sets(...)`
+3. count how often each parent-edge appears inside those violating edge sets
+4. break ties with candidate score and edge recency
+5. remove exactly as many edges as the fallback policy says to remove
+
+This makes the fallback logic answer two separate questions:
+
+- how many edges to remove
+- which edges to remove
+
+The first still comes from the rollback schedule. The second now comes from
+feasibility evidence whenever the estimator can expose structural violations.
+
+### Rollback Schedule
 
 For fallback index `i`:
 
@@ -317,14 +334,33 @@ rollback_steps_i = ceil(fallback_base_steps * fallback_growth_factor**i)
 beam_limit_i     = ceil(beam_size * beam_growth_factor**(i + 1))
 ```
 
-The fallback depth is:
+At fallback stage `i`, the generator removes `rollback_steps_i` edges from each
+repairable blocked state and resumes search with beam size `beam_limit_i`.
+
+If no useful violating-edge evidence is available, it falls back to the older
+rewind behavior and restores the beam at:
 
 ```text
 fallback_depth = max(0, current_depth - rollback_steps_i)
 ```
 
-If `fallback_depth == 0`, the fallback becomes a full restart from the start
+If `fallback_depth == 0`, that rewind becomes a full restart from the start
 graph.
+
+### Why This Helps
+
+The old fallback policy knew only how far to jump back. The new policy still
+uses that distance, but applies it surgically:
+
+- attractive but infeasible candidates are not discarded as pure noise
+- violating motif edge sets identify which existing edges repeatedly block good
+  continuations
+- repeated evidence across several infeasible candidates increases the priority
+  of removing that edge
+
+This is especially effective with feasibility estimators such as
+`FeasibilityEstimatorFeatureCannotExist`, because they can map forbidden motifs
+back to concrete edge sets.
 
 ### Example
 
@@ -336,27 +372,26 @@ With:
 - `fallback_growth_factor=2.0`
 - `beam_growth_factor=1.5`
 
-the fallback schedule is approximately:
+the rollback schedule is approximately:
 
-1. rollback `2` steps, beam limit `3`
-2. rollback `4` steps, beam limit `5`
-3. rollback `8` steps, beam limit `7`
-4. rollback `16` steps, beam limit `11`
+1. remove `2` edges, beam limit `3`
+2. remove `4` edges, beam limit `5`
+3. remove `8` edges, beam limit `7`
+4. remove `16` edges, beam limit `11`
 
 If the current depth is smaller than the rollback distance, that stage becomes a
 full restart.
 
 `max_restarts` controls the number of fallback stages after the initial search
-phase.
-
-So the total number of search phases is:
+phase, so the total number of search phases is:
 
 ```text
 1 + max_restarts
 ```
 
-This is why verbose logs report a `phase` index rather than only a restart
-counter.
+Verbose logs therefore still report a `phase` index, but they can now also show
+when a fallback stage was handled by surgical edge removal instead of plain beam
+rewind.
 
 ## Dead-End Banning
 
