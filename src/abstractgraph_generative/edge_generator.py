@@ -602,6 +602,7 @@ class EdgeGenerator:
         *,
         size_of_edge_removal=0.5,
         n_paths: int = 3,
+        n_neighbors_per_path_graph: int = 3,
         target=None,
         target_lambda: float = 1.0,
         return_path: bool = True,
@@ -622,6 +623,11 @@ class EdgeGenerator:
             raise ValueError("Could not find shortest paths between the requested graphs")
 
         selected_indices = sorted({idx for path in paths for idx in path})
+        selected_indices = self._augment_indices_with_nearest_neighbors(
+            query["distance_matrix"],
+            selected_indices,
+            k=n_neighbors_per_path_graph,
+        )
         fit_graphs = [query["graphs"][idx].copy() for idx in selected_indices]
         fit_targets = None
         if query["targets"] is not None:
@@ -660,6 +666,24 @@ class EdgeGenerator:
                     n_graphs_per_line=len(row_graphs),
                     titles=row_titles,
                 )
+            training_titles = []
+            for idx in selected_indices:
+                target_value = (
+                    query["targets"][idx]
+                    if query["targets"] is not None and idx < len(query["targets"])
+                    else None
+                )
+                label = f"idx={idx}"
+                if target_value is not None:
+                    label = f"{label}\ntgt={target_value}"
+                training_titles.append(label)
+            print(f"[pair] training_set_indices={selected_indices}")
+            self._draw_graphs(
+                draw_graphs_fn,
+                fit_graphs,
+                n_graphs_per_line=min(len(fit_graphs), 7),
+                titles=training_titles,
+            )
 
         if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
             self.fit(fit_graphs, targets=fit_targets)
@@ -705,6 +729,48 @@ class EdgeGenerator:
             draw_graphs_fn=draw_graphs_fn,
             verbose=verbose,
         )
+
+    def _augment_indices_with_nearest_neighbors(
+        self,
+        distance_matrix,
+        selected_indices,
+        *,
+        k: int,
+    ):
+        if k < 0:
+            raise ValueError("n_neighbors_per_path_graph must be >= 0")
+
+        selected = []
+        seen = set()
+        for idx in selected_indices:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            selected.append(int(idx))
+
+        if k == 0 or not selected:
+            return selected
+
+        distances = np.asarray(distance_matrix, dtype=float)
+        n_nodes = distances.shape[0]
+        for idx in list(selected):
+            if idx < 0 or idx >= n_nodes:
+                continue
+            row = distances[idx]
+            neighbor_order = np.argsort(row, kind="stable")
+            n_added = 0
+            for neighbor_idx in neighbor_order:
+                neighbor_idx = int(neighbor_idx)
+                if neighbor_idx == idx or neighbor_idx in seen:
+                    continue
+                if not np.isfinite(row[neighbor_idx]):
+                    continue
+                seen.add(neighbor_idx)
+                selected.append(neighbor_idx)
+                n_added += 1
+                if n_added >= k:
+                    break
+        return sorted(selected)
 
     def _generate_one(
         self,

@@ -107,6 +107,7 @@ generation_path = generator.generate_from_pair(
     graph_b,
     size=0.5,
     n_paths=3,
+    n_neighbors_per_path_graph=3,
     target=None,
     target_lambda=0.5,
     return_path=True,
@@ -173,6 +174,7 @@ generator.generate_from_pair(
     graph_b,
     size=0.5,
     n_paths=3,
+    n_neighbors_per_path_graph=3,
     target=None,
     target_lambda=1.0,
     return_path=True,
@@ -184,10 +186,11 @@ generator.generate_from_pair(
 1. resolves `graph_a` and `graph_b` to stored indices when their hashes match
 2. otherwise transforms the query graphs on the fly, appends them to a temporary query corpus, and computes shortest paths there
 3. extracts `n_paths` edge-disjoint shortest paths by removing used path edges after each path
-4. fits the generator on the union of graphs appearing on those paths
-5. removes edges from both endpoints
-6. mixes connected components from the two reduced graphs
-7. starts generation from that mixed graph
+4. deduplicates the path graphs and augments that set with up to `n_neighbors_per_path_graph` nearest neighbors per selected graph
+5. fits the generator on the resulting expanded set
+6. removes edges from both endpoints
+7. mixes connected components from the two reduced graphs
+8. starts generation from that mixed graph
 
 If stored targets exist and no explicit `target=` is passed, `generate_from_pair()`
 infers a pair target from the endpoint targets:
