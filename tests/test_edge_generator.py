@@ -7,6 +7,29 @@ import pytest
 from abstractgraph_generative.edge_generator import EdgeGenerator
 
 
+class _RecordingFeasibilityEstimator:
+    def __init__(self, label: str):
+        self.label = label
+        self.fit_sizes = []
+
+    def fit(self, graphs):
+        self.fit_sizes.append(len(graphs))
+        return self
+
+    def predict(self, graphs):
+        return np.ones(len(graphs), dtype=bool)
+
+    def number_of_violations(self, graphs):
+        return np.zeros(len(graphs), dtype=int)
+
+
+class _RecordingGraphEstimator:
+    def fit(self, graphs, targets):
+        self.fit_size = len(graphs)
+        self.targets = np.asarray(targets)
+        return self
+
+
 def test_augment_indices_with_nearest_neighbors_adds_k_per_seed_without_duplicates() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
     distance_matrix = np.asarray(
@@ -46,6 +69,25 @@ def test_augment_indices_with_nearest_neighbors_rejects_negative_k() -> None:
 
     with pytest.raises(ValueError, match="n_neighbors_per_path_graph must be >= 0"):
         generator._augment_indices_with_nearest_neighbors(np.zeros((1, 1)), [0], k=-1)
+
+
+def test_path_matrix_from_distance_matrix_uses_sparse_mst_knn_graph() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    distance_matrix = np.asarray(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [1.0, 0.0, 1.0, 2.0],
+            [2.0, 1.0, 0.0, 1.0],
+            [3.0, 2.0, 1.0, 0.0],
+        ]
+    )
+
+    path_matrix = generator._path_matrix_from_distance_matrix(distance_matrix, k=1)
+
+    assert np.isinf(path_matrix[0, 3])
+    assert path_matrix[0, 1] == 1.0
+    assert path_matrix[1, 2] == 1.0
+    assert path_matrix[2, 3] == 1.0
 
 
 def test_select_edges_for_surgical_repair_prioritizes_repeated_violations() -> None:
@@ -124,3 +166,24 @@ def test_select_edges_for_surgical_repair_requires_violation_evidence() -> None:
 
     assert removed_edges == []
     assert repair_score == 0.0
+
+
+def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_sets() -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        feasibility_estimator=partial_estimator,
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+    graph = nx.path_graph(3)
+
+    generator.fit([graph])
+
+    assert partial_estimator.fit_sizes == [2]
+    assert final_estimator.fit_sizes == [1]
+    assert graph_estimator.fit_size > 0

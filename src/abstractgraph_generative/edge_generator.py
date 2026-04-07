@@ -13,6 +13,7 @@ from joblib import Parallel, delayed
 from abstractgraph.graphs import graph_to_abstract_graph
 from abstractgraph.hashing import hash_graph
 from sklearn.metrics import pairwise_distances
+from abstractgraph_generative.interpolate import _build_adjacency
 
 
 DrawGraphsFn = Callable[..., object]
@@ -337,12 +338,14 @@ def _merge_component_graphs(component_graphs, template_graph: nx.Graph):
 class EdgeGenerator:
     def __init__(
         self,
-        feasibility_estimator,
-        graph_estimator,
+        feasibility_estimator=None,
+        graph_estimator=None,
         target_estimator=None,
         target_estimator_mode: str = "classification",
         decomposition_function=None,
         *,
+        partial_feasibility_estimator=None,
+        final_feasibility_estimator=None,
         n_negative_per_positive: int = 3,
         n_replicates: int = 1,
         beam_size: int = 10,
@@ -362,7 +365,18 @@ class EdgeGenerator:
         verbose: bool = False,
         seed: int | None = None,
     ):
-        self.feasibility_estimator = feasibility_estimator
+        (
+            self.partial_feasibility_estimator,
+            self.final_feasibility_estimator,
+        ) = self._resolve_feasibility_estimators(
+            feasibility_estimator=feasibility_estimator,
+            partial_feasibility_estimator=partial_feasibility_estimator,
+            final_feasibility_estimator=final_feasibility_estimator,
+        )
+        if graph_estimator is None:
+            raise ValueError("graph_estimator is required")
+        # Backward-compatible alias for code that still expects one search-time estimator.
+        self.feasibility_estimator = self.partial_feasibility_estimator
         self.graph_estimator = graph_estimator
         self.target_estimator = target_estimator
         if target_estimator_mode not in {"classification", "regression"}:
@@ -414,27 +428,61 @@ class EdgeGenerator:
         self.stored_distance_matrix_ = None
         self.surgical_backtracking_ = True
 
+    def _resolve_feasibility_estimators(
+        self,
+        *,
+        feasibility_estimator,
+        partial_feasibility_estimator,
+        final_feasibility_estimator,
+    ):
+        resolved_partial = (
+            partial_feasibility_estimator
+            if partial_feasibility_estimator is not None
+            else feasibility_estimator
+        )
+        resolved_final = (
+            final_feasibility_estimator
+            if final_feasibility_estimator is not None
+            else feasibility_estimator
+        )
+        if resolved_partial is None or resolved_final is None:
+            raise ValueError(
+                "Provide feasibility_estimator or both partial_feasibility_estimator "
+                "and final_feasibility_estimator"
+            )
+        if resolved_partial is resolved_final:
+            resolved_final = copy.deepcopy(resolved_final)
+        return resolved_partial, resolved_final
+
     def fit(self, graphs, targets=None):
         graph_list = self._as_graph_list(graphs)
         self.seed_graphs_ = [graph.copy() for graph in graph_list]
         dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
         self._store_graph_estimator_training_data(dataset_parts)
 
-        fit_graphs = self._unique_graphs(
+        partial_fit_graphs = self._unique_graphs(
             list(self.seed_graphs_)
             + [graph for graph in self.positives_ if graph.number_of_edges() > 0]
         )
-        feasibility_fit_start = time.perf_counter()
-        self.feasibility_estimator.fit(fit_graphs)
-        feasibility_fit_time = time.perf_counter() - feasibility_fit_start
+        final_fit_graphs = self._unique_graphs(list(self.seed_graphs_))
+        partial_feasibility_fit_start = time.perf_counter()
+        self.partial_feasibility_estimator.fit(partial_fit_graphs)
+        partial_feasibility_fit_time = time.perf_counter() - partial_feasibility_fit_start
+        final_feasibility_fit_start = time.perf_counter()
+        self.final_feasibility_estimator.fit(final_fit_graphs)
+        final_feasibility_fit_time = time.perf_counter() - final_feasibility_fit_start
         if self.verbose:
-            feasibility_fit_min = int(feasibility_fit_time // 60)
-            feasibility_fit_sec = feasibility_fit_time - 60 * feasibility_fit_min
+            partial_fit_min = int(partial_feasibility_fit_time // 60)
+            partial_fit_sec = partial_feasibility_fit_time - 60 * partial_fit_min
+            final_fit_min = int(final_feasibility_fit_time // 60)
+            final_fit_sec = final_feasibility_fit_time - 60 * final_fit_min
             print(
-                f"[fit] feasibility_graphs={len(fit_graphs)} "
+                f"[fit] partial_feasibility_graphs={len(partial_fit_graphs)} "
+                f"final_feasibility_graphs={len(final_fit_graphs)} "
                 f"positives={len(self.positives_)} negatives={len(self.negatives_)} "
                 f"dataset={len(self.dataset_)} "
-                f"time={feasibility_fit_min}m {feasibility_fit_sec:.1f}s"
+                f"partial_time={partial_fit_min}m {partial_fit_sec:.1f}s "
+                f"final_time={final_fit_min}m {final_fit_sec:.1f}s"
             )
 
         self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
@@ -603,6 +651,7 @@ class EdgeGenerator:
         *,
         size_of_edge_removal=0.5,
         n_paths: int = 3,
+        path_k: int = 3,
         n_neighbors_per_path_graph: int = 3,
         target=None,
         target_lambda: float = 1.0,
@@ -615,8 +664,12 @@ class EdgeGenerator:
 
         training_set_start = time.perf_counter()
         query = self._build_pair_query_corpus(graph_a, graph_b)
-        paths = self._shortest_paths_from_matrix(
+        path_matrix = self._path_matrix_from_distance_matrix(
             query["distance_matrix"],
+            k=path_k,
+        )
+        paths = self._shortest_paths_from_matrix(
+            path_matrix,
             query["source_idx"],
             query["dest_idx"],
             n_paths=n_paths,
@@ -641,6 +694,7 @@ class EdgeGenerator:
             print(
                 f"[pair] source_idx={query['source_idx']} dest_idx={query['dest_idx']} "
                 f"n_paths={len(paths)} selected_graphs={len(fit_graphs)} "
+                f"path_k={path_k} "
                 f"path_lengths={path_lengths} "
                 f"training_set_time={self._format_minutes_seconds(training_set_elapsed)}"
             )
@@ -811,6 +865,8 @@ class EdgeGenerator:
             self._draw_graphs(draw_graphs_fn, [start_graph])
 
         if start_graph.number_of_edges() == n_edges:
+            if not bool(self.final_feasibility_estimator.predict([start_graph])[0]):
+                raise ValueError("Start graph does not satisfy the final feasibility estimator")
             if verbose:
                 print(
                     f"[graph {graph_index}] solved depth=0 max_depth=0 "
@@ -850,8 +906,8 @@ class EdgeGenerator:
             repulsion_lambda = 0.0
             if generated:
                 generated_graphs = [cand["graph"] for cand in generated]
-                feasibility_mask = np.asarray(
-                    self.feasibility_estimator.predict(generated_graphs),
+                partial_feasibility_mask = np.asarray(
+                    self.partial_feasibility_estimator.predict(generated_graphs),
                     dtype=bool,
                 )
                 positive_scores = self._positive_scores(generated_graphs)
@@ -859,9 +915,10 @@ class EdgeGenerator:
                     generated_graphs,
                     target=target,
                 )
-                for cand, is_feasible, score, target_score in zip(
+                partial_terminal_candidates = []
+                for cand, is_partial_feasible, score, target_score in zip(
                     generated,
-                    feasibility_mask,
+                    partial_feasibility_mask,
                     positive_scores,
                     target_scores,
                 ):
@@ -870,10 +927,31 @@ class EdgeGenerator:
                     cand["selection_score"] = float(
                         cand["score"] + target_lambda * cand["target_score"]
                     )
-                    if is_feasible:
-                        feasible_candidates.append(cand)
+                    if is_partial_feasible:
+                        if cand["graph"].number_of_edges() == n_edges:
+                            partial_terminal_candidates.append(cand)
+                        else:
+                            feasible_candidates.append(cand)
                     else:
+                        cand["feasibility_stage"] = "partial"
                         infeasible_candidates.append(cand)
+
+                if partial_terminal_candidates:
+                    final_mask = np.asarray(
+                        self.final_feasibility_estimator.predict(
+                            [cand["graph"] for cand in partial_terminal_candidates]
+                        ),
+                        dtype=bool,
+                    )
+                    for cand, is_final_feasible in zip(
+                        partial_terminal_candidates,
+                        final_mask,
+                    ):
+                        if is_final_feasible:
+                            feasible_candidates.append(cand)
+                        else:
+                            cand["feasibility_stage"] = "final"
+                            infeasible_candidates.append(cand)
 
             if feasible_candidates:
                 repulsions, repulsion_lambda = self._repulsion_values(
@@ -890,14 +968,7 @@ class EdgeGenerator:
                 )
 
             if infeasible_candidates:
-                violation_counts = np.asarray(
-                    self.feasibility_estimator.number_of_violations(
-                        [cand["graph"] for cand in infeasible_candidates]
-                    ),
-                    dtype=float,
-                ).reshape(-1)
-                for cand, violation_count in zip(infeasible_candidates, violation_counts):
-                    cand["violation_count"] = float(violation_count)
+                self._annotate_infeasible_candidates_with_violations(infeasible_candidates)
                 infeasible_candidates.sort(
                     key=lambda cand: (
                         cand.get("selection_score", cand["score"]),
@@ -1179,11 +1250,7 @@ class EdgeGenerator:
         if not selected_candidates:
             return []
 
-        violating_edge_sets = self.feasibility_estimator.violating_edge_sets(
-            [cand["graph"] for cand in selected_candidates]
-        )
-        for cand, edge_sets in zip(selected_candidates, violating_edge_sets):
-            cand["violating_edge_sets"] = edge_sets
+        self._annotate_infeasible_candidates_with_violating_edge_sets(selected_candidates)
 
         grouped_candidates: dict[tuple, list] = {}
         for cand in selected_candidates:
@@ -1245,6 +1312,48 @@ class EdgeGenerator:
             )
             selected.extend(state_candidates[:per_parent_limit])
         return selected
+
+    def _feasibility_estimator_for_stage(self, stage: str):
+        if stage == "final":
+            return self.final_feasibility_estimator
+        return self.partial_feasibility_estimator
+
+    def _annotate_infeasible_candidates_with_violations(self, candidates) -> None:
+        if not candidates:
+            return
+        grouped_candidates = {}
+        for cand in candidates:
+            stage = cand.get("feasibility_stage", "partial")
+            grouped_candidates.setdefault(stage, []).append(cand)
+        for stage, stage_candidates in grouped_candidates.items():
+            estimator = self._feasibility_estimator_for_stage(stage)
+            violation_counts = np.asarray(
+                estimator.number_of_violations(
+                    [cand["graph"] for cand in stage_candidates]
+                ),
+                dtype=float,
+            ).reshape(-1)
+            for cand, violation_count in zip(stage_candidates, violation_counts):
+                cand["violation_count"] = float(violation_count)
+
+    def _annotate_infeasible_candidates_with_violating_edge_sets(self, candidates) -> None:
+        if not candidates:
+            return
+        grouped_candidates = {}
+        for cand in candidates:
+            stage = cand.get("feasibility_stage", "partial")
+            grouped_candidates.setdefault(stage, []).append(cand)
+        for stage, stage_candidates in grouped_candidates.items():
+            estimator = self._feasibility_estimator_for_stage(stage)
+            if not hasattr(estimator, "violating_edge_sets"):
+                for cand in stage_candidates:
+                    cand["violating_edge_sets"] = []
+                continue
+            violating_edge_sets = estimator.violating_edge_sets(
+                [cand["graph"] for cand in stage_candidates]
+            )
+            for cand, edge_sets in zip(stage_candidates, violating_edge_sets):
+                cand["violating_edge_sets"] = edge_sets
 
     def _select_edges_for_surgical_repair(self, state, candidates, *, rollback_steps: int):
         if rollback_steps < 1:
@@ -1478,6 +1587,22 @@ class EdgeGenerator:
         expanded[:-1, -1] = distances
         expanded[-1, -1] = 0.0
         return expanded
+
+    def _path_matrix_from_distance_matrix(self, distance_matrix, *, k: int):
+        if k < 0:
+            raise ValueError("path_k must be >= 0")
+        distances = np.asarray(distance_matrix, dtype=float)
+        if distances.ndim != 2 or distances.shape[0] != distances.shape[1]:
+            raise ValueError("distance_matrix must be a square matrix")
+        if distances.shape[0] <= 1:
+            return distances.copy()
+        adjacency = _build_adjacency(distances, k=max(1, int(k)), degree_penalty=0.0)
+        path_matrix = adjacency.toarray().astype(float, copy=False)
+        missing_mask = path_matrix == 0.0
+        np.fill_diagonal(missing_mask, False)
+        path_matrix[missing_mask] = np.inf
+        np.fill_diagonal(path_matrix, 0.0)
+        return path_matrix
 
     def _shortest_paths_from_matrix(self, distance_matrix, source_idx, dest_idx, *, n_paths: int):
         if n_paths < 1:

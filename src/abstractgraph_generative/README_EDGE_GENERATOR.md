@@ -2,7 +2,8 @@
 
 `EdgeGenerator` builds graphs by adding edges one step at a time, using:
 
-- a feasibility model to reject invalid partial graphs
+- a partial-stage feasibility model to reject invalid intermediate graphs
+- a final-graph feasibility model to validate completed graphs
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
 - an optional decomposition-aware training trajectory to bias reconstruction toward complete subgraphs
@@ -91,7 +92,8 @@ Stored-corpus pair workflow:
 
 ```python
 generator = EdgeGenerator(
-    feasibility_estimator=feasibility_estimator,
+    partial_feasibility_estimator=partial_feasibility_estimator,
+    final_feasibility_estimator=final_feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
     target_estimator_mode="regression",
@@ -107,6 +109,7 @@ generation_path = generator.generate_from_pair(
     graph_b,
     size=0.5,
     n_paths=3,
+    path_k=3,
     n_neighbors_per_path_graph=3,
     target=None,
     target_lambda=0.5,
@@ -126,6 +129,31 @@ mixed_graph = mix_connected_components(graph_a, graph_b, seed=0)
 `mix_connected_components` builds a new graph by taking the same number of
 connected components from each source graph and choosing the component subsets
 whose total node count is closest to the average node count of the two inputs.
+
+## Feasibility Stages
+
+`EdgeGenerator` supports two feasibility models:
+
+- `partial_feasibility_estimator`: trained on partial reconstruction stages and
+  used while edges are being added
+- `final_feasibility_estimator`: trained on full graphs and used only when a
+  candidate has reached the requested final edge count
+
+This is useful when some constraints should apply only to completed graphs. For
+example, an intermediate graph may temporarily contain aromatic bonds that do
+not yet form a full aromatic cycle, while the final graph must satisfy that
+constraint.
+
+Backward compatibility:
+
+- if you pass only `feasibility_estimator=...`, the generator uses it as the
+  partial estimator and deep-copies it for the final estimator
+
+Training behavior:
+
+- the partial estimator is fit on the fragment set used during edge-regression
+  training
+- the final estimator is fit only on the full seed graphs
 
 ## Generate Semantics
 
@@ -174,6 +202,7 @@ generator.generate_from_pair(
     graph_b,
     size=0.5,
     n_paths=3,
+    path_k=3,
     n_neighbors_per_path_graph=3,
     target=None,
     target_lambda=1.0,
@@ -184,13 +213,14 @@ generator.generate_from_pair(
 `generate_from_pair()`:
 
 1. resolves `graph_a` and `graph_b` to stored indices when their hashes match
-2. otherwise transforms the query graphs on the fly, appends them to a temporary query corpus, and computes shortest paths there
-3. extracts `n_paths` edge-disjoint shortest paths by removing used path edges after each path
-4. deduplicates the path graphs and augments that set with up to `n_neighbors_per_path_graph` nearest neighbors per selected graph
-5. fits the generator on the resulting expanded set
-6. removes edges from both endpoints
-7. mixes connected components from the two reduced graphs
-8. starts generation from that mixed graph
+2. otherwise transforms the query graphs on the fly and appends them to a temporary query corpus
+3. builds an `MST + kNN` retrieval graph from the dense pairwise distance matrix, using `path_k` as the kNN degree
+4. extracts `n_paths` edge-disjoint shortest paths by removing used path edges after each path
+5. deduplicates the path graphs and augments that set with up to `n_neighbors_per_path_graph` nearest neighbors per selected graph
+6. fits the generator on the resulting expanded set
+7. removes edges from both endpoints
+8. mixes connected components from the two reduced graphs
+9. starts generation from that mixed graph
 
 If stored targets exist and no explicit `target=` is passed, `generate_from_pair()`
 infers a pair target from the endpoint targets:
