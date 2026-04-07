@@ -721,7 +721,7 @@ class EdgeGenerator:
                 self._draw_graphs(
                     draw_graphs_fn,
                     row_graphs,
-                    n_graphs_per_line=len(row_graphs),
+                    n_graphs_per_line=min(len(row_graphs), 7),
                     titles=row_titles,
                 )
             training_titles = []
