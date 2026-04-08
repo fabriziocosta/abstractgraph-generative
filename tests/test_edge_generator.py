@@ -4,7 +4,7 @@ import networkx as nx
 import numpy as np
 import pytest
 
-from abstractgraph_generative.edge_generator import EdgeGenerator
+from abstractgraph_generative.edge_generator import EdgeGenerator, remove_edges
 
 
 class _RecordingFeasibilityEstimator:
@@ -209,7 +209,7 @@ def test_generate_from_cached_pair_session_reuses_cached_graphs_and_target(monke
 
     calls = {"remove_edges": 0, "mix": 0, "generate": 0}
 
-    def fake_remove_edges(graph, *, size):
+    def fake_remove_edges(graph, *, size, rng=None):
         calls["remove_edges"] += 1
         return graph.copy(), graph.number_of_edges() + 2
 
@@ -253,3 +253,34 @@ def test_generate_from_cached_pair_session_reuses_cached_graphs_and_target(monke
     assert result["target"] == 7
     assert result["target_lambda"] == 0.25
     assert result["return_path"] is False
+
+
+def test_remove_edges_is_deterministic_with_seed() -> None:
+    graph = nx.cycle_graph(6)
+
+    pruned_a, target_a = remove_edges(graph, size=0.5, seed=13)
+    pruned_b, target_b = remove_edges(graph, size=0.5, seed=13)
+
+    assert target_a == graph.number_of_edges()
+    assert target_b == graph.number_of_edges()
+    assert sorted(pruned_a.edges()) == sorted(pruned_b.edges())
+
+
+class _EstimatorWithDirectClasses:
+    classes_ = np.asarray([0, 1])
+
+    def predict_proba(self, graphs):
+        return np.tile(np.asarray([[0.25, 0.75]]), (len(graphs), 1))
+
+
+def test_class_probability_supports_estimators_exposing_classes_directly() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+
+    probs = generator._class_probability(
+        _EstimatorWithDirectClasses(),
+        [nx.path_graph(2)],
+        target=1,
+        estimator_name="graph_estimator",
+    )
+
+    assert probs.tolist() == [0.75]

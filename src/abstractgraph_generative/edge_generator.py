@@ -27,6 +27,29 @@ def mix_connected_components(
     n_trials: int = 128,
     seed: int | None = None,
 ):
+    """Build a graph by mixing connected components from two input graphs.
+
+    Parameters
+    ----------
+    graph1 : nx.Graph
+        First source graph providing candidate connected components.
+    graph2 : nx.Graph
+        Second source graph providing candidate connected components.
+    target_n_nodes : int | None, optional
+        Desired node count for the merged graph. If omitted, the midpoint
+        between the two source graph sizes is used.
+    n_trials : int, optional
+        Number of random component-sampling attempts for each component count.
+        Larger values improve the chance of matching ``target_n_nodes``.
+    seed : int | None, optional
+        Random seed controlling component sampling.
+
+    Returns
+    -------
+    nx.Graph
+        A new graph composed of relabeled connected components sampled from
+        both inputs.
+    """
     if graph1.number_of_nodes() < 1 or graph2.number_of_nodes() < 1:
         raise ValueError("Both input graphs must contain at least one node")
     if nx.is_directed(graph1) != nx.is_directed(graph2):
@@ -86,6 +109,25 @@ def edge_neighbors(
     seed: int | None = None,
     allow_self_loops: bool = False,
 ):
+    """Generate neighboring graphs by moving one edge to a new location.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Input simple graph from which neighbors are generated.
+    n_samples : int, optional
+        Number of independently sampled neighboring graphs to return.
+    seed : int | None, optional
+        Random seed controlling edge removal and insertion choices.
+    allow_self_loops : bool, optional
+        Whether candidate destination edges may include ``(node, node)``.
+
+    Returns
+    -------
+    list[nx.Graph]
+        Neighbor graphs obtained by removing one existing edge and adding one
+        previously absent edge.
+    """
     if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
         raise ValueError("random_edge_move_copies supports only simple NetworkX graphs")
     if n_samples < 1:
@@ -125,7 +167,35 @@ def edge_neighbors(
     return sampled_graphs
 
 
-def remove_edges(G: nx.Graph, size=0.1):
+def remove_edges(
+    G: nx.Graph,
+    size=0.1,
+    *,
+    seed: int | None = None,
+    rng: random.Random | None = None,
+):
+    """Remove a subset of edges from a graph.
+
+    Parameters
+    ----------
+    G : nx.Graph
+        Input graph to prune.
+    size : float | int, optional
+        Number of edges to remove. Values in ``[0, 1)`` are interpreted as a
+        fraction of the current edge count; larger values are interpreted as an
+        absolute edge count.
+    seed : int | None, optional
+        Random seed used when ``rng`` is not provided.
+    rng : random.Random | None, optional
+        Explicit random number generator used for edge sampling. This takes
+        precedence over ``seed`` and is useful when a caller wants reproducible
+        multi-step workflows.
+
+    Returns
+    -------
+    tuple[nx.Graph, int]
+        The pruned graph and the original edge count before removal.
+    """
     H = G.copy()
     n_edges = H.number_of_edges()
     edges = list(H.edges())
@@ -139,7 +209,8 @@ def remove_edges(G: nx.Graph, size=0.1):
     n_remove = max(0, min(n_edges, n_remove))
 
     if n_remove > 0:
-        removed_edges = random.sample(edges, k=n_remove)
+        edge_rng = rng if rng is not None else random.Random(seed)
+        removed_edges = edge_rng.sample(edges, k=n_remove)
         H.remove_edges_from(removed_edges)
 
     return H, n_edges
@@ -153,6 +224,27 @@ def make_edge_regression_dataset(
     seed: int | None = None,
     allow_self_loops: bool = False,
 ):
+    """Build a binary edge-removal dataset from one seed graph.
+
+    Parameters
+    ----------
+    seed_graph : nx.Graph
+        Source graph whose successive edge removals define the positive
+        training examples.
+    n_negative_per_positive : int
+        Number of negative neighbor graphs sampled for each positive example.
+    n_replicates : int, optional
+        Number of independent edge-removal trajectories to generate.
+    seed : int | None, optional
+        Random seed controlling edge-removal order and negative sampling.
+    allow_self_loops : bool, optional
+        Whether negative samples may add self-loops when moving edges.
+
+    Returns
+    -------
+    tuple[list[nx.Graph], list[nx.Graph], list[tuple[nx.Graph, int]]]
+        Positive graphs, negative graphs, and the combined labeled dataset.
+    """
     rng = random.Random(seed)
     positives = []
     negatives = []
@@ -196,6 +288,32 @@ def make_edge_regression_dataset_subgraph_ordered(
     seed: int | None = None,
     allow_self_loops: bool = False,
 ):
+    """Build an edge-removal dataset using a decomposition-aware edge order.
+
+    Parameters
+    ----------
+    seed_graph : nx.Graph
+        Source graph whose edges are removed to create training examples.
+    decomposition_function : callable
+        Function used to decompose the graph into interpretation subgraphs so
+        edge removals can respect domain-specific substructure groupings.
+    nbits : int
+        Bit width passed to the abstract-graph decomposition machinery.
+    n_negative_per_positive : int
+        Number of negative neighbor graphs sampled for each positive example.
+    n_replicates : int, optional
+        Number of independent decomposition-group traversal runs to generate.
+    seed : int | None, optional
+        Random seed controlling group order, edge order within groups, and
+        negative sampling.
+    allow_self_loops : bool, optional
+        Whether negative samples may add self-loops when moving edges.
+
+    Returns
+    -------
+    tuple[list[nx.Graph], list[nx.Graph], list[tuple[nx.Graph, int]]]
+        Positive graphs, negative graphs, and the combined labeled dataset.
+    """
     rng = random.Random(seed)
     positives = []
     negatives = []
@@ -336,6 +454,17 @@ def _merge_component_graphs(component_graphs, template_graph: nx.Graph):
 
 
 class EdgeGenerator:
+    """Learn graph-growing policies and generate graphs by adding edges.
+
+    The generator combines:
+    - feasibility estimators for partial and final validity checks,
+    - a graph estimator that scores promising next states,
+    - an optional target estimator used to steer generation toward a label or
+      numeric target,
+    - retrieval-based pair conditioning through ``store(...)`` and
+      ``generate_from_pair(...)``.
+    """
+
     def __init__(
         self,
         feasibility_estimator=None,
@@ -365,6 +494,78 @@ class EdgeGenerator:
         verbose: bool = False,
         seed: int | None = None,
     ):
+        """Configure an edge-growing graph generator.
+
+        Parameters
+        ----------
+        feasibility_estimator : object, optional
+            Backward-compatible estimator used for both partial and final
+            feasibility if separate estimators are not provided.
+        graph_estimator : object
+            Estimator scoring which partially built graphs look most promising
+            during beam search.
+        target_estimator : object, optional
+            Optional estimator used to score graphs against a requested target.
+        target_estimator_mode : str, optional
+            ``"classification"`` to match a class label or ``"regression"`` to
+            prefer predictions close to a numeric target.
+        decomposition_function : callable, optional
+            Optional graph decomposition used when building ordered fragment
+            training datasets.
+        partial_feasibility_estimator : object, optional
+            Estimator checked on intermediate states during search.
+        final_feasibility_estimator : object, optional
+            Estimator checked on terminal states with the requested edge count.
+        n_negative_per_positive : int, optional
+            Number of negative graphs sampled per positive fragment during
+            training-set construction.
+        n_replicates : int, optional
+            Number of independent fragment-generation runs per training graph.
+        beam_size : int, optional
+            Base number of candidates retained at each search step.
+        max_restarts : int, optional
+            Maximum number of fallback/backtracking phases allowed when search
+            gets stuck.
+        fallback_base_steps : int, optional
+            Initial rollback depth used by fallback search repair.
+        fallback_growth_factor : float, optional
+            Multiplicative growth applied to rollback depth after each fallback.
+        beam_growth_factor : float, optional
+            Multiplicative growth applied to beam size after each fallback.
+        max_beam_size : int | None, optional
+            Optional cap on the expanded fallback beam size.
+        enforce_diversity : bool, optional
+            Whether previously seen graphs are filtered to encourage diverse
+            search trajectories.
+        use_similarity_repulsion : bool, optional
+            Whether failed states contribute a similarity penalty in later
+            fallback phases.
+        repulsion_weight : float, optional
+            Base weight of the similarity-repulsion penalty.
+        repulsion_growth_factor : float, optional
+            Multiplicative growth of repulsion during fallback phases.
+        max_repulsion_memory : int, optional
+            Maximum number of failed graph embeddings retained for repulsion.
+        allow_self_loops : bool, optional
+            Whether candidate added edges and negative samples may include
+            self-loops.
+        fit_n_jobs : int, optional
+            Parallelism used when building fragment datasets during fitting.
+        fit_backend : str, optional
+            Joblib backend used for parallel fragment dataset construction.
+        verbose : bool, optional
+            Whether fitting and generation emit progress logs.
+        seed : int | None, optional
+            Seed for the internal random number generator controlling sampling,
+            fallback randomness, and pair-conditioned generation.
+
+        Returns
+        -------
+        None
+            Initializes the generator in-place.
+        """
+        # Estimator roles: search feasibility, graph scoring, and optional
+        # target steering can be configured independently.
         (
             self.partial_feasibility_estimator,
             self.final_feasibility_estimator,
@@ -382,9 +583,11 @@ class EdgeGenerator:
         if target_estimator_mode not in {"classification", "regression"}:
             raise ValueError(
                 "target_estimator_mode must be 'classification' or 'regression'"
-            )
+        )
         self.target_estimator_mode = target_estimator_mode
         self.decomposition_function = decomposition_function
+
+        # Training-set construction and search-shape parameters.
         self.n_negative_per_positive = n_negative_per_positive
         self.n_replicates = n_replicates
         self.beam_size = beam_size
@@ -404,6 +607,9 @@ class EdgeGenerator:
         self.verbose = verbose
         self.seed = seed
         self.rng = random.Random(seed)
+
+        # Learned datasets, search bookkeeping, and retrieval caches are
+        # populated after fitting and/or storing graphs.
         self.seed_graphs_ = None
         self.positives_ = None
         self.negatives_ = None
@@ -456,6 +662,22 @@ class EdgeGenerator:
         return resolved_partial, resolved_final
 
     def fit(self, graphs, targets=None):
+        """Fit the generator from one or more training graphs.
+
+        Parameters
+        ----------
+        graphs : nx.Graph | iterable[nx.Graph]
+            Training graphs used to construct fragment datasets and fit the
+            internal estimators.
+        targets : object | iterable[object], optional
+            Optional per-graph targets used to fit the target estimator on graph
+            fragments.
+
+        Returns
+        -------
+        EdgeGenerator
+            The fitted generator instance.
+        """
         graph_list = self._as_graph_list(graphs)
         self.seed_graphs_ = [graph.copy() for graph in graph_list]
         dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
@@ -531,6 +753,20 @@ class EdgeGenerator:
         return self
 
     def fit_target_estimator(self, graphs, targets):
+        """Fit only the optional target estimator from graphs and targets.
+
+        Parameters
+        ----------
+        graphs : nx.Graph | iterable[nx.Graph]
+            Graphs used to build fragment-level target-estimator training data.
+        targets : object | iterable[object]
+            Per-graph target values aligned with ``graphs``.
+
+        Returns
+        -------
+        EdgeGenerator
+            The generator instance with an updated target estimator.
+        """
         if self.target_estimator is None:
             raise ValueError("target_estimator is None; provide one before fitting")
         graph_list = [graph.copy() for graph in self._as_graph_list(graphs)]
@@ -552,6 +788,21 @@ class EdgeGenerator:
         return self
 
     def store(self, graphs, targets=None):
+        """Store a graph corpus for retrieval-based pair generation.
+
+        Parameters
+        ----------
+        graphs : iterable[nx.Graph]
+            Graph corpus used as the retrieval space for
+            ``generate_from_pair(...)``.
+        targets : object | iterable[object], optional
+            Optional per-graph targets stored alongside the retrieval corpus.
+
+        Returns
+        -------
+        EdgeGenerator
+            The generator instance with an initialized retrieval index.
+        """
         graph_list = [graph.copy() for graph in self._as_graph_list(graphs)]
         if len(graph_list) < 2:
             raise ValueError("store(graphs, ...) requires at least two graphs")
@@ -596,27 +847,47 @@ class EdgeGenerator:
         draw_graphs_fn: DrawGraphsFn | None = None,
         verbose: bool | None = None,
     ):
+        """Generate graphs by adding edges until a requested edge count is met.
+
+        Parameters
+        ----------
+        graphs : nx.Graph | iterable[nx.Graph]
+            Starting graph or graphs from which generation begins.
+        n_edges : int | iterable[int]
+            Desired final edge count for each input graph.
+        target : object | iterable[object], optional
+            Optional target value used by the target estimator to steer search.
+        target_lambda : float, optional
+            Weight applied to the target score when combining it with the graph
+            estimator score.
+        return_path : bool, optional
+            Whether to return the full graph-growth path or only the final
+            generated graph for each input.
+        draw_graphs_fn : callable, optional
+            Optional visualization callback used when verbose logging is
+            enabled.
+        verbose : bool | None, optional
+            Overrides the instance-level verbosity for this call.
+
+        Returns
+        -------
+        list[nx.Graph] | nx.Graph | list[list[nx.Graph]] | list[nx.Graph] | None
+            Generated path(s) or final graph(s), matching the single-graph vs
+            multi-graph input shape and the ``return_path`` setting.
+        """
         if self.edge_attribute_templates_ is None:
             raise ValueError("EdgeGenerator must be fit before calling generate")
         verbose = self.verbose if verbose is None else verbose
 
-        graph_list = self._as_graph_list(graphs)
-        if isinstance(n_edges, int):
-            edge_counts = [n_edges]
-        else:
-            edge_counts = list(n_edges)
-        target_values = self._coerce_optional_per_graph_argument(
-            target,
-            graph_list,
-            name="target",
+        graph_list, edge_counts, target_values = self._normalize_generate_inputs(
+            graphs,
+            n_edges,
+            target=target,
         )
-
-        if len(graph_list) != len(edge_counts):
-            raise ValueError("graphs and n_edges must have the same length")
 
         paths = []
         for i, (graph, target_n_edges, target_value) in enumerate(
-            zip(graph_list, edge_counts, target_values if target_values is not None else [None] * len(graph_list))
+            zip(graph_list, edge_counts, target_values)
         ):
             try:
                 path = self._generate_one(
@@ -647,8 +918,8 @@ class EdgeGenerator:
 
     def generate_from_pair(
         self,
-        graph_a,
-        graph_b,
+        graph_a=None,
+        graph_b=None,
         *,
         size_of_edge_removal=0.5,
         n_paths: int = 3,
@@ -660,6 +931,45 @@ class EdgeGenerator:
         draw_graphs_fn: DrawGraphsFn | None = None,
         verbose: bool | None = None,
     ):
+        """Generate a graph conditioned on a pair of endpoint graphs.
+
+        Parameters
+        ----------
+        graph_a : nx.Graph | None, optional
+            First endpoint graph. If both ``graph_a`` and ``graph_b`` are
+            omitted, the last cached pair session is reused.
+        graph_b : nx.Graph | None, optional
+            Second endpoint graph paired with ``graph_a``.
+        size_of_edge_removal : float | int, optional
+            Amount of edge pruning applied to each endpoint graph before
+            component mixing starts the generation process.
+        n_paths : int, optional
+            Number of shortest retrieval paths to extract between the endpoint
+            graphs in the stored corpus.
+        path_k : int, optional
+            Neighborhood size used when sparsifying the retrieval graph for
+            shortest-path computation.
+        n_neighbors_per_path_graph : int, optional
+            Number of extra nearest neighbors added around each graph selected
+            from the retrieved paths.
+        target : object, optional
+            Optional explicit target for the generated graph. If omitted, a
+            target may be inferred from stored endpoint targets.
+        target_lambda : float, optional
+            Weight applied to target steering during graph generation.
+        return_path : bool, optional
+            Whether to return the full generation path or only the final graph.
+        draw_graphs_fn : callable, optional
+            Optional visualization callback used when verbose logging is
+            enabled.
+        verbose : bool | None, optional
+            Overrides the instance-level verbosity for this call.
+
+        Returns
+        -------
+        list[nx.Graph] | nx.Graph | None
+            Generated path or final graph, depending on ``return_path``.
+        """
         verbose = self.verbose if verbose is None else verbose
         if (graph_a is None) != (graph_b is None):
             raise ValueError("graph_a and graph_b must either both be provided or both be None")
@@ -677,108 +987,21 @@ class EdgeGenerator:
             )
 
         self._require_stored_dataset()
-
-        training_set_start = time.perf_counter()
-        query = self._build_pair_query_corpus(graph_a, graph_b)
-        path_matrix = self._path_matrix_from_distance_matrix(
-            query["distance_matrix"],
-            k=path_k,
-        )
-        paths = self._shortest_paths_from_matrix(
-            path_matrix,
-            query["source_idx"],
-            query["dest_idx"],
+        pair_context = self._prepare_pair_training_context(
+            graph_a,
+            graph_b,
             n_paths=n_paths,
+            path_k=path_k,
+            n_neighbors_per_path_graph=n_neighbors_per_path_graph,
         )
-        if not paths:
-            raise ValueError("Could not find shortest paths between the requested graphs")
-
-        selected_indices = sorted({idx for path in paths for idx in path})
-        selected_indices = self._augment_indices_with_nearest_neighbors(
-            query["distance_matrix"],
-            selected_indices,
-            k=n_neighbors_per_path_graph,
+        self._log_pair_training_context(
+            pair_context,
+            draw_graphs_fn=draw_graphs_fn,
+            verbose=verbose,
         )
-        fit_graphs = [query["graphs"][idx].copy() for idx in selected_indices]
-        fit_targets = None
-        if query["targets"] is not None:
-            fit_targets = [query["targets"][idx] for idx in selected_indices]
-        training_set_elapsed = time.perf_counter() - training_set_start
+        self._fit_pair_training_graphs(pair_context["fit_graphs"], pair_context["fit_targets"])
 
-        if verbose:
-            path_lengths = [len(path) for path in paths]
-            print(
-                f"[pair] source_idx={query['source_idx']} dest_idx={query['dest_idx']} "
-                f"n_paths={len(paths)} selected_graphs={len(fit_graphs)} "
-                f"path_k={path_k} "
-                f"path_lengths={path_lengths} "
-                f"training_set_time={self._format_minutes_seconds(training_set_elapsed)}"
-            )
-            print(f"[pair] selected_indices={selected_indices}")
-            for path_idx, path in enumerate(paths, start=1):
-                row_indices = list(path)
-                row_graphs = [query["graphs"][idx] for idx in row_indices]
-                row_titles = []
-                for position, idx in enumerate(row_indices):
-                    target_value = (
-                        query["targets"][idx]
-                        if query["targets"] is not None and idx < len(query["targets"])
-                        else None
-                    )
-                    label = f"idx={idx}"
-                    if position == 0:
-                        label = f"src\n{label}"
-                    elif position == len(row_indices) - 1:
-                        label = f"dest\n{label}"
-                    if target_value is not None:
-                        label = f"{label}\ntgt={target_value}"
-                    row_titles.append(label)
-                print(f"[pair] path {path_idx}/{len(paths)} indices={path}")
-                self._draw_graphs(
-                    draw_graphs_fn,
-                    row_graphs,
-                    n_graphs_per_line=min(len(row_graphs), 7),
-                    titles=row_titles,
-                )
-            training_titles = []
-            for idx in selected_indices:
-                target_value = (
-                    query["targets"][idx]
-                    if query["targets"] is not None and idx < len(query["targets"])
-                    else None
-                )
-                label = f"idx={idx}"
-                if target_value is not None:
-                    label = f"{label}\ntgt={target_value}"
-                training_titles.append(label)
-            print(f"[pair] training_set_indices={selected_indices}")
-            self._draw_graphs(
-                draw_graphs_fn,
-                fit_graphs,
-                n_graphs_per_line=min(len(fit_graphs), 7),
-                titles=training_titles,
-            )
-
-        if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
-            self.fit(fit_graphs, targets=fit_targets)
-        else:
-            self.fit(fit_graphs)
-            if self.target_estimator is not None and fit_targets is not None:
-                labeled_pairs = [
-                    (graph, target_value)
-                    for graph, target_value in zip(fit_graphs, fit_targets)
-                    if target_value is not None
-                ]
-                if labeled_pairs:
-                    labeled_graphs, labeled_targets = zip(*labeled_pairs)
-                    self.fit_target_estimator(list(labeled_graphs), list(labeled_targets))
-
-        resolved_target = target
-        if resolved_target is None:
-            resolved_target = self._infer_pair_target(
-                query["targets"][query["source_idx"]] if query["targets"] is not None else None,
-                query["targets"][query["dest_idx"]] if query["targets"] is not None else None,
-            )
+        resolved_target = self._resolve_pair_target(pair_context["query"], target)
         self._cache_pair_session(
             graph_a=graph_a,
             graph_b=graph_b,
@@ -833,10 +1056,12 @@ class EdgeGenerator:
         start_graph_a, target_n_edges_a = remove_edges(
             graph_a,
             size=size_of_edge_removal,
+            rng=self.rng,
         )
         start_graph_b, target_n_edges_b = remove_edges(
             graph_b,
             size=size_of_edge_removal,
+            rng=self.rng,
         )
         mixed_graph = mix_connected_components(
             start_graph_a,
@@ -896,6 +1121,161 @@ class EdgeGenerator:
                     break
         return sorted(selected)
 
+    # Search setup and orchestration.
+
+    def _normalize_generate_inputs(self, graphs, n_edges, *, target):
+        graph_list = self._as_graph_list(graphs)
+        edge_counts = [n_edges] if isinstance(n_edges, int) else list(n_edges)
+        if len(graph_list) != len(edge_counts):
+            raise ValueError("graphs and n_edges must have the same length")
+        target_values = self._coerce_optional_per_graph_argument(
+            target,
+            graph_list,
+            name="target",
+        )
+        if target_values is None:
+            target_values = [None] * len(graph_list)
+        return graph_list, edge_counts, target_values
+
+    # Pair-conditioned retrieval and fitting.
+
+    def _prepare_pair_training_context(
+        self,
+        graph_a,
+        graph_b,
+        *,
+        n_paths: int,
+        path_k: int,
+        n_neighbors_per_path_graph: int,
+    ):
+        training_set_start = time.perf_counter()
+        query = self._build_pair_query_corpus(graph_a, graph_b)
+        path_matrix = self._path_matrix_from_distance_matrix(
+            query["distance_matrix"],
+            k=path_k,
+        )
+        paths = self._shortest_paths_from_matrix(
+            path_matrix,
+            query["source_idx"],
+            query["dest_idx"],
+            n_paths=n_paths,
+        )
+        if not paths:
+            raise ValueError("Could not find shortest paths between the requested graphs")
+
+        selected_indices = sorted({idx for path in paths for idx in path})
+        selected_indices = self._augment_indices_with_nearest_neighbors(
+            query["distance_matrix"],
+            selected_indices,
+            k=n_neighbors_per_path_graph,
+        )
+        fit_graphs = [query["graphs"][idx].copy() for idx in selected_indices]
+        fit_targets = self._select_pair_targets(query, selected_indices)
+        return {
+            "query": query,
+            "paths": paths,
+            "selected_indices": selected_indices,
+            "fit_graphs": fit_graphs,
+            "fit_targets": fit_targets,
+            "path_k": path_k,
+            "training_set_elapsed": time.perf_counter() - training_set_start,
+        }
+
+    def _select_pair_targets(self, query, selected_indices):
+        if query["targets"] is None:
+            return None
+        return [query["targets"][idx] for idx in selected_indices]
+
+    def _log_pair_training_context(
+        self,
+        pair_context,
+        *,
+        draw_graphs_fn: DrawGraphsFn | None,
+        verbose: bool,
+    ) -> None:
+        if not verbose:
+            return
+        query = pair_context["query"]
+        paths = pair_context["paths"]
+        fit_graphs = pair_context["fit_graphs"]
+        selected_indices = pair_context["selected_indices"]
+        path_lengths = [len(path) for path in paths]
+        print(
+            f"[pair] source_idx={query['source_idx']} dest_idx={query['dest_idx']} "
+            f"n_paths={len(paths)} selected_graphs={len(fit_graphs)} "
+            f"path_k={pair_context['path_k']} "
+            f"path_lengths={path_lengths} "
+            f"training_set_time={self._format_minutes_seconds(pair_context['training_set_elapsed'])}"
+        )
+        print(f"[pair] selected_indices={selected_indices}")
+        for path_idx, path in enumerate(paths, start=1):
+            row_indices = list(path)
+            row_graphs = [query["graphs"][idx] for idx in row_indices]
+            row_titles = self._pair_graph_titles(
+                query,
+                row_indices,
+                source_idx=row_indices[0],
+                dest_idx=row_indices[-1],
+            )
+            print(f"[pair] path {path_idx}/{len(paths)} indices={path}")
+            self._draw_graphs(
+                draw_graphs_fn,
+                row_graphs,
+                n_graphs_per_line=min(len(row_graphs), 7),
+                titles=row_titles,
+            )
+        print(f"[pair] training_set_indices={selected_indices}")
+        self._draw_graphs(
+            draw_graphs_fn,
+            fit_graphs,
+            n_graphs_per_line=min(len(fit_graphs), 7),
+            titles=self._pair_graph_titles(query, selected_indices),
+        )
+
+    def _pair_graph_titles(self, query, indices, *, source_idx=None, dest_idx=None):
+        titles = []
+        for idx in indices:
+            label = f"idx={idx}"
+            if source_idx is not None and idx == source_idx:
+                label = f"src\n{label}"
+            elif dest_idx is not None and idx == dest_idx:
+                label = f"dest\n{label}"
+            target_value = (
+                query["targets"][idx]
+                if query["targets"] is not None and idx < len(query["targets"])
+                else None
+            )
+            if target_value is not None:
+                label = f"{label}\ntgt={target_value}"
+            titles.append(label)
+        return titles
+
+    def _fit_pair_training_graphs(self, fit_graphs, fit_targets) -> None:
+        if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
+            self.fit(fit_graphs, targets=fit_targets)
+            return
+
+        self.fit(fit_graphs)
+        if self.target_estimator is None or fit_targets is None:
+            return
+        labeled_pairs = [
+            (graph, target_value)
+            for graph, target_value in zip(fit_graphs, fit_targets)
+            if target_value is not None
+        ]
+        if not labeled_pairs:
+            return
+        labeled_graphs, labeled_targets = zip(*labeled_pairs)
+        self.fit_target_estimator(list(labeled_graphs), list(labeled_targets))
+
+    def _resolve_pair_target(self, query, requested_target):
+        if requested_target is not None:
+            return requested_target
+        return self._infer_pair_target(
+            query["targets"][query["source_idx"]] if query["targets"] is not None else None,
+            query["targets"][query["dest_idx"]] if query["targets"] is not None else None,
+        )
+
     def _generate_one(
         self,
         graph: nx.Graph,
@@ -931,320 +1311,574 @@ class EdgeGenerator:
             self._draw_graphs(draw_graphs_fn, [start_graph])
 
         if start_graph.number_of_edges() == n_edges:
-            if not bool(self.final_feasibility_estimator.predict([start_graph])[0]):
-                raise ValueError("Start graph does not satisfy the final feasibility estimator")
-            if verbose:
-                print(
-                    f"[graph {graph_index}] solved depth=0 max_depth=0 "
-                    f"edges={start_graph.number_of_edges()} remaining_edges=0 "
-                    f"tried=0 elapsed=0m 0.0s eta=0m 0.0s"
-                )
-            return [start_graph]
+            return self._finish_if_start_graph_is_solution(
+                start_graph,
+                verbose=verbose,
+                graph_index=graph_index,
+            )
 
-        beam = [self._make_state(start_graph, parent=None, score=1.0, depth=0)]
-        beam_history = [self._copy_beam(beam)]
-        blocked_state_keys_by_depth: dict[int, set] = {}
-        tabu_path_signatures = set()
-        visited = self._rebuild_visited_from_history(beam_history)
-        depth = 0
-        fallback_index = -1
-        beam_limit = self._beam_limit_for_fallback(fallback_index)
+        search = self._initialize_search_state(start_graph)
+        beam_limit = self._beam_limit_for_fallback(search["fallback_index"])
         self.top_k_ = beam_limit
-        step_start_time = time.perf_counter()
-
         if verbose and total_phases > 1:
-            print(
-                f"[graph {graph_index}] phase=1/{total_phases} "
-                f"beam_limit={beam_limit} fallback=0/{n_fallbacks}"
+            self._print_phase_banner(
+                graph_index=graph_index,
+                fallback_index=search["fallback_index"],
+                total_phases=total_phases,
+                beam_limit=beam_limit,
+                n_fallbacks=n_fallbacks,
             )
 
-        while beam:
-            if depth >= n_edges:
+        # Main search loop: expand, score, retain, then optionally repair/backtrack.
+        while search["beam"]:
+            if search["depth"] >= n_edges:
                 break
 
-            generated = []
-            for state in beam:
-                generated.extend(self._expand_state(state))
-
-            self.n_tried_ += len(generated)
-            feasible_candidates = []
-            infeasible_candidates = []
-            repulsion_lambda = 0.0
-            if generated:
-                generated_graphs = [cand["graph"] for cand in generated]
-                partial_feasibility_mask = np.asarray(
-                    self.partial_feasibility_estimator.predict(generated_graphs),
-                    dtype=bool,
-                )
-                positive_scores = self._positive_scores(generated_graphs)
-                target_scores = self._target_scores(
-                    generated_graphs,
-                    target=target,
-                )
-                partial_terminal_candidates = []
-                for cand, is_partial_feasible, score, target_score in zip(
-                    generated,
-                    partial_feasibility_mask,
-                    positive_scores,
-                    target_scores,
-                ):
-                    cand["score"] = float(score)
-                    cand["target_score"] = float(target_score)
-                    cand["selection_score"] = float(
-                        cand["score"] + target_lambda * cand["target_score"]
-                    )
-                    if is_partial_feasible:
-                        if cand["graph"].number_of_edges() == n_edges:
-                            partial_terminal_candidates.append(cand)
-                        else:
-                            feasible_candidates.append(cand)
-                    else:
-                        cand["feasibility_stage"] = "partial"
-                        infeasible_candidates.append(cand)
-
-                if partial_terminal_candidates:
-                    final_mask = np.asarray(
-                        self.final_feasibility_estimator.predict(
-                            [cand["graph"] for cand in partial_terminal_candidates]
-                        ),
-                        dtype=bool,
-                    )
-                    for cand, is_final_feasible in zip(
-                        partial_terminal_candidates,
-                        final_mask,
-                    ):
-                        if is_final_feasible:
-                            feasible_candidates.append(cand)
-                        else:
-                            cand["feasibility_stage"] = "final"
-                            infeasible_candidates.append(cand)
-
-            if feasible_candidates:
-                repulsions, repulsion_lambda = self._repulsion_values(
-                    [cand["graph"] for cand in feasible_candidates],
-                    fallback_index=fallback_index,
-                )
-                for cand, repulsion in zip(feasible_candidates, repulsions):
-                    cand["repulsion"] = float(repulsion)
-                    cand["selection_score"] = float(
-                        cand["selection_score"] - repulsion_lambda * cand["repulsion"]
-                    )
-                feasible_candidates.sort(
-                    key=lambda cand: cand["selection_score"], reverse=True
-                )
-
-            if infeasible_candidates:
-                self._annotate_infeasible_candidates_with_violations(infeasible_candidates)
-                infeasible_candidates.sort(
-                    key=lambda cand: (
-                        cand.get("selection_score", cand["score"]),
-                        -cand.get("violation_count", 0.0),
-                    ),
-                    reverse=True,
-                )
-
-            next_depth = depth + 1
-            blocked_state_keys = blocked_state_keys_by_depth.get(next_depth, set())
-            unseen_candidates = []
-            for cand in feasible_candidates:
-                state_key = cand["key"]
-                if state_key in visited or state_key in blocked_state_keys:
-                    continue
-                if cand["path_signature"] in tabu_path_signatures:
-                    continue
-                if (
-                    self.enforce_diversity
-                    and cand["graph_hash"] in self.diversity_memory_hash_set_
-                ):
-                    continue
-                unseen_candidates.append(cand)
-
-            retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
-
-            if verbose:
-                target_active = target is not None
-                repulsion_active = repulsion_lambda > 0.0
-                best_score = retained[0]["score"] if retained else None
-                best_selection_score = (
-                    retained[0]["selection_score"] if retained else None
-                ) if (target_active or repulsion_active) else None
-                best_target_score = (
-                    retained[0].get("target_score") if retained and target_active else None
-                )
-                best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
-                step_elapsed = time.perf_counter() - step_start_time
-                step_elapsed_str = self._format_minutes_seconds(step_elapsed)
-                best_score_str = f"{best_score:.3f}" if best_score is not None else "None"
-                best_selection_score_str = (
-                    f"{best_selection_score:.3f}"
-                    if best_selection_score is not None
-                    else "None"
-                )
-                best_target_score_str = (
-                    f"{best_target_score:.3f}"
-                    if best_target_score is not None
-                    else "None"
-                )
-                current_edges = (
-                    retained[0]["graph"].number_of_edges()
-                    if retained
-                    else start_graph.number_of_edges() + next_depth
-                )
-                remaining_edges = max(0, n_edges - current_edges)
-                eta = remaining_edges * step_elapsed
-                eta_str = self._format_minutes_seconds(eta)
-                line1 = (
-                    f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-                    f"depth={next_depth} remaining_edges={remaining_edges} "
-                    f"step_time={step_elapsed_str} eta={eta_str}"
-                )
-                line2 = (
-                    f"generated={len(generated)} feasible={len(feasible_candidates)} "
-                    f"retained={len(retained)} tried={self.n_tried_}"
-                )
-                line3_parts = [f"best_score={best_score_str}"]
-                if target_active:
-                    line3_parts.append(f"best_target_score={best_target_score_str}")
-                if target_active or repulsion_active:
-                    line3_parts.append(f"best_selection_score={best_selection_score_str}")
-                if repulsion_active:
-                    line3_parts.append(f"best_repulsion={best_repulsion:.3f}")
-                line4_parts = []
-                if target_active:
-                    line4_parts.append(f"target_lambda={target_lambda:.3f}")
-                if repulsion_active:
-                    line4_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
-                line4_parts.append(f"beam_limit={beam_limit}")
-                print("\n".join([line1, line2, " ".join(line3_parts), " ".join(line4_parts)]))
-                if retained:
-                    retained_graphs = [cand["graph"] for cand in retained]
-                    retained_titles = []
-                    for cand in retained:
-                        title_line1_parts = []
-                        title_line2_parts = [f"clf={cand['score']:.3f}"]
-                        if target_active or repulsion_active:
-                            title_line1_parts.append(
-                                f"sel={cand.get('selection_score', cand['score']):.3f}"
-                            )
-                        if repulsion_active:
-                            title_line1_parts.append(
-                                f"rep={cand.get('repulsion', 0.0):.3f}"
-                            )
-                        if target_active:
-                            title_line2_parts.append(
-                                f"tgt={cand.get('target_score', 0.0):.3f}"
-                            )
-                        if title_line1_parts:
-                            retained_titles.append(
-                                " ".join(title_line1_parts) + "\n" + " ".join(title_line2_parts)
-                            )
-                        else:
-                            retained_titles.append(" ".join(title_line2_parts))
-                    self._draw_graphs(
-                        draw_graphs_fn,
-                        retained_graphs,
-                        n_graphs_per_line=min(len(retained_graphs), 7),
-                        titles=retained_titles,
-                    )
-
-            if retained:
-                for cand in retained:
-                    visited.add(cand["key"])
-                depth = next_depth
-                self.max_depth_ = max(self.max_depth_, depth)
-                beam = retained
-                if len(beam_history) > depth:
-                    beam_history[depth] = self._copy_beam(retained)
-                    del beam_history[depth + 1 :]
-                else:
-                    beam_history.append(self._copy_beam(retained))
-                step_start_time = time.perf_counter()
-
-                for state in retained:
-                    if state["graph"].number_of_edges() == n_edges:
-                        path = self._reconstruct_path(state)
-                        if verbose:
-                            elapsed = time.perf_counter() - start_time
-                            elapsed_str = self._format_minutes_seconds(elapsed)
-                            print(
-                                f"[graph {graph_index}] solved phase={fallback_index + 2}/{total_phases} "
-                                f"depth={depth} max_depth={self.max_depth_} "
-                                f'edges={state["graph"].number_of_edges()} remaining_edges=0 '
-                                f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
-                            )
-                        return path
-                continue
-
-            blocked_state_keys_by_depth.setdefault(depth, set()).update(
-                state["key"] for state in beam
+            generated = self._expand_beam(search["beam"])
+            scored = self._score_generated_candidates(
+                generated,
+                n_edges=n_edges,
+                target=target,
+                target_lambda=target_lambda,
+                fallback_index=search["fallback_index"],
             )
-            tabu_path_signatures.update(state["path_signature"] for state in beam)
-            self._remember_failed_graphs([state["graph"] for state in beam])
-
-            if fallback_index + 1 >= n_fallbacks:
-                break
-
-            fallback_index += 1
-            rollback_steps = self._rollback_steps_for_fallback(fallback_index)
-            beam_limit = self._beam_limit_for_fallback(fallback_index)
-            self.top_k_ = beam_limit
-            repaired_beam = self._repair_beam_from_infeasible_candidates(
-                beam,
-                infeasible_candidates,
-                rollback_steps=rollback_steps,
+            retained = self._retain_unseen_candidates(
+                scored["feasible_candidates"],
+                search=search,
+                next_depth=search["depth"] + 1,
                 beam_limit=beam_limit,
             )
-            if repaired_beam:
-                repaired_depth = repaired_beam[0]["depth"]
-                beam_history = beam_history[: repaired_depth + 1]
-                beam_history[repaired_depth] = self._copy_beam(repaired_beam)
-                beam = repaired_beam
-                depth = repaired_depth
-                visited = self._rebuild_visited_from_history(beam_history)
-                step_start_time = time.perf_counter()
 
-                if verbose:
-                    removed_descriptions = [
-                        ",".join(str(edge) for edge in state.get("repair_removed_edges", ()))
-                        for state in repaired_beam
-                    ]
-                    print(
-                        f"[graph {graph_index}] fallback={fallback_index + 1}/{n_fallbacks} "
-                        f"rollback_steps={rollback_steps} surgical_repairs={len(repaired_beam)} "
-                        f"to_depth={repaired_depth} beam_limit={beam_limit}"
-                    )
-                    print(
-                        f"[graph {graph_index}] surgical_removed_edges={removed_descriptions}"
-                    )
+            self._log_search_step(
+                retained,
+                scored,
+                start_graph=start_graph,
+                n_edges=n_edges,
+                next_depth=search["depth"] + 1,
+                target=target,
+                target_lambda=target_lambda,
+                graph_index=graph_index,
+                total_phases=total_phases,
+                fallback_index=search["fallback_index"],
+                beam_limit=beam_limit,
+                step_start_time=search["step_start_time"],
+                draw_graphs_fn=draw_graphs_fn,
+                verbose=verbose,
+            )
 
-                if verbose and total_phases > 1:
-                    print(
-                        f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-                        f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
-                    )
+            if retained:
+                path = self._advance_search_with_retained(
+                    retained,
+                    search=search,
+                    n_edges=n_edges,
+                    graph_index=graph_index,
+                    total_phases=total_phases,
+                    start_time=start_time,
+                    verbose=verbose,
+                )
+                if path is not None:
+                    return path
                 continue
 
-            fallback_depth = max(0, depth - rollback_steps)
-            beam_history = beam_history[: fallback_depth + 1]
-            beam = self._copy_beam(beam_history[fallback_depth])
-            depth = fallback_depth
-            visited = self._rebuild_visited_from_history(beam_history)
-            step_start_time = time.perf_counter()
-
-            if verbose:
-                print(
-                    f"[graph {graph_index}] fallback={fallback_index + 1}/{n_fallbacks} "
-                    f"rollback_steps={rollback_steps} to_depth={fallback_depth} "
-                    f"beam_limit={beam_limit}"
-                )
-
-            if verbose and total_phases > 1:
-                print(
-                    f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-                    f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
-                )
+            beam_limit = self._apply_search_fallback(
+                search,
+                infeasible_candidates=scored["infeasible_candidates"],
+                n_fallbacks=n_fallbacks,
+                total_phases=total_phases,
+                graph_index=graph_index,
+                verbose=verbose,
+            )
+            if beam_limit is None:
+                break
 
         raise ValueError("Could not generate a feasible graph with the requested number of edges")
+
+    def _finish_if_start_graph_is_solution(self, start_graph, *, verbose: bool, graph_index: int):
+        if not bool(self.final_feasibility_estimator.predict([start_graph])[0]):
+            raise ValueError("Start graph does not satisfy the final feasibility estimator")
+        if verbose:
+            print(
+                f"[graph {graph_index}] solved depth=0 max_depth=0 "
+                f"edges={start_graph.number_of_edges()} remaining_edges=0 "
+                f"tried=0 elapsed=0m 0.0s eta=0m 0.0s"
+            )
+        return [start_graph]
+
+    def _initialize_search_state(self, start_graph):
+        beam = [self._make_state(start_graph, parent=None, score=1.0, depth=0)]
+        beam_history = [self._copy_beam(beam)]
+        return {
+            "beam": beam,
+            "beam_history": beam_history,
+            "blocked_state_keys_by_depth": {},
+            "tabu_path_signatures": set(),
+            "visited": self._rebuild_visited_from_history(beam_history),
+            "depth": 0,
+            "fallback_index": -1,
+            "step_start_time": time.perf_counter(),
+        }
+
+    # Beam expansion and candidate scoring.
+
+    def _expand_beam(self, beam):
+        generated = []
+        for state in beam:
+            generated.extend(self._expand_state(state))
+        self.n_tried_ += len(generated)
+        return generated
+
+    def _score_generated_candidates(
+        self,
+        generated,
+        *,
+        n_edges: int,
+        target,
+        target_lambda: float,
+        fallback_index: int,
+    ):
+        feasible_candidates = []
+        infeasible_candidates = []
+        repulsion_lambda = 0.0
+        if generated:
+            self._partition_candidates_by_feasibility(
+                generated,
+                n_edges=n_edges,
+                target=target,
+                target_lambda=target_lambda,
+                feasible_candidates=feasible_candidates,
+                infeasible_candidates=infeasible_candidates,
+            )
+            repulsion_lambda = self._rank_feasible_candidates(
+                feasible_candidates,
+                fallback_index=fallback_index,
+            )
+            self._rank_infeasible_candidates(infeasible_candidates)
+        return {
+            "generated": generated,
+            "feasible_candidates": feasible_candidates,
+            "infeasible_candidates": infeasible_candidates,
+            "repulsion_lambda": repulsion_lambda,
+        }
+
+    def _partition_candidates_by_feasibility(
+        self,
+        generated,
+        *,
+        n_edges: int,
+        target,
+        target_lambda: float,
+        feasible_candidates,
+        infeasible_candidates,
+    ) -> None:
+        generated_graphs = [cand["graph"] for cand in generated]
+        partial_feasibility_mask = np.asarray(
+            self.partial_feasibility_estimator.predict(generated_graphs),
+            dtype=bool,
+        )
+        positive_scores = self._positive_scores(generated_graphs)
+        target_scores = self._target_scores(generated_graphs, target=target)
+        partial_terminal_candidates = []
+        for cand, is_partial_feasible, score, target_score in zip(
+            generated,
+            partial_feasibility_mask,
+            positive_scores,
+            target_scores,
+        ):
+            cand["score"] = float(score)
+            cand["target_score"] = float(target_score)
+            cand["selection_score"] = float(
+                cand["score"] + target_lambda * cand["target_score"]
+            )
+            if is_partial_feasible:
+                if cand["graph"].number_of_edges() == n_edges:
+                    partial_terminal_candidates.append(cand)
+                else:
+                    feasible_candidates.append(cand)
+            else:
+                cand["feasibility_stage"] = "partial"
+                infeasible_candidates.append(cand)
+        self._promote_final_feasible_candidates(
+            partial_terminal_candidates,
+            feasible_candidates=feasible_candidates,
+            infeasible_candidates=infeasible_candidates,
+        )
+
+    def _promote_final_feasible_candidates(
+        self,
+        partial_terminal_candidates,
+        *,
+        feasible_candidates,
+        infeasible_candidates,
+    ) -> None:
+        if not partial_terminal_candidates:
+            return
+        final_mask = np.asarray(
+            self.final_feasibility_estimator.predict(
+                [cand["graph"] for cand in partial_terminal_candidates]
+            ),
+            dtype=bool,
+        )
+        for cand, is_final_feasible in zip(partial_terminal_candidates, final_mask):
+            if is_final_feasible:
+                feasible_candidates.append(cand)
+            else:
+                cand["feasibility_stage"] = "final"
+                infeasible_candidates.append(cand)
+
+    def _rank_feasible_candidates(self, feasible_candidates, *, fallback_index: int):
+        if not feasible_candidates:
+            return 0.0
+        repulsions, repulsion_lambda = self._repulsion_values(
+            [cand["graph"] for cand in feasible_candidates],
+            fallback_index=fallback_index,
+        )
+        for cand, repulsion in zip(feasible_candidates, repulsions):
+            cand["repulsion"] = float(repulsion)
+            cand["selection_score"] = float(
+                cand["selection_score"] - repulsion_lambda * cand["repulsion"]
+            )
+        feasible_candidates.sort(key=lambda cand: cand["selection_score"], reverse=True)
+        return repulsion_lambda
+
+    def _rank_infeasible_candidates(self, infeasible_candidates) -> None:
+        if not infeasible_candidates:
+            return
+        self._annotate_infeasible_candidates_with_violations(infeasible_candidates)
+        infeasible_candidates.sort(
+            key=lambda cand: (
+                cand.get("selection_score", cand["score"]),
+                -cand.get("violation_count", 0.0),
+            ),
+            reverse=True,
+        )
+
+    def _retain_unseen_candidates(self, feasible_candidates, *, search, next_depth: int, beam_limit: int):
+        blocked_state_keys = search["blocked_state_keys_by_depth"].get(next_depth, set())
+        unseen_candidates = []
+        for cand in feasible_candidates:
+            state_key = cand["key"]
+            if state_key in search["visited"] or state_key in blocked_state_keys:
+                continue
+            if cand["path_signature"] in search["tabu_path_signatures"]:
+                continue
+            if self.enforce_diversity and cand["graph_hash"] in self.diversity_memory_hash_set_:
+                continue
+            unseen_candidates.append(cand)
+        return self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
+
+    # Search progress logging.
+
+    def _log_search_step(
+        self,
+        retained,
+        scored,
+        *,
+        start_graph,
+        n_edges: int,
+        next_depth: int,
+        target,
+        target_lambda: float,
+        graph_index: int,
+        total_phases: int,
+        fallback_index: int,
+        beam_limit: int,
+        step_start_time: float,
+        draw_graphs_fn: DrawGraphsFn | None,
+        verbose: bool,
+    ) -> None:
+        if not verbose:
+            return
+        repulsion_lambda = scored["repulsion_lambda"]
+        target_active = target is not None
+        repulsion_active = repulsion_lambda > 0.0
+        best_score = retained[0]["score"] if retained else None
+        best_selection_score = (
+            retained[0]["selection_score"] if retained else None
+        ) if (target_active or repulsion_active) else None
+        best_target_score = (
+            retained[0].get("target_score") if retained and target_active else None
+        )
+        best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
+        step_elapsed = time.perf_counter() - step_start_time
+        current_edges = (
+            retained[0]["graph"].number_of_edges()
+            if retained
+            else start_graph.number_of_edges() + next_depth
+        )
+        remaining_edges = max(0, n_edges - current_edges)
+        eta_str = self._format_minutes_seconds(remaining_edges * step_elapsed)
+        line1 = (
+            f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
+            f"depth={next_depth} remaining_edges={remaining_edges} "
+            f"step_time={self._format_minutes_seconds(step_elapsed)} eta={eta_str}"
+        )
+        line2 = (
+            f"generated={len(scored['generated'])} feasible={len(scored['feasible_candidates'])} "
+            f"retained={len(retained)} tried={self.n_tried_}"
+        )
+        line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
+        if target_active:
+            line3_parts.append(
+                f"best_target_score={self._format_optional_score(best_target_score)}"
+            )
+        if target_active or repulsion_active:
+            line3_parts.append(
+                f"best_selection_score={self._format_optional_score(best_selection_score)}"
+            )
+        if repulsion_active:
+            line3_parts.append(f"best_repulsion={best_repulsion:.3f}")
+        line4_parts = []
+        if target_active:
+            line4_parts.append(f"target_lambda={target_lambda:.3f}")
+        if repulsion_active:
+            line4_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
+        line4_parts.append(f"beam_limit={beam_limit}")
+        print("\n".join([line1, line2, " ".join(line3_parts), " ".join(line4_parts)]))
+        self._draw_retained_candidates(
+            retained,
+            target_active=target_active,
+            repulsion_active=repulsion_active,
+            draw_graphs_fn=draw_graphs_fn,
+        )
+
+    def _format_optional_score(self, value):
+        return f"{value:.3f}" if value is not None else "None"
+
+    def _draw_retained_candidates(
+        self,
+        retained,
+        *,
+        target_active: bool,
+        repulsion_active: bool,
+        draw_graphs_fn: DrawGraphsFn | None,
+    ) -> None:
+        if not retained:
+            return
+        retained_graphs = [cand["graph"] for cand in retained]
+        retained_titles = []
+        for cand in retained:
+            title_line1_parts = []
+            title_line2_parts = [f"clf={cand['score']:.3f}"]
+            if target_active or repulsion_active:
+                title_line1_parts.append(
+                    f"sel={cand.get('selection_score', cand['score']):.3f}"
+                )
+            if repulsion_active:
+                title_line1_parts.append(f"rep={cand.get('repulsion', 0.0):.3f}")
+            if target_active:
+                title_line2_parts.append(f"tgt={cand.get('target_score', 0.0):.3f}")
+            if title_line1_parts:
+                retained_titles.append(
+                    " ".join(title_line1_parts) + "\n" + " ".join(title_line2_parts)
+                )
+            else:
+                retained_titles.append(" ".join(title_line2_parts))
+        self._draw_graphs(
+            draw_graphs_fn,
+            retained_graphs,
+            n_graphs_per_line=min(len(retained_graphs), 7),
+            titles=retained_titles,
+        )
+
+    # Beam retention and fallback transitions.
+
+    def _advance_search_with_retained(
+        self,
+        retained,
+        *,
+        search,
+        n_edges: int,
+        graph_index: int,
+        total_phases: int,
+        start_time: float,
+        verbose: bool,
+    ):
+        for cand in retained:
+            search["visited"].add(cand["key"])
+        search["depth"] += 1
+        self.max_depth_ = max(self.max_depth_, search["depth"])
+        search["beam"] = retained
+        if len(search["beam_history"]) > search["depth"]:
+            search["beam_history"][search["depth"]] = self._copy_beam(retained)
+            del search["beam_history"][search["depth"] + 1 :]
+        else:
+            search["beam_history"].append(self._copy_beam(retained))
+        search["step_start_time"] = time.perf_counter()
+        return self._find_solution_in_beam(
+            retained,
+            n_edges=n_edges,
+            graph_index=graph_index,
+            total_phases=total_phases,
+            fallback_index=search["fallback_index"],
+            start_time=start_time,
+            verbose=verbose,
+        )
+
+    def _find_solution_in_beam(
+        self,
+        beam,
+        *,
+        n_edges: int,
+        graph_index: int,
+        total_phases: int,
+        fallback_index: int,
+        start_time: float,
+        verbose: bool,
+    ):
+        for state in beam:
+            if state["graph"].number_of_edges() != n_edges:
+                continue
+            path = self._reconstruct_path(state)
+            if verbose:
+                elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
+                print(
+                    f"[graph {graph_index}] solved phase={fallback_index + 2}/{total_phases} "
+                    f"depth={state['depth']} max_depth={self.max_depth_} "
+                    f'edges={state["graph"].number_of_edges()} remaining_edges=0 '
+                    f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
+                )
+            return path
+        return None
+
+    def _apply_search_fallback(
+        self,
+        search,
+        *,
+        infeasible_candidates,
+        n_fallbacks: int,
+        total_phases: int,
+        graph_index: int,
+        verbose: bool,
+    ):
+        self._mark_blocked_beam(search)
+        if search["fallback_index"] + 1 >= n_fallbacks:
+            return None
+        search["fallback_index"] += 1
+        rollback_steps = self._rollback_steps_for_fallback(search["fallback_index"])
+        beam_limit = self._beam_limit_for_fallback(search["fallback_index"])
+        self.top_k_ = beam_limit
+        repaired_beam = self._repair_beam_from_infeasible_candidates(
+            search["beam"],
+            infeasible_candidates,
+            rollback_steps=rollback_steps,
+            beam_limit=beam_limit,
+        )
+        if repaired_beam:
+            self._restore_repaired_beam(
+                repaired_beam,
+                search=search,
+                beam_limit=beam_limit,
+                rollback_steps=rollback_steps,
+                n_fallbacks=n_fallbacks,
+                total_phases=total_phases,
+                graph_index=graph_index,
+                verbose=verbose,
+            )
+            return beam_limit
+        self._rollback_search_without_repair(
+            search,
+            rollback_steps=rollback_steps,
+            beam_limit=beam_limit,
+            n_fallbacks=n_fallbacks,
+            total_phases=total_phases,
+            graph_index=graph_index,
+            verbose=verbose,
+        )
+        return beam_limit
+
+    def _mark_blocked_beam(self, search) -> None:
+        search["blocked_state_keys_by_depth"].setdefault(search["depth"], set()).update(
+            state["key"] for state in search["beam"]
+        )
+        search["tabu_path_signatures"].update(
+            state["path_signature"] for state in search["beam"]
+        )
+        self._remember_failed_graphs([state["graph"] for state in search["beam"]])
+
+    def _restore_repaired_beam(
+        self,
+        repaired_beam,
+        *,
+        search,
+        beam_limit: int,
+        rollback_steps: int,
+        n_fallbacks: int,
+        total_phases: int,
+        graph_index: int,
+        verbose: bool,
+    ) -> None:
+        repaired_depth = repaired_beam[0]["depth"]
+        search["beam_history"] = search["beam_history"][: repaired_depth + 1]
+        search["beam_history"][repaired_depth] = self._copy_beam(repaired_beam)
+        search["beam"] = repaired_beam
+        search["depth"] = repaired_depth
+        search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
+        search["step_start_time"] = time.perf_counter()
+        if verbose:
+            removed_descriptions = [
+                ",".join(str(edge) for edge in state.get("repair_removed_edges", ()))
+                for state in repaired_beam
+            ]
+            print(
+                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks} "
+                f"rollback_steps={rollback_steps} surgical_repairs={len(repaired_beam)} "
+                f"to_depth={repaired_depth} beam_limit={beam_limit}"
+            )
+            print(f"[graph {graph_index}] surgical_removed_edges={removed_descriptions}")
+        if verbose and total_phases > 1:
+            self._print_phase_banner(
+                graph_index=graph_index,
+                fallback_index=search["fallback_index"],
+                total_phases=total_phases,
+                beam_limit=beam_limit,
+                n_fallbacks=n_fallbacks,
+            )
+
+    def _rollback_search_without_repair(
+        self,
+        search,
+        *,
+        rollback_steps: int,
+        beam_limit: int,
+        n_fallbacks: int,
+        total_phases: int,
+        graph_index: int,
+        verbose: bool,
+    ) -> None:
+        fallback_depth = max(0, search["depth"] - rollback_steps)
+        search["beam_history"] = search["beam_history"][: fallback_depth + 1]
+        search["beam"] = self._copy_beam(search["beam_history"][fallback_depth])
+        search["depth"] = fallback_depth
+        search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
+        search["step_start_time"] = time.perf_counter()
+        if verbose:
+            print(
+                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks} "
+                f"rollback_steps={rollback_steps} to_depth={fallback_depth} "
+                f"beam_limit={beam_limit}"
+            )
+        if verbose and total_phases > 1:
+            self._print_phase_banner(
+                graph_index=graph_index,
+                fallback_index=search["fallback_index"],
+                total_phases=total_phases,
+                beam_limit=beam_limit,
+                n_fallbacks=n_fallbacks,
+            )
+
+    def _print_phase_banner(
+        self,
+        *,
+        graph_index: int,
+        fallback_index: int,
+        total_phases: int,
+        beam_limit: int,
+        n_fallbacks: int,
+    ) -> None:
+        print(
+            f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
+            f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
+        )
 
     def _expand_state(self, state):
         candidates = []
@@ -2023,7 +2657,10 @@ class EdgeGenerator:
 
     def _class_probability(self, estimator, graphs, *, target, estimator_name: str):
         probs = estimator.predict_proba(graphs)
-        classes = getattr(estimator.estimator_, "classes_", None)
+        classes = getattr(estimator, "classes_", None)
+        if classes is None:
+            wrapped_estimator = getattr(estimator, "estimator_", None)
+            classes = getattr(wrapped_estimator, "classes_", None)
         if classes is None:
             raise ValueError(f"{estimator_name} does not expose fitted classes_")
         classes = list(classes)
