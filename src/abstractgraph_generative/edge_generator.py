@@ -427,6 +427,7 @@ class EdgeGenerator:
         self.stored_retrieval_vectors_ = None
         self.stored_distance_matrix_ = None
         self.surgical_backtracking_ = True
+        self.last_pair_session_ = None
 
     def _resolve_feasibility_estimators(
         self,
@@ -659,8 +660,23 @@ class EdgeGenerator:
         draw_graphs_fn: DrawGraphsFn | None = None,
         verbose: bool | None = None,
     ):
-        self._require_stored_dataset()
         verbose = self.verbose if verbose is None else verbose
+        if (graph_a is None) != (graph_b is None):
+            raise ValueError("graph_a and graph_b must either both be provided or both be None")
+
+        if graph_a is None and graph_b is None:
+            session = self._require_cached_pair_session()
+            if verbose:
+                print("[pair] reusing cached pair session and fitted estimators")
+            return self._generate_from_cached_pair_session(
+                session,
+                target_lambda=target_lambda,
+                return_path=return_path,
+                draw_graphs_fn=draw_graphs_fn,
+                verbose=verbose,
+            )
+
+        self._require_stored_dataset()
 
         training_set_start = time.perf_counter()
         query = self._build_pair_query_corpus(graph_a, graph_b)
@@ -757,6 +773,63 @@ class EdgeGenerator:
                     labeled_graphs, labeled_targets = zip(*labeled_pairs)
                     self.fit_target_estimator(list(labeled_graphs), list(labeled_targets))
 
+        resolved_target = target
+        if resolved_target is None:
+            resolved_target = self._infer_pair_target(
+                query["targets"][query["source_idx"]] if query["targets"] is not None else None,
+                query["targets"][query["dest_idx"]] if query["targets"] is not None else None,
+            )
+        self._cache_pair_session(
+            graph_a=graph_a,
+            graph_b=graph_b,
+            size_of_edge_removal=size_of_edge_removal,
+            target=resolved_target,
+        )
+
+        return self._generate_from_cached_pair_session(
+            self.last_pair_session_,
+            target_lambda=target_lambda,
+            return_path=return_path,
+            draw_graphs_fn=draw_graphs_fn,
+            verbose=verbose,
+        )
+
+    def _cache_pair_session(
+        self,
+        *,
+        graph_a,
+        graph_b,
+        size_of_edge_removal,
+        target,
+    ) -> None:
+        self.last_pair_session_ = {
+            "graph_a": None if graph_a is None else graph_a.copy(),
+            "graph_b": None if graph_b is None else graph_b.copy(),
+            "size_of_edge_removal": float(size_of_edge_removal),
+            "target": target,
+        }
+
+    def _require_cached_pair_session(self):
+        if self.last_pair_session_ is None:
+            raise ValueError(
+                "No cached pair session is available; call generate_from_pair(graph_a, graph_b, ...)"
+            )
+        return self.last_pair_session_
+
+    def _generate_from_cached_pair_session(
+        self,
+        session,
+        *,
+        target_lambda: float,
+        return_path: bool,
+        draw_graphs_fn: DrawGraphsFn | None,
+        verbose: bool,
+    ):
+        graph_a = session["graph_a"]
+        graph_b = session["graph_b"]
+        size_of_edge_removal = session["size_of_edge_removal"]
+        resolved_target = session["target"]
+
         start_graph_a, target_n_edges_a = remove_edges(
             graph_a,
             size=size_of_edge_removal,
@@ -771,13 +844,6 @@ class EdgeGenerator:
             seed=self.rng.randrange(10**9),
         )
         mixed_target_n_edges = int(round(np.mean([target_n_edges_a, target_n_edges_b])))
-        resolved_target = target
-        if resolved_target is None:
-            resolved_target = self._infer_pair_target(
-                query["targets"][query["source_idx"]] if query["targets"] is not None else None,
-                query["targets"][query["dest_idx"]] if query["targets"] is not None else None,
-            )
-
         return self.generate(
             mixed_graph,
             mixed_target_n_edges,

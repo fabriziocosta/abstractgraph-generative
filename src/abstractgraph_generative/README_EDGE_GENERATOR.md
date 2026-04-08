@@ -222,6 +222,26 @@ generator.generate_from_pair(
 8. mixes connected components from the two reduced graphs
 9. starts generation from that mixed graph
 
+After one successful pair setup call, you can reuse the same fitted pair session
+without recomputing paths or refitting:
+
+```python
+generator.generate_from_pair(
+    None,
+    None,
+    target_lambda=1.0,
+    return_path=True,
+)
+```
+
+In that mode the generator:
+
+- reuses the previously cached `graph_a`, `graph_b`, edge-removal fraction, and
+  resolved target
+- reuses the already fitted estimators from the prior pair call
+- performs a fresh stochastic edge removal and component mix
+- starts a new generation immediately
+
 If stored targets exist and no explicit `target=` is passed, `generate_from_pair()`
 infers a pair target from the endpoint targets:
 

@@ -187,3 +187,69 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
     assert partial_estimator.fit_sizes == [2]
     assert final_estimator.fit_sizes == [1]
     assert graph_estimator.fit_size > 0
+
+
+def test_generate_from_pair_none_none_requires_cached_session() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+
+    with pytest.raises(ValueError, match="No cached pair session is available"):
+        generator.generate_from_pair(None, None)
+
+
+def test_generate_from_cached_pair_session_reuses_cached_graphs_and_target(monkeypatch) -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object(), seed=0)
+    graph_a = nx.path_graph(3)
+    graph_b = nx.path_graph(4)
+    generator._cache_pair_session(
+        graph_a=graph_a,
+        graph_b=graph_b,
+        size_of_edge_removal=0.5,
+        target=7,
+    )
+
+    calls = {"remove_edges": 0, "mix": 0, "generate": 0}
+
+    def fake_remove_edges(graph, *, size):
+        calls["remove_edges"] += 1
+        return graph.copy(), graph.number_of_edges() + 2
+
+    def fake_mix_connected_components(graph1, graph2, *, seed):
+        calls["mix"] += 1
+        out = nx.compose(graph1, graph2)
+        out.graph["seed"] = seed
+        return out
+
+    def fake_generate(graph, n_edges, *, target, target_lambda, return_path, draw_graphs_fn, verbose):
+        calls["generate"] += 1
+        return {
+            "n_edges": n_edges,
+            "target": target,
+            "target_lambda": target_lambda,
+            "return_path": return_path,
+            "verbose": verbose,
+            "n_graph_edges": graph.number_of_edges(),
+        }
+
+    monkeypatch.setattr(
+        "abstractgraph_generative.edge_generator.remove_edges",
+        fake_remove_edges,
+    )
+    monkeypatch.setattr(
+        "abstractgraph_generative.edge_generator.mix_connected_components",
+        fake_mix_connected_components,
+    )
+    monkeypatch.setattr(generator, "generate", fake_generate)
+
+    result = generator.generate_from_pair(
+        None,
+        None,
+        target_lambda=0.25,
+        return_path=False,
+        verbose=False,
+    )
+
+    assert calls == {"remove_edges": 2, "mix": 1, "generate": 1}
+    assert result["n_edges"] == 4
+    assert result["target"] == 7
+    assert result["target_lambda"] == 0.25
+    assert result["return_path"] is False
