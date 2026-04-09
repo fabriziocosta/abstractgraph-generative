@@ -4,10 +4,12 @@
 top of `abstractgraph` and `abstractgraph-ml`.
 
 It contains graph rewriting, autoregressive and conditional generation,
-interpolation, optimization/repair workflows, and backend-specific generators.
+interpolation, optimization/repair workflows.
 
 Text and story-graph workflows were extracted into the sibling repo
 `abstractgraph-text`.
+Backend-specific generators were extracted into the sibling repo
+`abstractgraph-generative-backends`.
 
 ## Ecosystem
 
@@ -42,9 +44,10 @@ See [ECOSYSTEM.md](ECOSYSTEM.md) for the dependency graph and install order.
 
 ## Notebooks
 
-- `notebooks/examples/` contains copied generative workflows updated to the
-  split package names.
+- `notebooks/examples/` contains the remaining core generative workflows.
 - Text-oriented notebooks now live in `/home/fabrizio/code/abstractgraph-text`.
+- Backend-generator notebooks now live in
+  `/home/fabrizio/code/abstractgraph-generative-backends`.
 - `notebooks/research/` contains exploratory generation notebooks.
 - Example and research notebooks now bootstrap imports and normalize the
   working directory automatically for the standard three-repo ecosystem layout.

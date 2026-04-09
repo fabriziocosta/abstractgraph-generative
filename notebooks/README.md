@@ -9,6 +9,8 @@ Layout:
 - `research/` for exploratory generation notebooks
 
 Text-oriented notebooks were extracted to `/home/fabrizio/code/abstractgraph-text`.
+Backend-generator notebooks were extracted to
+`/home/fabrizio/code/abstractgraph-generative-backends`.
 
 Bootstrap behavior:
 - Notebooks use `notebooks/_bootstrap.py` to locate the repo root.
