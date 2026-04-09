@@ -493,6 +493,7 @@ class EdgeGenerator:
         fit_backend: str = "loky",
         verbose: bool = False,
         seed: int | None = None,
+        early_stop_if_final_feasible: bool = True,
     ):
         """Configure an edge-growing graph generator.
 
@@ -558,6 +559,10 @@ class EdgeGenerator:
         seed : int | None, optional
             Seed for the internal random number generator controlling sampling,
             fallback randomness, and pair-conditioned generation.
+        early_stop_if_final_feasible : bool, optional
+            Whether search may terminate before reaching ``n_edges`` when the
+            current graph already satisfies the final feasibility estimator and
+            every feasible one-edge expansion scores worse.
 
         Returns
         -------
@@ -606,6 +611,7 @@ class EdgeGenerator:
         self.fit_backend = fit_backend
         self.verbose = verbose
         self.seed = seed
+        self.early_stop_if_final_feasible = early_stop_if_final_feasible
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -1342,6 +1348,20 @@ class EdgeGenerator:
                 target_lambda=target_lambda,
                 fallback_index=search["fallback_index"],
             )
+            early_stop_path = self._find_early_stop_in_beam(
+                search["beam"],
+                scored=scored,
+                n_edges=n_edges,
+                target=target,
+                target_lambda=target_lambda,
+                fallback_index=search["fallback_index"],
+                graph_index=graph_index,
+                total_phases=total_phases,
+                start_time=start_time,
+                verbose=verbose,
+            )
+            if early_stop_path is not None:
+                return early_stop_path
             retained = self._retain_unseen_candidates(
                 scored["feasible_candidates"],
                 search=search,
@@ -1739,6 +1759,114 @@ class EdgeGenerator:
                 )
             return path
         return None
+
+    def _find_early_stop_in_beam(
+        self,
+        beam,
+        *,
+        scored,
+        n_edges: int,
+        target,
+        target_lambda: float,
+        fallback_index: int,
+        graph_index: int,
+        total_phases: int,
+        start_time: float,
+        verbose: bool,
+    ):
+        if not self.early_stop_if_final_feasible or not beam:
+            return None
+
+        current_states = self._score_current_beam_states_for_early_stop(
+            beam,
+            target=target,
+            target_lambda=target_lambda,
+            fallback_index=fallback_index,
+        )
+        if not current_states:
+            return None
+
+        best_current = current_states[0]
+        best_expansion_score = None
+        if scored["feasible_candidates"]:
+            best_expansion_score = scored["feasible_candidates"][0].get(
+                "selection_score",
+                scored["feasible_candidates"][0]["score"],
+            )
+
+        current_score = best_current.get("selection_score", best_current["score"])
+        if best_expansion_score is not None and current_score < best_expansion_score:
+            return None
+
+        path = self._reconstruct_path(best_current)
+        if verbose:
+            elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
+            current_edges = best_current["graph"].number_of_edges()
+            edge_shortfall = max(0, n_edges - current_edges)
+            print(
+                f"[graph {graph_index}] early_stop phase={fallback_index + 2}/{total_phases} "
+                f"depth={best_current['depth']} max_depth={self.max_depth_} "
+                f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
+                f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
+            )
+            print(
+                f"[graph {graph_index}] early_stop_selection_score="
+                f"{current_score:.3f} best_expansion_selection_score="
+                f"{self._format_optional_score(best_expansion_score)}"
+            )
+        return path
+
+    def _score_current_beam_states_for_early_stop(
+        self,
+        beam,
+        *,
+        target,
+        target_lambda: float,
+        fallback_index: int,
+    ):
+        beam_graphs = [state["graph"] for state in beam]
+        final_mask = np.asarray(
+            self.final_feasibility_estimator.predict(beam_graphs),
+            dtype=bool,
+        )
+        if not np.any(final_mask):
+            return []
+
+        positive_scores = self._positive_scores(beam_graphs)
+        target_scores = self._target_scores(beam_graphs, target=target)
+        final_states = []
+        for state, is_final_feasible, score, target_score in zip(
+            beam,
+            final_mask,
+            positive_scores,
+            target_scores,
+        ):
+            if not is_final_feasible:
+                continue
+            state["score"] = float(score)
+            state["target_score"] = float(target_score)
+            state["selection_score"] = float(
+                state["score"] + target_lambda * state["target_score"]
+            )
+            final_states.append(state)
+
+        if not final_states:
+            return []
+
+        repulsions, repulsion_lambda = self._repulsion_values(
+            [state["graph"] for state in final_states],
+            fallback_index=fallback_index,
+        )
+        for state, repulsion in zip(final_states, repulsions):
+            state["repulsion"] = float(repulsion)
+            state["selection_score"] = float(
+                state["selection_score"] - repulsion_lambda * state["repulsion"]
+            )
+        final_states.sort(
+            key=lambda state: state.get("selection_score", state["score"]),
+            reverse=True,
+        )
+        return final_states
 
     def _apply_search_fallback(
         self,
