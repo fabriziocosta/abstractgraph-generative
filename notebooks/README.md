@@ -8,6 +8,13 @@ Layout:
 - `examples/` for supported generator workflows
 - `research/` for exploratory generation notebooks
 
+Highlighted examples:
+- `examples/example_edge_generator_from_pair.ipynb`
+  Pair-conditioned edge generation from a stored retrieval corpus.
+- `examples/example_edge_generator_repair.ipynb`
+  Retrieval-based graph repair by perturbing one stored graph and regrowing
+  from surgically repaired infeasible starts.
+
 Text-oriented notebooks were extracted to `/home/fabrizio/code/abstractgraph-text`.
 Backend-generator notebooks were extracted to
 `/home/fabrizio/code/abstractgraph-generative-backends`.

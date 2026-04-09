@@ -1097,18 +1097,9 @@ class EdgeGenerator:
         resolved_target = self._resolve_repair_target(repair_context, target)
 
         if bool(self.final_feasibility_estimator.predict([start_graph])[0]):
-            path = self.generate(
-                start_graph,
-                target_n_edges,
-                target=resolved_target,
-                target_lambda=target_lambda,
-                return_path=True,
-                draw_graphs_fn=draw_graphs_fn,
-                verbose=verbose,
-            )
-            if not path:
-                return [] if return_path else None
-            return path if return_path else path[-1]
+            if verbose:
+                print("[repair] input graph is already final-feasible; returning unchanged graph")
+            return [start_graph] if return_path else start_graph
 
         repaired_states = self._build_repair_start_states(
             start_graph,

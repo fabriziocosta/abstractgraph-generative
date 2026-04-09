@@ -148,8 +148,7 @@ Typical pattern:
 Behavior:
 
 - the target edge count is always `graph.number_of_edges()`
-- if the graph is already final-feasible, repair just runs same-edge-count
-  generation on the locally refit model
+- if the graph is already final-feasible, repair returns it unchanged
 - if the graph is final-infeasible, repair asks the final-feasibility estimator
   for violating edge sets, removes the most implicated edges according to the
   fallback rollback schedule, and regrows from those repaired starts
