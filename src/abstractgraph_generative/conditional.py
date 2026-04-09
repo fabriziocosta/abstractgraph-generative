@@ -90,6 +90,7 @@ from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import copy
+import math
 import os
 from pprint import pformat
 import random
@@ -102,6 +103,8 @@ import networkx as nx
 from abstractgraph.graphs import AbstractGraph, get_mapped_subgraph, graph_to_abstract_graph
 from abstractgraph.hashing import hash_graph
 from abstractgraph_generative.rewrite import (
+    _cosine_similarity,
+    _transform_context_graphs,
     anchor_type_current,
     anchor_type_train,
     extract_ball,
@@ -277,6 +280,8 @@ class ConditionalAutoregressiveGenerator:
         interpretation_cut_radius: Optional[int] = None,
         preimage_cut_radius: Optional[int] = None,
         image_cut_radius: Optional[int] = None,
+        context_vectorizer=None,
+        preimage_context_radius: Optional[int] = None,
         n_jobs: int = -1,
         debug: bool = False,
         debug_level: int = 1,
@@ -291,6 +296,9 @@ class ConditionalAutoregressiveGenerator:
             interpretation_cut_radius: Canonical radius for interpretation-node neighborhood hashes.
             preimage_cut_radius: Deprecated alias for ``base_cut_radius``.
             image_cut_radius: Deprecated alias for ``interpretation_cut_radius``.
+            context_vectorizer: Optional graph vectorizer used for context scoring.
+            preimage_context_radius: Radius of the anchor-context neighborhood union.
+                If None, embed the full base graph instead.
             n_jobs: Reserved for API compatibility.
             debug: If True, print generation diagnostics.
             debug_level: Debug verbosity level.
@@ -327,6 +335,10 @@ class ConditionalAutoregressiveGenerator:
             )
         )
         self.n_jobs = int(n_jobs)
+        self.context_vectorizer = context_vectorizer
+        self.preimage_context_radius = (
+            None if preimage_context_radius is None else int(preimage_context_radius)
+        )
         requested_debug_level = max(0, int(debug_level))
         self.debug = bool(debug) or requested_debug_level > 0
         if self.debug:
@@ -340,6 +352,10 @@ class ConditionalAutoregressiveGenerator:
         self._inv: dict[tuple[int, int, int, int], set[int]] = {}
         self._inv_freq: dict[tuple[int, int, int, int], int] = {}
         self._interpretation_graph_pool: list[nx.Graph] = []
+        self._component_signature_by_id: dict[int, tuple] = {}
+        self._component_ids_by_signature: dict[tuple, list[int]] = {}
+        self._component_context_embeddings: dict[int, object] = {}
+        self._full_graph_context_embeddings: dict[int, object] = {}
         self._is_fitted: bool = False
         self._zero_generation_streak: int = 0
         self._missing_anchor_sentinel = -1
@@ -627,6 +643,161 @@ class ConditionalAutoregressiveGenerator:
         )
         return (anchor_type, *self._base_node_order_key(graph, node))
 
+    @staticmethod
+    def _similarity_to_weight(similarity: Optional[float]) -> Optional[float]:
+        """Convert cosine similarity into a non-negative weight."""
+        if similarity is None:
+            return None
+        return max(0.0, (float(similarity) + 1.0) * 0.5)
+
+    def _context_scoring_enabled(self) -> bool:
+        """Return whether context-based scoring is available."""
+        return self.context_vectorizer is not None
+
+    def _training_anchor_nodes(self, interpretation_graph: nx.Graph, image_node) -> list:
+        """Collect training-time anchor nodes for one interpretation-node mapping."""
+        mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[image_node])
+        if not isinstance(mapped_subgraph, nx.Graph):
+            return []
+        anchor_nodes = set()
+        mapped_nodes = set(mapped_subgraph.nodes())
+        for neighbor in interpretation_graph.neighbors(image_node):
+            neighbor_mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
+            if not isinstance(neighbor_mapped_subgraph, nx.Graph):
+                continue
+            anchor_nodes.update(mapped_nodes & set(neighbor_mapped_subgraph.nodes()))
+        return sorted(anchor_nodes, key=lambda node: self._base_node_order_key(mapped_subgraph, node))
+
+    def _extract_anchor_context_subgraph(
+        self,
+        graph: nx.Graph,
+        anchor_nodes: Sequence,
+    ) -> Optional[nx.Graph]:
+        """Extract the union of anchor-centered neighborhoods."""
+        if self.preimage_context_radius is None:
+            return graph
+        centers = [node for node in anchor_nodes if node in graph]
+        if not centers:
+            return None
+        included_nodes = set()
+        for center in centers:
+            lengths = nx.single_source_shortest_path_length(
+                graph,
+                center,
+                cutoff=int(self.preimage_context_radius),
+            )
+            included_nodes.update(lengths.keys())
+        if not included_nodes:
+            return None
+        return graph.subgraph(included_nodes).copy()
+
+    def _embed_context_graph(self, graph: Optional[nx.Graph]):
+        """Vectorize one context graph into a dense embedding."""
+        if graph is None or self.context_vectorizer is None:
+            return None
+        cache_key = None
+        if self.preimage_context_radius is None:
+            cache_key = hash_graph(graph)
+            if cache_key in self._full_graph_context_embeddings:
+                return self._full_graph_context_embeddings[cache_key]
+        vectors = _transform_context_graphs(self.context_vectorizer, [graph])
+        if vectors is None or len(vectors) == 0:
+            return None
+        embedding = vectors[0]
+        if cache_key is not None:
+            self._full_graph_context_embeddings[cache_key] = embedding
+        return embedding
+
+    def _embed_anchor_context(self, graph: nx.Graph, anchor_nodes: Sequence):
+        """Embed the requested anchor context or the full graph."""
+        context_graph = self._extract_anchor_context_subgraph(graph, anchor_nodes)
+        return self._embed_context_graph(context_graph)
+
+    def _component_signature(self, component: ComponentInstance) -> tuple:
+        """Build a stable signature for one component independent of comp_id."""
+        port_signatures = tuple(
+            (
+                tuple(int(anchor_type) for anchor_type in port.anchor_types),
+                tuple(tuple(order_key) for order_key in port.anchor_order_keys),
+            )
+            for port in component.ports
+        )
+        return (
+            int(component.img_type),
+            int(component.deg),
+            int(hash_graph(component.subgraph, nbits=max(int(self.nbits), 31))),
+            port_signatures,
+        )
+
+    def _query_component_embedding(self, ag: AbstractGraph, image_node):
+        """Return the context embedding used to score one query component."""
+        if not self._context_scoring_enabled():
+            return None
+        if self.preimage_context_radius is None:
+            return self._embed_context_graph(ag.base_graph)
+        anchor_nodes = self._training_anchor_nodes(ag.interpretation_graph, image_node)
+        return self._embed_anchor_context(ag.base_graph, anchor_nodes)
+
+    def _score_query_component_probability(
+        self,
+        ag: AbstractGraph,
+        image_node,
+        *,
+        k: int,
+    ) -> float:
+        """Estimate a probability-like score for one decomposed query component."""
+        query_component = self._build_component_instance(ag, image_node, comp_id=-1)
+        candidate_ids = list(self._bucket.get((query_component.img_type, query_component.deg), []))
+        if not candidate_ids:
+            return 0.0
+
+        query_signature = self._component_signature(query_component)
+        query_embedding = self._query_component_embedding(ag, image_node)
+        if query_embedding is None:
+            return 0.0
+
+        scored_neighbors: list[tuple[float, int]] = []
+        for comp_id in candidate_ids:
+            reference_embedding = self._component_context_embeddings.get(comp_id)
+            similarity = _cosine_similarity(query_embedding, reference_embedding)
+            if similarity is None:
+                continue
+            scored_neighbors.append((float(similarity), int(comp_id)))
+        if not scored_neighbors:
+            return 0.0
+
+        scored_neighbors.sort(key=lambda item: item[0], reverse=True)
+        top_neighbors = scored_neighbors[: max(1, int(k))]
+        best_similarity, best_comp_id = top_neighbors[0]
+        if (
+            best_similarity >= 1.0 - 1e-12
+            and self._component_signature_by_id.get(best_comp_id) == query_signature
+        ):
+            return 1.0
+
+        weights: list[tuple[float, int]] = []
+        for similarity, comp_id in top_neighbors:
+            weight = self._similarity_to_weight(similarity)
+            if weight is None or not math.isfinite(float(weight)) or float(weight) <= 0.0:
+                continue
+            weights.append((float(weight), int(comp_id)))
+        if not weights:
+            return 0.0
+
+        total_weight = float(sum(weight for weight, _ in weights))
+        if total_weight <= 0.0:
+            return 0.0
+        matching_weight = float(
+            sum(
+                weight
+                for weight, comp_id in weights
+                if self._component_signature_by_id.get(comp_id) == query_signature
+            )
+        )
+        context_probability = min(1.0, max(0.0, self._similarity_to_weight(best_similarity) or 0.0))
+        component_given_context_probability = min(1.0, max(0.0, matching_weight / total_weight))
+        return float(context_probability * component_given_context_probability)
+
     def _build_component_instance(self, ag: AbstractGraph, image_node, comp_id: int) -> ComponentInstance:
         """Build one component instance from an interpretation-node occurrence.
 
@@ -746,6 +917,8 @@ class ConditionalAutoregressiveGenerator:
         bucket: dict[tuple[int, int], list[int]] = {}
         inv: dict[tuple[int, int, int, int], set[int]] = {}
         inv_freq: dict[tuple[int, int, int, int], int] = {}
+        component_signature_by_id: dict[int, tuple] = {}
+        component_ids_by_signature: dict[tuple, list[int]] = {}
         skipped_missing_anchor_components = 0
 
         comp_id = 0
@@ -761,6 +934,9 @@ class ConditionalAutoregressiveGenerator:
                     comp_id += 1
                     continue
                 components[comp_id] = comp
+                comp_signature = self._component_signature(comp)
+                component_signature_by_id[comp_id] = comp_signature
+                component_ids_by_signature.setdefault(comp_signature, []).append(comp_id)
                 key = (comp.img_type, comp.deg)
                 bucket.setdefault(key, []).append(comp_id)
                 for port in comp.ports:
@@ -783,13 +959,105 @@ class ConditionalAutoregressiveGenerator:
         self._inv = inv
         self._inv_freq = inv_freq
         self._interpretation_graph_pool = interpretation_pool
+        self._component_signature_by_id = component_signature_by_id
+        self._component_ids_by_signature = component_ids_by_signature
+        self._component_context_embeddings = {}
+        self._full_graph_context_embeddings = {}
         self._fit_skipped_missing_anchor_components = int(skipped_missing_anchor_components)
         self._is_fitted = True
+
+        if self._context_scoring_enabled():
+            full_graph_embeddings = {}
+            if self.preimage_context_radius is None:
+                for graph in graph_list:
+                    cache_key = hash_graph(graph)
+                    full_graph_embeddings[cache_key] = self._embed_context_graph(graph)
+
+            component_id = 0
+            for ag in abstract_graphs:
+                graph_embedding = None
+                if self.preimage_context_radius is None:
+                    graph_embedding = full_graph_embeddings.get(hash_graph(ag.base_graph))
+                for image_node in ag.interpretation_graph.nodes():
+                    if component_id in self._components:
+                        if self.preimage_context_radius is None:
+                            self._component_context_embeddings[component_id] = graph_embedding
+                        else:
+                            anchor_nodes = self._training_anchor_nodes(ag.interpretation_graph, image_node)
+                            self._component_context_embeddings[component_id] = self._embed_anchor_context(
+                                ag.base_graph,
+                                anchor_nodes,
+                            )
+                    component_id += 1
 
         self._fit_feasibility_estimator(graph_list)
         self._debug_print_fit_indexes()
 
         return self
+
+    def predict_proba(
+        self,
+        graphs: Sequence[nx.Graph],
+        *,
+        k: int = 8,
+        log: bool = False,
+    ) -> list[float]:
+        """Estimate graph scores from component-context nearest neighbors.
+
+        Each query graph is decomposed into interpretation-node components. For
+        each query component, the method retrieves fitted training components
+        from the same ``(img_type, degree)`` bucket, embeds the query context,
+        and scores the top-``k`` nearest neighbors by cosine similarity.
+
+        The local probability proxy is:
+        ``p(component | context) * p(context)``
+        where:
+        - ``p(context)`` is the best-neighbor similarity mapped to ``[0, 1]``
+        - ``p(component | context)`` is the normalized top-``k`` vote mass of
+          neighbors with the same fitted component signature.
+
+        Exact component+context matches return ``1.0`` for that component. The
+        graph score is the geometric mean of its component scores.
+
+        Args:
+            graphs: Query graphs to score.
+            k: Number of nearest fitted contexts to average per component.
+            log: If True, return log scores instead of raw scores.
+
+        Returns:
+            list[float]: One score per graph.
+        """
+        if not self._is_fitted:
+            raise RuntimeError("Generator must be fitted before calling predict_proba().")
+        if not self._context_scoring_enabled():
+            raise ValueError("predict_proba() requires `context_vectorizer`.")
+        if graphs is None:
+            raise ValueError("graphs is required.")
+
+        scores: list[float] = []
+        for graph in list(graphs):
+            ag = graph_to_abstract_graph(
+                graph,
+                decomposition_function=self.decomposition_function,
+                nbits=self.nbits,
+                label_mode=self.label_mode,
+            )
+            component_scores = [
+                max(
+                    self._score_query_component_probability(ag, image_node, k=max(1, int(k))),
+                    1e-12,
+                )
+                for image_node in ag.interpretation_graph.nodes()
+            ]
+            if not component_scores:
+                score = 0.0
+            else:
+                mean_log_score = sum(math.log(float(value)) for value in component_scores) / float(
+                    len(component_scores)
+                )
+                score = float(math.exp(mean_log_score))
+            scores.append(float(math.log(score)) if log and score > 0.0 else (-math.inf if log else score))
+        return scores
 
     def _compute_target_signatures(self, interpretation_graph: nx.Graph) -> dict:
         """Precompute retrieval signatures for a target interpretation graph.

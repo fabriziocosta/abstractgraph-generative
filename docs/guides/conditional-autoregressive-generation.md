@@ -65,6 +65,11 @@ Each component stores:
 - `subgraph`: the reusable base-graph fragment,
 - `ports`: the exposed interfaces used to connect this component to neighbors.
 
+When `context_vectorizer` is provided, fitting also stores one context
+embedding per component. The embedding is computed either from the full base
+graph or from the union of anchor-centered neighborhoods controlled by
+`preimage_context_radius`.
+
 ## Retrieval Indexes
 
 The fitted generator builds two indexes.
@@ -205,6 +210,55 @@ The attributed variant adds a softer preference:
 This biases generation toward reusing associations in contexts that resemble
 their original training environments, even when the current graph is still only
 partially instantiated.
+
+## Probability Scoring
+
+`ConditionalAutoregressiveGenerator` also exposes:
+
+- `predict_proba(graphs, k=8, log=False)`
+
+This method is available only when the generator has a `context_vectorizer`.
+It scores an input graph by decomposing it into interpretation-node components
+and comparing each component context against the fitted training components.
+
+### Component-Level Score
+
+For each interpretation node in the query graph, the scorer:
+
+1. rebuilds the local component with the same decomposition used in training,
+2. restricts retrieval to fitted components in the same `(img_type, degree)`
+   bucket,
+3. embeds the query context with the configured `context_vectorizer`,
+4. finds the top-`k` nearest fitted component contexts by cosine similarity,
+5. converts those similarities into non-negative weights,
+6. estimates:
+   - `p(context)` from the best-neighbor similarity,
+   - `p(component | context)` from the normalized top-`k` vote mass assigned to
+     fitted components with the same component signature.
+
+The local score is then:
+
+- `p(component | context) * p(context)`
+
+If the nearest neighbor is an exact component-and-context match, the local
+score is forced to `1.0`.
+
+### Graph-Level Score
+
+The graph-level score is the geometric mean of the per-component scores. This
+keeps scores comparable across graphs with different numbers of interpretation
+nodes and avoids collapsing to zero too aggressively as graph size grows.
+
+### Practical Interpretation
+
+`predict_proba` returns a probability-like score rather than a calibrated
+statistical probability.
+
+- scores near `1` indicate that the decomposed components and their contexts
+  are strongly represented in the fitted training set,
+- scores near `0` indicate that the graph requires components or contexts that
+  are weakly supported by the fitted component library,
+- `log=True` returns the same score in log space.
 
 ## Boundary Matching
 
