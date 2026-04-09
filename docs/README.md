@@ -1,68 +1,67 @@
-# abstractgraph-generative docs
+# Documentation
 
-`abstractgraph-generative` contains graph generation and rewrite workflows
-built on top of `abstractgraph` and `abstractgraph-ml`.
+This directory is the documentation root for `abstractgraph-generative`.
+
+## Guides
+
+- [Autoregressive Generator and Rewrite](guides/autoregressive-generator-and-rewrite.md)
+- [Conditional Autoregressive Generation](guides/conditional-autoregressive-generation.md)
+- [Edge Generator](guides/edge-generator.md)
 
 ## Scope
 
-This repo owns:
-- autoregressive generators
-- conditional autoregressive generators
+This repo owns the graph-only generation layer built on top of
+`abstractgraph` and `abstractgraph-ml`, including:
+
+- autoregressive generation
+- conditional autoregressive generation
 - interpolation and path-construction workflows
 - graph rewrite and repair utilities
 - graph optimization helpers
-- backend-specific generators such as VGAE, GRAN, and DiGress wrappers
-- graph-only generative workflows
-
-## Module map
-
-- `abstractgraph_generative.rewrite`
-  rewrite primitives and boundary-compatible replacements
-- `abstractgraph_generative.autoregressive`
-  autoregressive generator
-- `abstractgraph_generative.conditional`
-  conditional autoregressive generator
-- `abstractgraph_generative.conditional_batch`
-  dataset-level conditional generation wrapper
-- `abstractgraph_generative.interpolate`
-  interpolation estimator
-- `abstractgraph_generative.interpolation`
-  interpolation generator
-- `abstractgraph_generative.optimize`
-  optimization helpers
-- `abstractgraph_generative.repair`
-  repair-style generation
-- `abstractgraph_generative.legacy.conditional_v0_1`
-  preserved legacy conditional pipeline
+- edge-based generation workflows
 
 Text and story-graph workflows now live in the sibling repo
 `/home/fabrizio/code/abstractgraph-text`.
 
-## Related docs
+Backend-specific generators such as DiGress, GRAN, and VGAE now live in the
+sibling repo `/home/fabrizio/code/abstractgraph-generative-backends`.
 
-- [AUTOREGRESSIVE_GENERATOR_AND_REWRITE.md](AUTOREGRESSIVE_GENERATOR_AND_REWRITE.md)
+## Module Map
 
-Compatibility note:
-- active code is migrating to `base_graph`, `interpretation_graph`, and
-  `mapped_subgraph`
-- `abstractgraph_generative.legacy.*` intentionally preserves the older
-  terminology for backward compatibility
+- `abstractgraph_generative.autoregressive`
+  Autoregressive generator over mapped-subgraph rewrites.
+- `abstractgraph_generative.rewrite`
+  Rewrite primitives and boundary-compatible replacements.
+- `abstractgraph_generative.conditional`
+  Conditional autoregressive generator.
+- `abstractgraph_generative.conditional_batch`
+  Dataset-level conditional generation wrapper.
+- `abstractgraph_generative.conditional_attributed`
+  Context-aware conditional variant.
+- `abstractgraph_generative.edge_generator`
+  Edge-by-edge generator with feasibility and ranking.
+- `abstractgraph_generative.interpolate`
+  Interpolation estimator helpers.
+- `abstractgraph_generative.interpolation`
+  Interpolation generator.
+- `abstractgraph_generative.optimize`
+  Optimization helpers.
+- `abstractgraph_generative.repair`
+  Repair-style generation utilities.
+- `abstractgraph_generative.legacy.conditional_v0_1`
+  Preserved legacy conditional pipeline.
 
-## Dependencies
+## Conventions
 
-- `abstractgraph`
-- `abstractgraph-ml`
+- Active narrative documentation lives in `docs/`.
+- Long-form guides live in `docs/guides/`.
+- Guide filenames use kebab-case.
+- `README.md` files act as landing pages for directories.
 
-## Ecosystem
+## Notes
 
-Sibling repositories:
-
-- `abstractgraph`
-  Path: `/home/fabrizio/work/abstractgraph`
-- `abstractgraph-ml`
-  Path: `/home/fabrizio/work/abstractgraph-ml`
-- `abstractgraph-generative`
-  Path: `/home/fabrizio/work/abstractgraph-generative`
-
-See [../ECOSYSTEM.md](../ECOSYSTEM.md) for install order and dependency
-direction.
+- Active code is migrating to `base_graph`, `interpretation_graph`, and
+  `mapped_subgraph`.
+- `abstractgraph_generative.legacy.*` intentionally preserves older
+  terminology for backward compatibility.
+- For repo-level dependency context, see [../ECOSYSTEM.md](../ECOSYSTEM.md).
