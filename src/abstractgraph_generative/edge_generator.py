@@ -494,6 +494,7 @@ class EdgeGenerator:
         verbose: bool = False,
         seed: int | None = None,
         early_stop_if_final_feasible: bool = True,
+        require_single_connected_component: bool = True,
     ):
         """Configure an edge-growing graph generator.
 
@@ -563,6 +564,10 @@ class EdgeGenerator:
             Whether search may terminate before reaching ``n_edges`` when the
             current graph already satisfies the final feasibility estimator and
             every feasible one-edge expansion scores worse.
+        require_single_connected_component : bool, optional
+            Whether final-feasible graphs with more than one connected
+            component should continue growing past ``n_edges`` until a single
+            connected component is reached, within a bounded extra-edge window.
 
         Returns
         -------
@@ -612,6 +617,7 @@ class EdgeGenerator:
         self.verbose = verbose
         self.seed = seed
         self.early_stop_if_final_feasible = early_stop_if_final_feasible
+        self.require_single_connected_component = require_single_connected_component
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -1559,6 +1565,7 @@ class EdgeGenerator:
         self.max_depth_ = 0
         n_fallbacks = max(0, self.max_restarts)
         total_phases = n_fallbacks + 1
+        max_total_edges = self._max_total_edges_for_generation(start_graph, n_edges)
         start_time = time.perf_counter()
         if verbose:
             remaining_edges = n_edges - start_graph.number_of_edges()
@@ -1574,7 +1581,10 @@ class EdgeGenerator:
             print(" ".join(start_parts))
             self._draw_graphs(draw_graphs_fn, [start_graph])
 
-        if start_graph.number_of_edges() == n_edges:
+        if (
+            start_graph.number_of_edges() == n_edges
+            and self._is_terminal_solution_graph(start_graph, n_edges=n_edges)
+        ):
             return self._finish_if_start_graph_is_solution(
                 start_graph,
                 verbose=verbose,
@@ -1595,10 +1605,15 @@ class EdgeGenerator:
 
         # Main search loop: expand, score, retain, then optionally repair/backtrack.
         while search["beam"]:
-            if search["depth"] >= n_edges:
+            expandable_beam = [
+                state
+                for state in search["beam"]
+                if state["graph"].number_of_edges() < max_total_edges
+            ]
+            if not expandable_beam:
                 break
 
-            generated = self._expand_beam(search["beam"])
+            generated = self._expand_beam(expandable_beam)
             scored = self._score_generated_candidates(
                 generated,
                 n_edges=n_edges,
@@ -1681,6 +1696,33 @@ class EdgeGenerator:
                 f"tried=0 elapsed=0m 0.0s eta=0m 0.0s"
             )
         return [start_graph]
+
+    def _graph_component_count(self, graph: nx.Graph) -> int:
+        if graph.number_of_nodes() <= 0:
+            return 0
+        if nx.is_directed(graph):
+            return int(nx.number_weakly_connected_components(graph))
+        return int(nx.number_connected_components(graph))
+
+    def _is_connectivity_satisfied(self, graph: nx.Graph) -> bool:
+        if not self.require_single_connected_component:
+            return True
+        return self._graph_component_count(graph) <= 1
+
+    def _is_terminal_solution_graph(self, graph: nx.Graph, *, n_edges: int) -> bool:
+        if graph.number_of_edges() < int(n_edges):
+            return False
+        return self._is_connectivity_satisfied(graph)
+
+    def _max_total_edges_for_generation(self, start_graph: nx.Graph, n_edges: int) -> int:
+        base_edges = int(n_edges)
+        if not self.require_single_connected_component:
+            return base_edges
+        start_components = self._graph_component_count(start_graph)
+        if start_components <= 1:
+            return base_edges
+        extra_edges = max(0, start_components - 1)
+        return base_edges + extra_edges
 
     def _initialize_search_state(self, start_graph):
         beam = [self._make_state(start_graph, parent=None, score=1.0, depth=0)]
@@ -1768,7 +1810,7 @@ class EdgeGenerator:
                 cand["score"] + target_lambda * cand["target_score"]
             )
             if is_partial_feasible:
-                if cand["graph"].number_of_edges() == n_edges:
+                if cand["graph"].number_of_edges() >= n_edges:
                     partial_terminal_candidates.append(cand)
                 else:
                     feasible_candidates.append(cand)
@@ -1798,6 +1840,7 @@ class EdgeGenerator:
         )
         for cand, is_final_feasible in zip(partial_terminal_candidates, final_mask):
             if is_final_feasible:
+                cand["connected_components"] = self._graph_component_count(cand["graph"])
                 feasible_candidates.append(cand)
             else:
                 cand["feasibility_stage"] = "final"
@@ -2004,15 +2047,17 @@ class EdgeGenerator:
         verbose: bool,
     ):
         for state in beam:
-            if state["graph"].number_of_edges() != n_edges:
+            if not self._is_terminal_solution_graph(state["graph"], n_edges=n_edges):
                 continue
             path = self._reconstruct_path(state)
             if verbose:
                 elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
+                current_edges = state["graph"].number_of_edges()
+                edge_shortfall = max(0, n_edges - current_edges)
                 print(
                     f"[graph {graph_index}] solved phase={fallback_index + 2}/{total_phases} "
                     f"depth={state['depth']} max_depth={self.max_depth_} "
-                    f'edges={state["graph"].number_of_edges()} remaining_edges=0 '
+                    f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
                     f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
                 )
             return path
@@ -2103,6 +2148,8 @@ class EdgeGenerator:
             target_scores,
         ):
             if not is_final_feasible:
+                continue
+            if not self._is_connectivity_satisfied(state["graph"]):
                 continue
             state["score"] = float(score)
             state["target_score"] = float(target_score)

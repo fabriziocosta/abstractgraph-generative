@@ -74,6 +74,7 @@ generator = EdgeGenerator(
     fallback_growth_factor=2.0,
     beam_growth_factor=1.5,
     max_beam_size=8,
+    require_single_connected_component=True,
     verbose=True,
     seed=0,
 ).fit(fit_graphs, fit_targets)
@@ -215,6 +216,12 @@ With `verbose=True`, failed graphs emit a log line instead of aborting the full
 batch.
 
 `return_path=True` is still the default for compatibility.
+
+When `require_single_connected_component=True` (the default), a graph is not
+accepted as a terminal result unless it is both final-feasible and reduced to a
+single connected component. If search reaches `n_edges` with a disconnected
+final-feasible graph, it can continue for a bounded number of extra edges to
+try to connect the remaining components.
 
 ## Stored Retrieval Corpus
 
@@ -599,6 +606,10 @@ regions.
   Exponential growth factor for beam widening after each fallback.
 - `max_beam_size`
   Optional cap on widened beam size.
+- `require_single_connected_component`
+  When true, disconnected final-feasible graphs are not accepted at
+  `n_edges`; search may spend a bounded number of extra edges trying to merge
+  the remaining connected components.
 - `use_similarity_repulsion`
   Whether to activate cosine-similarity repulsion after fallback begins.
 - `repulsion_weight`
