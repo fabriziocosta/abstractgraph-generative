@@ -242,6 +242,22 @@ In that mode the generator:
 - performs a fresh stochastic edge removal and component mix
 - starts a new generation immediately
 
+You can also override the cached edge-removal amount without rebuilding the
+pair-retrieval context:
+
+```python
+generator.generate_from_pair(
+    None,
+    None,
+    size_of_edge_removal=0.8,
+    target_lambda=1.0,
+    return_path=True,
+)
+```
+
+If `size_of_edge_removal` is omitted in cached-session mode, the previously
+cached value is reused.
+
 If stored targets exist and no explicit `target=` is passed, `generate_from_pair()`
 infers a pair target from the endpoint targets:
 
@@ -574,6 +590,10 @@ Search logs report:
 - ETA
 - active beam limit
 - fallback count when a rollback happens
+
+If early stopping is enabled, it is evaluated only in the final search phase.
+Earlier phases still have to exhaust their normal beam expansion and fallback
+logic before a final-feasible shorter graph can terminate the run.
 
 Fallback transitions are logged explicitly, including:
 

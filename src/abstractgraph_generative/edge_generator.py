@@ -927,7 +927,7 @@ class EdgeGenerator:
         graph_a=None,
         graph_b=None,
         *,
-        size_of_edge_removal=0.5,
+        size_of_edge_removal=None,
         n_paths: int = 3,
         path_k: int = 3,
         n_neighbors_per_path_graph: int = 3,
@@ -946,9 +946,11 @@ class EdgeGenerator:
             omitted, the last cached pair session is reused.
         graph_b : nx.Graph | None, optional
             Second endpoint graph paired with ``graph_a``.
-        size_of_edge_removal : float | int, optional
+        size_of_edge_removal : float | int | None, optional
             Amount of edge pruning applied to each endpoint graph before
-            component mixing starts the generation process.
+            component mixing starts the generation process. When reusing a
+            cached pair session, the cached value is kept unless an explicit
+            override is provided here.
         n_paths : int, optional
             Number of shortest retrieval paths to extract between the endpoint
             graphs in the stored corpus.
@@ -982,6 +984,10 @@ class EdgeGenerator:
 
         if graph_a is None and graph_b is None:
             session = self._require_cached_pair_session()
+            if size_of_edge_removal is not None:
+                session = dict(session)
+                session["size_of_edge_removal"] = float(size_of_edge_removal)
+                self.last_pair_session_ = session
             if verbose:
                 print("[pair] reusing cached pair session and fitted estimators")
             return self._generate_from_cached_pair_session(
@@ -993,6 +999,9 @@ class EdgeGenerator:
             )
 
         self._require_stored_dataset()
+        resolved_size_of_edge_removal = (
+            0.5 if size_of_edge_removal is None else float(size_of_edge_removal)
+        )
         pair_context = self._prepare_pair_training_context(
             graph_a,
             graph_b,
@@ -1011,7 +1020,7 @@ class EdgeGenerator:
         self._cache_pair_session(
             graph_a=graph_a,
             graph_b=graph_b,
-            size_of_edge_removal=size_of_edge_removal,
+            size_of_edge_removal=resolved_size_of_edge_removal,
             target=resolved_target,
         )
 
@@ -1775,6 +1784,9 @@ class EdgeGenerator:
         verbose: bool,
     ):
         if not self.early_stop_if_final_feasible or not beam:
+            return None
+        final_phase_fallback_index = total_phases - 2
+        if fallback_index != final_phase_fallback_index:
             return None
 
         current_states = self._score_current_beam_states_for_early_stop(
