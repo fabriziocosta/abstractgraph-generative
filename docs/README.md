@@ -20,11 +20,6 @@ This repo owns the graph-only generation layer built on top of
 - graph optimization helpers
 - edge-based generation workflows
 
-Text and story-graph workflows now live in the sibling repo
-`/home/fabrizio/code/abstractgraph-text`.
-
-Backend-specific generators such as DiGress, GRAN, and VGAE now live in the
-sibling repo `/home/fabrizio/code/abstractgraph-generative-backends`.
 
 ## Module Map
 
