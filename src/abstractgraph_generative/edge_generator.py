@@ -1032,6 +1032,127 @@ class EdgeGenerator:
             verbose=verbose,
         )
 
+    def repair(
+        self,
+        graph,
+        *,
+        n_neighbors: int = 1,
+        target=None,
+        target_lambda: float = 0.5,
+        return_path: bool = True,
+        draw_graphs_fn: DrawGraphsFn | None = None,
+        verbose: bool | None = None,
+    ):
+        """Repair one graph by refitting on stored nearest neighbors.
+
+        The method reuses the stored retrieval corpus to select the nearest
+        ``n_neighbors`` training graphs, refits the generator on that local
+        neighborhood, keeps the original graph edge count as the repair target,
+        and, when the input graph is final-infeasible, seeds generation from
+        one or more surgically repaired rollback states derived from the
+        estimator's violating-edge sets.
+
+        Parameters
+        ----------
+        graph : nx.Graph
+            Graph to repair.
+        n_neighbors : int, optional
+            Number of nearest stored graphs used to refit the local generator.
+        target : object, optional
+            Optional target value forwarded to ``generate(...)``.
+        target_lambda : float, optional
+            Weight applied to target steering during repair generation.
+        return_path : bool, optional
+            Whether to return the full repair path or only the final graph.
+        draw_graphs_fn : callable, optional
+            Optional visualization callback used when verbose logging is
+            enabled.
+        verbose : bool | None, optional
+            Overrides the instance-level verbosity for this call.
+
+        Returns
+        -------
+        list[nx.Graph] | nx.Graph | None
+            Repair path or final repaired graph, matching ``return_path``.
+        """
+        verbose = self.verbose if verbose is None else verbose
+        self._require_stored_dataset()
+
+        repair_context = self._prepare_repair_training_context(
+            graph,
+            n_neighbors=n_neighbors,
+        )
+        self._log_repair_training_context(
+            repair_context,
+            draw_graphs_fn=draw_graphs_fn,
+            verbose=verbose,
+        )
+        self._fit_pair_training_graphs(
+            repair_context["fit_graphs"],
+            repair_context["fit_targets"],
+        )
+
+        start_graph = graph.copy()
+        target_n_edges = int(start_graph.number_of_edges())
+        resolved_target = self._resolve_repair_target(repair_context, target)
+
+        if bool(self.final_feasibility_estimator.predict([start_graph])[0]):
+            path = self.generate(
+                start_graph,
+                target_n_edges,
+                target=resolved_target,
+                target_lambda=target_lambda,
+                return_path=True,
+                draw_graphs_fn=draw_graphs_fn,
+                verbose=verbose,
+            )
+            if not path:
+                return [] if return_path else None
+            return path if return_path else path[-1]
+
+        repaired_states = self._build_repair_start_states(
+            start_graph,
+            target=resolved_target,
+            target_lambda=target_lambda,
+        )
+        if not repaired_states:
+            if verbose:
+                print("[repair] no surgical repair starts could be constructed")
+            return [] if return_path else None
+
+        for repair_index, repaired_state in enumerate(repaired_states, start=1):
+            if verbose:
+                removed_edges = repaired_state.get("repair_removed_edges", ())
+                print(
+                    f"[repair] attempt={repair_index}/{len(repaired_states)} "
+                    f"start_edges={repaired_state['graph'].number_of_edges()} "
+                    f"target_edges={target_n_edges} removed_edges={list(removed_edges)}"
+                )
+                self._draw_graphs(
+                    draw_graphs_fn,
+                    [start_graph, repaired_state["graph"]],
+                    n_graphs_per_line=2,
+                    titles=["input", "repaired_start"],
+                )
+            repaired_path = self.generate(
+                repaired_state["graph"],
+                target_n_edges,
+                target=resolved_target,
+                target_lambda=target_lambda,
+                return_path=True,
+                draw_graphs_fn=draw_graphs_fn,
+                verbose=verbose,
+            )
+            if not repaired_path:
+                continue
+            if hash_graph(repaired_path[0]) == hash_graph(start_graph):
+                full_path = repaired_path
+            else:
+                full_path = [start_graph] + repaired_path
+            return full_path if return_path else full_path[-1]
+
+        return [] if return_path else None
+
     def _cache_pair_session(
         self,
         *,
@@ -1195,6 +1316,143 @@ class EdgeGenerator:
             "path_k": path_k,
             "training_set_elapsed": time.perf_counter() - training_set_start,
         }
+
+    def _prepare_repair_training_context(
+        self,
+        graph,
+        *,
+        n_neighbors: int,
+    ):
+        if int(n_neighbors) < 1:
+            raise ValueError("n_neighbors must be >= 1")
+
+        graph_copy = graph.copy()
+        graph_hash = hash_graph(graph_copy)
+        stored_idx = self.stored_graph_hash_to_index_.get(graph_hash)
+        if stored_idx is not None:
+            distances = np.asarray(self.stored_distance_matrix_[stored_idx], dtype=float).copy()
+        else:
+            query_vector = self._vectorize_retrieval_graphs(
+                self.retrieval_transformer_,
+                [graph_copy],
+                fit=False,
+            )[0]
+            distances = pairwise_distances(
+                np.asarray(query_vector, dtype=float).reshape(1, -1),
+                np.asarray(self.stored_retrieval_vectors_, dtype=float),
+            ).ravel()
+
+        neighbor_indices = []
+        for idx in np.argsort(distances, kind="stable"):
+            idx = int(idx)
+            if stored_idx is not None and idx == stored_idx:
+                continue
+            if not np.isfinite(distances[idx]):
+                continue
+            neighbor_indices.append(idx)
+            if len(neighbor_indices) >= int(n_neighbors):
+                break
+
+        if not neighbor_indices and stored_idx is not None:
+            neighbor_indices = [int(stored_idx)]
+        if not neighbor_indices:
+            raise ValueError("Could not resolve any stored neighbors for repair")
+
+        fit_graphs = [self.stored_graphs_[idx].copy() for idx in neighbor_indices]
+        fit_targets = None
+        if self.stored_targets_ is not None:
+            fit_targets = [self.stored_targets_[idx] for idx in neighbor_indices]
+
+        return {
+            "graph": graph_copy,
+            "query_index": None if stored_idx is None else int(stored_idx),
+            "neighbor_indices": neighbor_indices,
+            "neighbor_distances": [float(distances[idx]) for idx in neighbor_indices],
+            "fit_graphs": fit_graphs,
+            "fit_targets": fit_targets,
+        }
+
+    def _resolve_repair_target(self, repair_context, requested_target):
+        if requested_target is not None:
+            return requested_target
+        query_index = repair_context.get("query_index")
+        if query_index is None or self.stored_targets_ is None:
+            return None
+        return self.stored_targets_[query_index]
+
+    def _log_repair_training_context(
+        self,
+        repair_context,
+        *,
+        draw_graphs_fn: DrawGraphsFn | None,
+        verbose: bool,
+    ) -> None:
+        if not verbose:
+            return
+        print(
+            f"[repair] query_index={repair_context['query_index']} "
+            f"n_neighbors={len(repair_context['neighbor_indices'])} "
+            f"neighbor_indices={repair_context['neighbor_indices']} "
+            f"neighbor_distances={[round(d, 4) for d in repair_context['neighbor_distances']]}"
+        )
+        self._draw_graphs(
+            draw_graphs_fn,
+            [repair_context["graph"]] + repair_context["fit_graphs"],
+            n_graphs_per_line=min(len(repair_context["fit_graphs"]) + 1, 7),
+            titles=["query"] + [f"nn:{idx}" for idx in repair_context["neighbor_indices"]],
+        )
+
+    def _build_repair_start_states(
+        self,
+        graph,
+        *,
+        target,
+        target_lambda: float,
+    ):
+        start_graph = graph.copy()
+        start_score = float(self._positive_scores([start_graph])[0])
+        start_target_score = float(self._target_scores([start_graph], target=target)[0])
+        start_state = self._make_state(
+            start_graph,
+            parent=None,
+            score=start_score,
+            depth=start_graph.number_of_edges(),
+        )
+        start_state["target_score"] = float(start_target_score)
+        start_state["selection_score"] = float(start_score + target_lambda * start_target_score)
+
+        infeasible_candidate = {
+            "graph": start_graph,
+            "score": float(start_score),
+            "target_score": float(start_target_score),
+            "selection_score": float(start_state["selection_score"]),
+            "feasibility_stage": "final",
+        }
+        self._annotate_infeasible_candidates_with_violating_edge_sets([infeasible_candidate])
+
+        repaired_states = []
+        seen_hashes = set()
+        n_repair_attempts = max(1, int(self.max_restarts))
+        for fallback_index in range(n_repair_attempts):
+            rollback_steps = self._rollback_steps_for_fallback(fallback_index)
+            removed_edges, repair_score = self._select_edges_for_surgical_repair(
+                start_state,
+                [infeasible_candidate],
+                rollback_steps=rollback_steps,
+            )
+            if not removed_edges:
+                continue
+            repaired_state = self._make_repaired_state(
+                start_state,
+                removed_edges,
+                score=repair_score,
+            )
+            repaired_hash = repaired_state["graph_hash"]
+            if repaired_hash in seen_hashes:
+                continue
+            seen_hashes.add(repaired_hash)
+            repaired_states.append(repaired_state)
+        return repaired_states
 
     def _select_pair_targets(self, query, selected_indices):
         if query["targets"] is None:

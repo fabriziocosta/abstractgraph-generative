@@ -34,7 +34,8 @@ This repo owns the graph-only generation layer built on top of
 - `abstractgraph_generative.conditional_attributed`
   Context-aware conditional variant.
 - `abstractgraph_generative.edge_generator`
-  Edge-by-edge generator with feasibility and ranking.
+  Edge-by-edge generator with feasibility, ranking, pair retrieval, and
+  nearest-neighbor repair workflows.
 - `abstractgraph_generative.interpolate`
   Interpolation estimator helpers.
 - `abstractgraph_generative.interpolation`
@@ -43,6 +44,17 @@ This repo owns the graph-only generation layer built on top of
   Optimization helpers.
 - `abstractgraph_generative.repair`
   Repair-style generation utilities.
+
+## Common Workflows
+
+- `generate(...)`
+  Grow a graph to a requested edge count under feasibility constraints.
+- `generate_from_pair(...)`
+  Build a local fitting subset from a stored retrieval corpus and generate from
+  a mixed pair start graph.
+- `repair(...)`
+  Fit on the nearest stored neighbors of one query graph, then regrow from a
+  surgically repaired infeasible start back to the original edge count.
 - `abstractgraph_generative.legacy.conditional_v0_1`
   Preserved legacy conditional pipeline.
 

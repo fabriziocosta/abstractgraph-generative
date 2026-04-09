@@ -118,6 +118,44 @@ generation_path = generator.generate_from_pair(
 )
 ```
 
+Stored-corpus repair workflow:
+
+```python
+repair_path = generator.repair(
+    graph,
+    n_neighbors=3,
+    target=None,
+    target_lambda=0.5,
+    return_path=True,
+    draw_graphs_fn=lambda graphs, **kwargs: display_graphs(
+        graphs,
+        n_graphs_per_line=7,
+        **kwargs,
+    ),
+)
+```
+
+Use `repair(...)` when you already have a candidate graph and want to repair it
+relative to a stored corpus, rather than mixing two endpoints.
+
+Typical pattern:
+
+1. call `generator.store(all_graphs, targets=all_targets)` once
+2. pass the query graph to `generator.repair(...)`
+3. choose `n_neighbors` to control how local the repair fit should be
+4. optionally pass `target` and `target_lambda` to bias the repaired result
+
+Behavior:
+
+- the target edge count is always `graph.number_of_edges()`
+- if the graph is already final-feasible, repair just runs same-edge-count
+  generation on the locally refit model
+- if the graph is final-infeasible, repair asks the final-feasibility estimator
+  for violating edge sets, removes the most implicated edges according to the
+  fallback rollback schedule, and regrows from those repaired starts
+- with `return_path=True`, the returned path begins with the original graph,
+  then the repaired start, then the regrowth sequence
+
 Component-mixing helper:
 
 ```python
@@ -263,6 +301,22 @@ infers a pair target from the endpoint targets:
 
 - regression mode: mean target
 - classification mode: rounded mean target
+
+`repair()` also reuses the stored corpus, but for a single graph query:
+
+1. vectorize the query graph against the stored retrieval transformer
+2. select the `n_neighbors` nearest stored graphs
+3. fit the generator on that local neighborhood
+4. keep the original graph edge count as the repair target
+5. if the input graph is already final-feasible, return it directly
+6. otherwise ask the final-feasibility estimator for violating edge sets
+7. construct one or more surgically reduced start graphs by removing the most
+   implicated edges according to the fallback rollback schedule
+8. regrow from those repaired starts back to the original edge count
+
+If the queried graph exactly matches a stored graph hash and stored targets are
+available, `repair()` reuses that stored target when no explicit `target=` is
+provided.
 
 ## Search Strategy
 

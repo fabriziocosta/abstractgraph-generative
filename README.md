@@ -19,9 +19,21 @@ Two of the main active generation tracks in this repo are:
 - edge-based generation
   This family starts from an input graph and grows it edge-by-edge under
   feasibility constraints, graph ranking, optional target guidance, and
-  pair-retrieval workflows.
+  pair-retrieval and local repair workflows.
   It is implemented in `abstractgraph_generative.edge_generator`.
   See [Edge Generator](docs/guides/edge-generator.md).
+
+One practical workflow in the edge-based generator is `repair(...)`:
+
+- store a retrieval corpus with `generator.store(graphs, targets=...)`
+- call `generator.repair(graph, n_neighbors=..., target=..., target_lambda=...)`
+- the generator fits on the nearest stored neighbors of the query graph
+- if the query graph is infeasible, it uses violating-edge sets from the final
+  feasibility estimator to build surgically reduced start graphs
+- it then regrows back to the original edge count
+
+See [Edge Generator](docs/guides/edge-generator.md) for the full API and
+examples.
 
 Text and story-graph workflows were extracted into the sibling repo
 `abstractgraph-text`.
