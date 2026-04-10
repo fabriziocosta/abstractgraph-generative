@@ -646,6 +646,8 @@ class EdgeGenerator:
         self.stored_distance_matrix_ = None
         self.surgical_backtracking_ = True
         self.last_pair_session_ = None
+        self.last_repair_training_graphs_ = None
+        self.last_repair_training_targets_ = None
 
     def _resolve_feasibility_estimators(
         self,
@@ -1088,6 +1090,13 @@ class EdgeGenerator:
             graph,
             n_neighbors=n_neighbors,
         )
+        self.last_repair_training_graphs_ = [
+            fit_graph.copy() for fit_graph in repair_context["fit_graphs"]
+        ]
+        if repair_context["fit_targets"] is None:
+            self.last_repair_training_targets_ = None
+        else:
+            self.last_repair_training_targets_ = list(repair_context["fit_targets"])
         self._log_repair_training_context(
             repair_context,
             draw_graphs_fn=draw_graphs_fn,
