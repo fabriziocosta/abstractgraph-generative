@@ -279,6 +279,49 @@ def test_repair_returns_none_when_neighbor_labels_do_not_match_input(monkeypatch
     assert "label-set mismatch between input graph and repair neighborhood" in out
 
 
+def test_repair_allows_extra_neighbor_labels_when_input_labels_are_covered(monkeypatch) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+    )
+    input_graph = _labeled_edge_graph(["C", "F"])
+    neighbor_graph = _labeled_edge_graph(["C", "F", "Cl"])
+    repair_context = {
+        "graph": input_graph.copy(),
+        "query_index": None,
+        "neighbor_indices": [0],
+        "neighbor_distances": [0.0],
+        "fit_graphs": [neighbor_graph],
+        "fit_targets": None,
+    }
+
+    monkeypatch.setattr(generator, "_require_stored_dataset", lambda: None)
+    monkeypatch.setattr(
+        generator,
+        "_prepare_repair_training_context",
+        lambda graph, *, n_neighbors: repair_context,
+    )
+    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(generator, "_fit_pair_training_graphs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(generator.final_feasibility_estimator, "predict", lambda graphs: np.asarray([True]))
+
+    repaired = generator.repair(
+        input_graph,
+        n_neighbors=1,
+        return_path=False,
+        verbose=True,
+    )
+
+    assert repaired is not None
+    assert sorted(repaired.nodes(data="label")) == sorted(input_graph.nodes(data="label"))
+    assert sorted(repaired.edges(data="label")) == sorted(input_graph.edges(data="label"))
+    assert generator.last_repair_label_set_mismatch_ is None
+
+
 def test_log_search_step_reports_backtrack_when_no_feasible_candidates_remain(capsys) -> None:
     generator = EdgeGenerator(
         feasibility_estimator=object(),

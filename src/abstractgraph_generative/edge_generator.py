@@ -1244,13 +1244,15 @@ class EdgeGenerator:
         neighbor_labels = set()
         for fit_graph in repair_context["fit_graphs"]:
             neighbor_labels.update(self._graph_unique_node_labels(fit_graph))
-        if graph_labels == neighbor_labels:
+        missing_from_neighbors = sorted(graph_labels - neighbor_labels)
+        extra_in_neighbors = sorted(neighbor_labels - graph_labels)
+        if not missing_from_neighbors:
             return None
         return {
             "graph_labels": sorted(graph_labels),
             "neighbor_labels": sorted(neighbor_labels),
-            "missing_from_neighbors": sorted(graph_labels - neighbor_labels),
-            "extra_in_neighbors": sorted(neighbor_labels - graph_labels),
+            "missing_from_neighbors": missing_from_neighbors,
+            "extra_in_neighbors": extra_in_neighbors,
         }
 
     def _cache_pair_session(

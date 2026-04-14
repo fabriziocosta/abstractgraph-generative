@@ -169,10 +169,10 @@ Behavior:
 - the target edge count is always `graph.number_of_edges()`
 - if the graph is already final-feasible, repair returns it unchanged
 - before fitting the local repair models, `repair()` checks that the unique
-  node-label set in the input graph exactly matches the union of unique
-  node labels present in the retrieved repair neighborhood; if the sets differ,
-  repair fails fast and returns no repair instead of fitting incompatible
-  feasibility models
+  node-label set in the input graph is covered by the union of unique
+  node labels present in the retrieved repair neighborhood; if any input label
+  is missing from the neighborhood, repair fails fast and returns no repair
+  instead of fitting incompatible feasibility models
 - if the graph is final-infeasible, repair asks the final-feasibility estimator
   for violating edge sets, removes the most implicated edges according to the
   fallback rollback schedule, and regrows from those repaired starts
@@ -184,7 +184,7 @@ Diagnostics:
 - when the label-set compatibility check fails, the generator stores the
   details in `last_repair_label_set_mismatch_`
 - in verbose mode, repair logs `missing_from_neighbors` and
-  `extra_in_neighbors` so you can see which labels prevented repair
+  `extra_in_neighbors` so you can inspect neighborhood coverage
 
 Component-mixing helper:
 
