@@ -2051,7 +2051,20 @@ class EdgeGenerator:
         if self.edge_risk_lambda > 0.0 and self.edge_risk_estimator is not None:
             line4_parts.append(f"edge_risk_lambda={self.edge_risk_lambda:.3f}")
         line4_parts.append(f"beam_limit={beam_limit}")
-        print("\n".join([line1, line2, " ".join(line3_parts), " ".join(line4_parts)]))
+        log_lines = [line1, line2, " ".join(line3_parts), " ".join(line4_parts)]
+        if len(scored["feasible_candidates"]) == 0:
+            remaining_fallbacks = max(0, total_phases - (fallback_index + 2))
+            if remaining_fallbacks > 0:
+                log_lines.append(
+                    f"[graph {graph_index}] BACKTRACK no feasible candidates remain; "
+                    f"{remaining_fallbacks} fallback phase(s) left"
+                )
+            else:
+                log_lines.append(
+                    f"[graph {graph_index}] FAILED no feasible candidates remain; "
+                    "no fallback phases left"
+                )
+        print("\n".join(log_lines))
         self._draw_retained_candidates(
             retained,
             target_active=target_active,
@@ -2149,7 +2162,6 @@ class EdgeGenerator:
             if not self._is_terminal_solution_graph(state["graph"], n_edges=n_edges):
                 continue
             self._mark_trace_state_status(state, "solved")
-            self._close_edge_risk_training_states(open_state_ids=set())
             path = self._reconstruct_path(state)
             if verbose:
                 elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
@@ -2206,7 +2218,6 @@ class EdgeGenerator:
             return None
 
         self._mark_trace_state_status(best_current, "solved")
-        self._close_edge_risk_training_states(open_state_ids=set())
         path = self._reconstruct_path(best_current)
         if verbose:
             elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
@@ -2319,9 +2330,6 @@ class EdgeGenerator:
                 graph_index=graph_index,
                 verbose=verbose,
             )
-            self._close_edge_risk_training_states(
-                open_state_ids=self._trace_open_state_ids(search["beam"])
-            )
             return beam_limit
         self._rollback_search_without_repair(
             search,
@@ -2331,9 +2339,6 @@ class EdgeGenerator:
             total_phases=total_phases,
             graph_index=graph_index,
             verbose=verbose,
-        )
-        self._close_edge_risk_training_states(
-            open_state_ids=self._trace_open_state_ids(search["beam"])
         )
         return beam_limit
 
@@ -2367,6 +2372,9 @@ class EdgeGenerator:
         search["depth"] = repaired_depth
         search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
         search["step_start_time"] = time.perf_counter()
+        self._close_edge_risk_training_states(
+            open_state_ids=self._trace_open_state_ids(search["beam"])
+        )
         if verbose:
             edge_risk_training_size = self._edge_risk_training_set_size()
             edge_risk_fit_time = self._edge_risk_last_fit_time_seconds()
@@ -2417,6 +2425,9 @@ class EdgeGenerator:
         search["depth"] = fallback_depth
         search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
         search["step_start_time"] = time.perf_counter()
+        self._close_edge_risk_training_states(
+            open_state_ids=self._trace_open_state_ids(search["beam"])
+        )
         if verbose:
             fallback_parts = [
                 f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks}",

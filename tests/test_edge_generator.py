@@ -220,6 +220,72 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
     assert graph_estimator.fit_size > 0
 
 
+def test_log_search_step_reports_backtrack_when_no_feasible_candidates_remain(capsys) -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        edge_risk_estimator=_RecordingRiskEstimator(),
+        edge_risk_lambda=0.25,
+    )
+
+    generator._log_search_step(
+        retained=[],
+        scored={
+            "repulsion_lambda": 0.0,
+            "generated": [nx.path_graph(2)],
+            "feasible_candidates": [],
+        },
+        start_graph=nx.path_graph(2),
+        n_edges=3,
+        next_depth=1,
+        target=None,
+        target_lambda=0.5,
+        graph_index=0,
+        total_phases=5,
+        fallback_index=0,
+        beam_limit=3,
+        step_start_time=0.0,
+        draw_graphs_fn=None,
+        verbose=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "BACKTRACK no feasible candidates remain" in out
+
+
+def test_log_search_step_reports_failed_when_no_fallback_phases_remain(capsys) -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        edge_risk_estimator=_RecordingRiskEstimator(),
+        edge_risk_lambda=0.25,
+    )
+
+    generator._log_search_step(
+        retained=[],
+        scored={
+            "repulsion_lambda": 0.0,
+            "generated": [nx.path_graph(2)],
+            "feasible_candidates": [],
+        },
+        start_graph=nx.path_graph(2),
+        n_edges=3,
+        next_depth=1,
+        target=None,
+        target_lambda=0.5,
+        graph_index=0,
+        total_phases=2,
+        fallback_index=0,
+        beam_limit=3,
+        step_start_time=0.0,
+        draw_graphs_fn=None,
+        verbose=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "FAILED no feasible candidates remain" in out
+
+
 def test_generate_from_pair_none_none_requires_cached_session() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
 
