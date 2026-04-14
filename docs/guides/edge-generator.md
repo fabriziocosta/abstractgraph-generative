@@ -28,6 +28,7 @@ Typical usage:
 
 ```python
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import SGDRegressor
 
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_ml.estimators import GraphEstimator
@@ -61,10 +62,12 @@ target_estimator = GraphEstimator(
 
 edge_risk_estimator = GraphEstimator(
     transformer=transformer,
-    estimator=RandomForestRegressor(
+    estimator=SGDRegressor(
+        loss="epsilon_insensitive",
+        alpha=1e-4,
+        max_iter=1000,
+        tol=1e-3,
         random_state=0,
-        n_estimators=300,
-        n_jobs=-1,
     ),
 )
 
@@ -427,9 +430,13 @@ semantics:
 - otherwise the adapter stores all past training examples in memory and refits
   the estimator on the full replay buffer each time it is updated
 
-This makes it possible to use `GraphEstimator(..., estimator=RandomForestRegressor(...))`
-as an edge-risk model even though `RandomForestRegressor` does not natively
-support `partial_fit`.
+`GraphEstimator` also exposes `partial_fit(...)` natively: it uses the wrapped
+estimator's own `partial_fit(...)` when available, otherwise it caches the
+already-vectorized batches and refits on their concatenation. This means an
+online SVM-style regressor such as
+`GraphEstimator(..., estimator=SGDRegressor(loss="epsilon_insensitive", ...))`
+can be trained incrementally for edge risk, while non-incremental estimators
+still work through replayed refits on cached feature matrices.
 
 ## Target-Conditioned Fitting
 

@@ -30,6 +30,7 @@ class _OnlineGraphRegressorAdapter:
         self.n_training_examples_ = 0
         self.is_fitted_ = False
         self.supports_partial_fit_ = hasattr(self.estimator_, "partial_fit")
+        self.last_fit_time_seconds_ = 0.0
 
     def partial_fit(self, graphs, targets):
         graph_list = [graph.copy() for graph in graphs]
@@ -40,6 +41,7 @@ class _OnlineGraphRegressorAdapter:
             return self
 
         self.n_training_examples_ += len(graph_list)
+        fit_start = time.perf_counter()
         if self.supports_partial_fit_:
             self.estimator_.partial_fit(graph_list, target_array)
         else:
@@ -47,6 +49,7 @@ class _OnlineGraphRegressorAdapter:
             self.replay_targets_.extend(target_array.tolist())
             self.estimator_ = copy.deepcopy(self.estimator)
             self.estimator_.fit(self.replay_graphs_, self.replay_targets_)
+        self.last_fit_time_seconds_ = time.perf_counter() - fit_start
         self.is_fitted_ = True
         return self
 
@@ -58,6 +61,9 @@ class _OnlineGraphRegressorAdapter:
 
     def training_set_size(self) -> int:
         return int(self.n_training_examples_)
+
+    def last_fit_time_seconds(self) -> float:
+        return float(self.last_fit_time_seconds_)
 
 
 def mix_connected_components(
@@ -2363,6 +2369,7 @@ class EdgeGenerator:
         search["step_start_time"] = time.perf_counter()
         if verbose:
             edge_risk_training_size = self._edge_risk_training_set_size()
+            edge_risk_fit_time = self._edge_risk_last_fit_time_seconds()
             removed_descriptions = [
                 ",".join(str(edge) for edge in state.get("repair_removed_edges", ()))
                 for state in repaired_beam
@@ -2377,6 +2384,10 @@ class EdgeGenerator:
             if edge_risk_training_size is not None:
                 fallback_parts.append(
                     f"edge_risk_training_set_size={edge_risk_training_size}"
+                )
+            if edge_risk_fit_time is not None:
+                fallback_parts.append(
+                    f"edge_risk_fit_time={self._format_minutes_seconds(edge_risk_fit_time)}"
                 )
             print(" ".join(fallback_parts))
             print(f"[graph {graph_index}] surgical_removed_edges={removed_descriptions}")
@@ -2414,9 +2425,14 @@ class EdgeGenerator:
                 f"beam_limit={beam_limit}",
             ]
             edge_risk_training_size = self._edge_risk_training_set_size()
+            edge_risk_fit_time = self._edge_risk_last_fit_time_seconds()
             if edge_risk_training_size is not None:
                 fallback_parts.append(
                     f"edge_risk_training_set_size={edge_risk_training_size}"
+                )
+            if edge_risk_fit_time is not None:
+                fallback_parts.append(
+                    f"edge_risk_fit_time={self._format_minutes_seconds(edge_risk_fit_time)}"
                 )
             print(" ".join(fallback_parts))
         if verbose and total_phases > 1:
@@ -2446,6 +2462,11 @@ class EdgeGenerator:
         if self.edge_risk_model_ is None or self.edge_risk_estimator is None:
             return None
         return self.edge_risk_model_.training_set_size()
+
+    def _edge_risk_last_fit_time_seconds(self) -> float | None:
+        if self.edge_risk_model_ is None or self.edge_risk_estimator is None:
+            return None
+        return self.edge_risk_model_.last_fit_time_seconds()
 
     def _expand_state(self, state):
         candidates = []
@@ -3352,6 +3373,15 @@ class EdgeGenerator:
 
         if training_graphs:
             self.edge_risk_model_.partial_fit(training_graphs, training_targets)
+            if self.verbose:
+                fit_time = self.edge_risk_model_.last_fit_time_seconds()
+                fit_min = int(fit_time // 60)
+                fit_sec = fit_time - 60 * fit_min
+                print(
+                    f"[edge_risk_fit] graphs={len(training_graphs)} "
+                    f"training_set_size={self.edge_risk_model_.training_set_size()} "
+                    f"time={fit_min}m {fit_sec:.1f}s"
+                )
 
     def _class_probability(self, estimator, graphs, *, target, estimator_name: str):
         probs = estimator.predict_proba(graphs)

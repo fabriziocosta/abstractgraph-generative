@@ -396,6 +396,7 @@ def test_online_graph_regressor_adapter_uses_native_partial_fit_when_available()
     assert adapter.training_set_size() == 1
     assert len(adapter.estimator_.partial_fit_calls) == 1
     assert adapter.estimator_.partial_fit_calls[0][1] == [0.3]
+    assert adapter.last_fit_time_seconds() >= 0.0
     assert adapter.predict([nx.path_graph(3)]).tolist() == [0.5]
 
 
@@ -408,6 +409,7 @@ def test_rollback_search_without_repair_logs_edge_risk_training_set_size(capsys)
         max_restarts=4,
     )
     generator.edge_risk_model_.n_training_examples_ = 12
+    generator.edge_risk_model_.last_fit_time_seconds_ = 0.25
     root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
     search = {
         "beam_history": [[root]],
@@ -430,6 +432,7 @@ def test_rollback_search_without_repair_logs_edge_risk_training_set_size(capsys)
 
     out = capsys.readouterr().out
     assert "edge_risk_training_set_size=12" in out
+    assert "edge_risk_fit_time=0m 0.2s" in out
 
 
 def test_make_edge_risk_graph_pair_is_disjoint_and_preserves_attributes() -> None:
