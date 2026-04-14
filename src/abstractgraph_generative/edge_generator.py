@@ -709,6 +709,7 @@ class EdgeGenerator:
         self.last_pair_session_ = None
         self.last_repair_training_graphs_ = None
         self.last_repair_training_targets_ = None
+        self.last_repair_label_set_mismatch_ = None
 
     def _resolve_feasibility_estimators(
         self,
@@ -1151,6 +1152,16 @@ class EdgeGenerator:
             graph,
             n_neighbors=n_neighbors,
         )
+        label_set_mismatch = self._repair_label_set_mismatch(repair_context)
+        self.last_repair_label_set_mismatch_ = label_set_mismatch
+        if label_set_mismatch is not None:
+            if verbose:
+                print(
+                    "[repair] label-set mismatch between input graph and repair neighborhood; "
+                    f"missing_from_neighbors={label_set_mismatch['missing_from_neighbors']} "
+                    f"extra_in_neighbors={label_set_mismatch['extra_in_neighbors']}"
+                )
+            return [] if return_path else None
         self.last_repair_training_graphs_ = [
             fit_graph.copy() for fit_graph in repair_context["fit_graphs"]
         ]
@@ -1219,6 +1230,28 @@ class EdgeGenerator:
             return full_path if return_path else full_path[-1]
 
         return [] if return_path else None
+
+    def _graph_unique_node_labels(self, graph) -> set:
+        labels = set()
+        for _, attrs in graph.nodes(data=True):
+            label = attrs.get("label")
+            if label is not None:
+                labels.add(label)
+        return labels
+
+    def _repair_label_set_mismatch(self, repair_context):
+        graph_labels = self._graph_unique_node_labels(repair_context["graph"])
+        neighbor_labels = set()
+        for fit_graph in repair_context["fit_graphs"]:
+            neighbor_labels.update(self._graph_unique_node_labels(fit_graph))
+        if graph_labels == neighbor_labels:
+            return None
+        return {
+            "graph_labels": sorted(graph_labels),
+            "neighbor_labels": sorted(neighbor_labels),
+            "missing_from_neighbors": sorted(graph_labels - neighbor_labels),
+            "extra_in_neighbors": sorted(neighbor_labels - graph_labels),
+        }
 
     def _cache_pair_session(
         self,
@@ -2191,9 +2224,6 @@ class EdgeGenerator:
         verbose: bool,
     ):
         if not self.early_stop_if_final_feasible or not beam:
-            return None
-        final_phase_fallback_index = total_phases - 2
-        if fallback_index != final_phase_fallback_index:
             return None
 
         current_states = self._score_current_beam_states_for_early_stop(

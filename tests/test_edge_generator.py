@@ -61,6 +61,15 @@ class _NativePartialFitRiskEstimator:
         return np.asarray([0.5] * len(graphs), dtype=float)
 
 
+def _labeled_edge_graph(node_labels: list[str]) -> nx.Graph:
+    graph = nx.Graph()
+    for idx, label in enumerate(node_labels):
+        graph.add_node(idx, label=label)
+    for idx in range(len(node_labels) - 1):
+        graph.add_edge(idx, idx + 1, label="single")
+    return graph
+
+
 def test_augment_indices_with_nearest_neighbors_adds_k_per_seed_without_duplicates() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
     distance_matrix = np.asarray(
@@ -218,6 +227,56 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
     assert partial_estimator.fit_sizes == [2]
     assert final_estimator.fit_sizes == [1]
     assert graph_estimator.fit_size > 0
+
+
+def test_repair_returns_none_when_neighbor_labels_do_not_match_input(monkeypatch, capsys) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+    )
+    input_graph = _labeled_edge_graph(["C", "F"])
+    neighbor_graph = _labeled_edge_graph(["C", "N"])
+    repair_context = {
+        "graph": input_graph.copy(),
+        "query_index": None,
+        "neighbor_indices": [0],
+        "neighbor_distances": [0.0],
+        "fit_graphs": [neighbor_graph],
+        "fit_targets": None,
+    }
+
+    monkeypatch.setattr(generator, "_require_stored_dataset", lambda: None)
+    monkeypatch.setattr(
+        generator,
+        "_prepare_repair_training_context",
+        lambda graph, *, n_neighbors: repair_context,
+    )
+
+    def fail_fit(*args, **kwargs):
+        raise AssertionError("repair should fail before fitting local estimators")
+
+    monkeypatch.setattr(generator, "_fit_pair_training_graphs", fail_fit)
+
+    repaired = generator.repair(
+        input_graph,
+        n_neighbors=1,
+        return_path=False,
+        verbose=True,
+    )
+
+    assert repaired is None
+    assert generator.last_repair_label_set_mismatch_ == {
+        "graph_labels": ["C", "F"],
+        "neighbor_labels": ["C", "N"],
+        "missing_from_neighbors": ["F"],
+        "extra_in_neighbors": ["N"],
+    }
+    out = capsys.readouterr().out
+    assert "label-set mismatch between input graph and repair neighborhood" in out
 
 
 def test_log_search_step_reports_backtrack_when_no_feasible_candidates_remain(capsys) -> None:
