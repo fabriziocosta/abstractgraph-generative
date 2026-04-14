@@ -19,6 +19,42 @@ from abstractgraph_generative.interpolate import _build_adjacency
 DrawGraphsFn = Callable[..., object]
 
 
+class _OnlineGraphRegressorAdapter:
+    """Online adapter for graph regressors with optional replay-backed fitting."""
+
+    def __init__(self, estimator) -> None:
+        self.estimator = estimator
+        self.estimator_ = copy.deepcopy(estimator)
+        self.replay_graphs_ = []
+        self.replay_targets_ = []
+        self.is_fitted_ = False
+        self.supports_partial_fit_ = hasattr(self.estimator_, "partial_fit")
+
+    def partial_fit(self, graphs, targets):
+        graph_list = [graph.copy() for graph in graphs]
+        target_array = np.asarray(targets, dtype=float).reshape(-1)
+        if len(graph_list) != len(target_array):
+            raise ValueError("graphs and targets must have the same length")
+        if not graph_list:
+            return self
+
+        if self.supports_partial_fit_:
+            self.estimator_.partial_fit(graph_list, target_array)
+        else:
+            self.replay_graphs_.extend(graph_list)
+            self.replay_targets_.extend(target_array.tolist())
+            self.estimator_ = copy.deepcopy(self.estimator)
+            self.estimator_.fit(self.replay_graphs_, self.replay_targets_)
+        self.is_fitted_ = True
+        return self
+
+    def predict(self, graphs):
+        if not self.is_fitted_:
+            return np.zeros(len(graphs), dtype=float)
+        predictions = self.estimator_.predict(graphs)
+        return np.asarray(predictions, dtype=float).reshape(-1)
+
+
 def mix_connected_components(
     graph1: nx.Graph,
     graph2: nx.Graph,
@@ -470,6 +506,7 @@ class EdgeGenerator:
         feasibility_estimator=None,
         graph_estimator=None,
         target_estimator=None,
+        edge_risk_estimator=None,
         target_estimator_mode: str = "classification",
         decomposition_function=None,
         *,
@@ -487,6 +524,7 @@ class EdgeGenerator:
         use_similarity_repulsion: bool = True,
         repulsion_weight: float = 0.2,
         repulsion_growth_factor: float = 1.5,
+        edge_risk_lambda: float = 0.0,
         max_repulsion_memory: int = 256,
         allow_self_loops: bool = False,
         fit_n_jobs: int = -1,
@@ -508,6 +546,8 @@ class EdgeGenerator:
             during beam search.
         target_estimator : object, optional
             Optional estimator used to score graphs against a requested target.
+        edge_risk_estimator : object, optional
+            Optional estimator used to learn online edge-materialization risk.
         target_estimator_mode : str, optional
             ``"classification"`` to match a class label or ``"regression"`` to
             prefer predictions close to a numeric target.
@@ -546,6 +586,8 @@ class EdgeGenerator:
             Base weight of the similarity-repulsion penalty.
         repulsion_growth_factor : float, optional
             Multiplicative growth of repulsion during fallback phases.
+        edge_risk_lambda : float, optional
+            Weight of the edge-risk penalty subtracted from selection scores.
         max_repulsion_memory : int, optional
             Maximum number of failed graph embeddings retained for repulsion.
         allow_self_loops : bool, optional
@@ -590,6 +632,7 @@ class EdgeGenerator:
         self.feasibility_estimator = self.partial_feasibility_estimator
         self.graph_estimator = graph_estimator
         self.target_estimator = target_estimator
+        self.edge_risk_estimator = edge_risk_estimator
         if target_estimator_mode not in {"classification", "regression"}:
             raise ValueError(
                 "target_estimator_mode must be 'classification' or 'regression'"
@@ -610,6 +653,7 @@ class EdgeGenerator:
         self.use_similarity_repulsion = use_similarity_repulsion
         self.repulsion_weight = repulsion_weight
         self.repulsion_growth_factor = repulsion_growth_factor
+        self.edge_risk_lambda = edge_risk_lambda
         self.max_repulsion_memory = max_repulsion_memory
         self.allow_self_loops = allow_self_loops
         self.fit_n_jobs = fit_n_jobs
@@ -638,6 +682,12 @@ class EdgeGenerator:
         self.diversity_memory_hash_set_ = set()
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
+        self.edge_risk_model_ = (
+            None
+            if self.edge_risk_estimator is None
+            else _OnlineGraphRegressorAdapter(self.edge_risk_estimator)
+        )
+        self.edge_risk_trace_ = None
         self.stored_graphs_ = None
         self.stored_targets_ = None
         self.stored_graph_hash_to_index_ = {}
@@ -1567,6 +1617,7 @@ class EdgeGenerator:
         graph_index: int = 0,
     ):
         start_graph = graph.copy()
+        self._reset_edge_risk_attempt_trace()
         if start_graph.number_of_edges() > n_edges:
             raise ValueError("Input graph already has more edges than n_edges")
 
@@ -1693,6 +1744,7 @@ class EdgeGenerator:
             if beam_limit is None:
                 break
 
+        self._close_edge_risk_training_states(open_state_ids=set())
         raise ValueError("Could not generate a feasible graph with the requested number of edges")
 
     def _finish_if_start_graph_is_solution(self, start_graph, *, verbose: bool, graph_index: int):
@@ -1806,17 +1858,22 @@ class EdgeGenerator:
         )
         positive_scores = self._positive_scores(generated_graphs)
         target_scores = self._target_scores(generated_graphs, target=target)
+        risk_scores = self._edge_risk_scores(generated)
         partial_terminal_candidates = []
-        for cand, is_partial_feasible, score, target_score in zip(
+        for cand, is_partial_feasible, score, target_score, risk_score in zip(
             generated,
             partial_feasibility_mask,
             positive_scores,
             target_scores,
+            risk_scores,
         ):
             cand["score"] = float(score)
             cand["target_score"] = float(target_score)
+            cand["risk_score"] = float(risk_score)
             cand["selection_score"] = float(
-                cand["score"] + target_lambda * cand["target_score"]
+                cand["score"]
+                + target_lambda * cand["target_score"]
+                - self.edge_risk_lambda * cand["risk_score"]
             )
             if is_partial_feasible:
                 if cand["graph"].number_of_edges() >= n_edges:
@@ -1825,6 +1882,7 @@ class EdgeGenerator:
                     feasible_candidates.append(cand)
             else:
                 cand["feasibility_stage"] = "partial"
+                self._mark_trace_state_status(cand, "partial_infeasible")
                 infeasible_candidates.append(cand)
         self._promote_final_feasible_candidates(
             partial_terminal_candidates,
@@ -1853,6 +1911,7 @@ class EdgeGenerator:
                 feasible_candidates.append(cand)
             else:
                 cand["feasibility_stage"] = "final"
+                self._mark_trace_state_status(cand, "final_infeasible")
                 infeasible_candidates.append(cand)
 
     def _rank_feasible_candidates(self, feasible_candidates, *, fallback_index: int):
@@ -1894,7 +1953,14 @@ class EdgeGenerator:
             if self.enforce_diversity and cand["graph_hash"] in self.diversity_memory_hash_set_:
                 continue
             unseen_candidates.append(cand)
-        return self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
+        retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
+        retained_ids = {cand.get("state_id") for cand in retained}
+        for cand in unseen_candidates:
+            if cand.get("state_id") in retained_ids:
+                self._mark_trace_state_status(cand, "retained")
+            else:
+                self._mark_trace_state_status(cand, "pruned")
+        return retained
 
     # Search progress logging.
 
@@ -1929,6 +1995,7 @@ class EdgeGenerator:
             retained[0].get("target_score") if retained and target_active else None
         )
         best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
+        best_risk = retained[0].get("risk_score", 0.0) if retained else 0.0
         step_elapsed = time.perf_counter() - step_start_time
         current_edges = (
             retained[0]["graph"].number_of_edges()
@@ -1957,11 +2024,15 @@ class EdgeGenerator:
             )
         if repulsion_active:
             line3_parts.append(f"best_repulsion={best_repulsion:.3f}")
+        if self.edge_risk_lambda > 0.0:
+            line3_parts.append(f"best_risk={best_risk:.3f}")
         line4_parts = []
         if target_active:
             line4_parts.append(f"target_lambda={target_lambda:.3f}")
         if repulsion_active:
             line4_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
+        if self.edge_risk_lambda > 0.0 and self.edge_risk_estimator is not None:
+            line4_parts.append(f"edge_risk_lambda={self.edge_risk_lambda:.3f}")
         line4_parts.append(f"beam_limit={beam_limit}")
         print("\n".join([line1, line2, " ".join(line3_parts), " ".join(line4_parts)]))
         self._draw_retained_candidates(
@@ -1995,6 +2066,8 @@ class EdgeGenerator:
                 )
             if repulsion_active:
                 title_line1_parts.append(f"rep={cand.get('repulsion', 0.0):.3f}")
+            if self.edge_risk_lambda > 0.0:
+                title_line1_parts.append(f"risk={cand.get('risk_score', 0.0):.3f}")
             if target_active:
                 title_line2_parts.append(f"tgt={cand.get('target_score', 0.0):.3f}")
             if title_line1_parts:
@@ -2058,6 +2131,8 @@ class EdgeGenerator:
         for state in beam:
             if not self._is_terminal_solution_graph(state["graph"], n_edges=n_edges):
                 continue
+            self._mark_trace_state_status(state, "solved")
+            self._close_edge_risk_training_states(open_state_ids=set())
             path = self._reconstruct_path(state)
             if verbose:
                 elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
@@ -2113,6 +2188,8 @@ class EdgeGenerator:
         if best_expansion_score is not None and current_score < best_expansion_score:
             return None
 
+        self._mark_trace_state_status(best_current, "solved")
+        self._close_edge_risk_training_states(open_state_ids=set())
         path = self._reconstruct_path(best_current)
         if verbose:
             elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
@@ -2149,12 +2226,14 @@ class EdgeGenerator:
 
         positive_scores = self._positive_scores(beam_graphs)
         target_scores = self._target_scores(beam_graphs, target=target)
+        risk_scores = self._edge_risk_scores(beam)
         final_states = []
-        for state, is_final_feasible, score, target_score in zip(
+        for state, is_final_feasible, score, target_score, risk_score in zip(
             beam,
             final_mask,
             positive_scores,
             target_scores,
+            risk_scores,
         ):
             if not is_final_feasible:
                 continue
@@ -2162,8 +2241,11 @@ class EdgeGenerator:
                 continue
             state["score"] = float(score)
             state["target_score"] = float(target_score)
+            state["risk_score"] = float(risk_score)
             state["selection_score"] = float(
-                state["score"] + target_lambda * state["target_score"]
+                state["score"]
+                + target_lambda * state["target_score"]
+                - self.edge_risk_lambda * state["risk_score"]
             )
             final_states.append(state)
 
@@ -2197,6 +2279,7 @@ class EdgeGenerator:
     ):
         self._mark_blocked_beam(search)
         if search["fallback_index"] + 1 >= n_fallbacks:
+            self._close_edge_risk_training_states(open_state_ids=set())
             return None
         search["fallback_index"] += 1
         rollback_steps = self._rollback_steps_for_fallback(search["fallback_index"])
@@ -2219,6 +2302,9 @@ class EdgeGenerator:
                 graph_index=graph_index,
                 verbose=verbose,
             )
+            self._close_edge_risk_training_states(
+                open_state_ids=self._trace_open_state_ids(search["beam"])
+            )
             return beam_limit
         self._rollback_search_without_repair(
             search,
@@ -2229,6 +2315,9 @@ class EdgeGenerator:
             graph_index=graph_index,
             verbose=verbose,
         )
+        self._close_edge_risk_training_states(
+            open_state_ids=self._trace_open_state_ids(search["beam"])
+        )
         return beam_limit
 
     def _mark_blocked_beam(self, search) -> None:
@@ -2238,6 +2327,8 @@ class EdgeGenerator:
         search["tabu_path_signatures"].update(
             state["path_signature"] for state in search["beam"]
         )
+        for state in search["beam"]:
+            self._mark_trace_state_status(state, "blocked")
         self._remember_failed_graphs([state["graph"] for state in search["beam"]])
 
     def _restore_repaired_beam(
@@ -2362,7 +2453,7 @@ class EdgeGenerator:
             depth = 0 if parent is None else parent.get("depth", 0)
             if added_edge is not None:
                 depth += 1
-        return {
+        state = {
             "graph": graph,
             "graph_hash": graph_hash,
             "parent": parent,
@@ -2375,6 +2466,8 @@ class EdgeGenerator:
             "edge_order": tuple(edge_order),
             "depth": int(depth),
         }
+        self._register_trace_state(state)
+        return state
 
     def _repair_beam_from_infeasible_candidates(
         self,
@@ -3099,6 +3192,130 @@ class EdgeGenerator:
             target=target,
             estimator_name="target_estimator",
         )
+
+    def _edge_risk_scores(self, candidates):
+        if (
+            self.edge_risk_model_ is None
+            or self.edge_risk_lambda == 0.0
+            or not candidates
+        ):
+            return np.zeros(len(candidates), dtype=float)
+        pair_graphs = []
+        for cand in candidates:
+            parent = cand.get("parent")
+            if parent is None:
+                pair_graphs.append(cand["graph"].copy())
+            else:
+                pair_graphs.append(
+                    self._make_edge_risk_graph_pair(parent["graph"], cand["graph"])
+                )
+        return self.edge_risk_model_.predict(pair_graphs)
+
+    def _make_edge_risk_graph_pair(self, parent_graph: nx.Graph, child_graph: nx.Graph):
+        return nx.disjoint_union(parent_graph.copy(), child_graph.copy())
+
+    def _reset_edge_risk_attempt_trace(self) -> None:
+        if self.edge_risk_model_ is None:
+            self.edge_risk_trace_ = None
+            return
+        self.edge_risk_trace_ = {
+            "next_state_id": 0,
+            "states": {},
+            "trained_state_ids": set(),
+        }
+
+    def _register_trace_state(self, state) -> None:
+        trace = self.edge_risk_trace_
+        if trace is None:
+            state["state_id"] = None
+            state["parent_state_id"] = None if state.get("parent") is None else state["parent"].get("state_id")
+            state["root_decision_id"] = None
+            return
+
+        state_id = int(trace["next_state_id"])
+        trace["next_state_id"] += 1
+        parent = state.get("parent")
+        parent_state_id = None if parent is None else parent.get("state_id")
+        state["state_id"] = state_id
+        state["parent_state_id"] = parent_state_id
+        state["root_decision_id"] = state_id if parent_state_id is not None else None
+        trace["states"][state_id] = {
+            "state": state,
+            "parent_state_id": parent_state_id,
+            "child_state_ids": [],
+            "status": "created",
+        }
+        if parent_state_id is not None and parent_state_id in trace["states"]:
+            trace["states"][parent_state_id]["child_state_ids"].append(state_id)
+
+    def _mark_trace_state_status(self, state, status: str) -> None:
+        trace = self.edge_risk_trace_
+        if trace is None:
+            return
+        state_id = state.get("state_id")
+        if state_id is None or state_id not in trace["states"]:
+            return
+        trace["states"][state_id]["status"] = status
+
+    def _trace_open_state_ids(self, beam):
+        trace = self.edge_risk_trace_
+        if trace is None:
+            return set()
+        open_state_ids = set()
+        for state in beam:
+            current = state
+            while current is not None:
+                state_id = current.get("state_id")
+                if state_id is None or state_id in open_state_ids:
+                    break
+                open_state_ids.add(state_id)
+                current = current.get("parent")
+        return open_state_ids
+
+    def _collect_trace_descendant_ids(self, state_id: int):
+        trace = self.edge_risk_trace_
+        if trace is None or state_id not in trace["states"]:
+            return []
+        descendants = []
+        stack = list(trace["states"][state_id]["child_state_ids"])
+        while stack:
+            child_id = stack.pop()
+            descendants.append(child_id)
+            stack.extend(trace["states"][child_id]["child_state_ids"])
+        return descendants
+
+    def _close_edge_risk_training_states(self, *, open_state_ids) -> None:
+        trace = self.edge_risk_trace_
+        if trace is None or self.edge_risk_model_ is None:
+            return
+
+        training_graphs = []
+        training_targets = []
+        for state_id, trace_state in trace["states"].items():
+            if state_id in open_state_ids or state_id in trace["trained_state_ids"]:
+                continue
+            state = trace_state["state"]
+            parent = state.get("parent")
+            if parent is None:
+                trace["trained_state_ids"].add(state_id)
+                continue
+            descendant_ids = self._collect_trace_descendant_ids(state_id)
+            if not descendant_ids:
+                continue
+            total_descendants = len(descendant_ids)
+            infeasible_descendants = sum(
+                1
+                for descendant_id in descendant_ids
+                if trace["states"][descendant_id]["status"] in {"partial_infeasible", "final_infeasible"}
+            )
+            training_graphs.append(
+                self._make_edge_risk_graph_pair(parent["graph"], state["graph"])
+            )
+            training_targets.append(infeasible_descendants / float(total_descendants))
+            trace["trained_state_ids"].add(state_id)
+
+        if training_graphs:
+            self.edge_risk_model_.partial_fit(training_graphs, training_targets)
 
     def _class_probability(self, estimator, graphs, *, target, estimator_name: str):
         probs = estimator.predict_proba(graphs)

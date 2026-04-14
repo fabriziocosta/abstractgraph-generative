@@ -18,8 +18,8 @@ Two of the main active generation tracks in this repo are:
 
 - edge-based generation
   This family starts from an input graph and grows it edge-by-edge under
-  feasibility constraints, graph ranking, optional target guidance, and
-  pair-retrieval and local repair workflows.
+  feasibility constraints, graph ranking, optional target guidance, optional
+  online edge-risk penalties, and pair-retrieval and local repair workflows.
   It is implemented in `abstractgraph_generative.edge_generator`.
   See [Edge Generator](docs/guides/edge-generator.md).
 

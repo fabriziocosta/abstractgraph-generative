@@ -6,6 +6,8 @@
 - a final-graph feasibility model to validate completed graphs
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
+- an optional online edge-risk model to penalize edge decisions that tend to
+  lead to infeasible descendants
 - an optional decomposition-aware training trajectory to bias reconstruction toward complete subgraphs
 - an optional stored retrieval corpus to select path-based fitting subsets from graph pairs
 - a beam search over partial constructions
@@ -57,6 +59,15 @@ target_estimator = GraphEstimator(
     ),
 )
 
+edge_risk_estimator = GraphEstimator(
+    transformer=transformer,
+    estimator=RandomForestRegressor(
+        random_state=0,
+        n_estimators=300,
+        n_jobs=-1,
+    ),
+)
+
 # Example target: regress graph max degree.
 fit_targets = [max(dict(graph.degree()).values(), default=0) for graph in fit_graphs]
 
@@ -64,6 +75,7 @@ generator = EdgeGenerator(
     feasibility_estimator=feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
+    edge_risk_estimator=edge_risk_estimator,
     target_estimator_mode="regression",
     decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
     n_negative_per_positive=5,
@@ -74,6 +86,7 @@ generator = EdgeGenerator(
     fallback_growth_factor=2.0,
     beam_growth_factor=1.5,
     max_beam_size=8,
+    edge_risk_lambda=0.25,
     require_single_connected_component=True,
     verbose=True,
     seed=0,
@@ -97,7 +110,9 @@ generator = EdgeGenerator(
     final_feasibility_estimator=final_feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
+    edge_risk_estimator=edge_risk_estimator,
     target_estimator_mode="regression",
+    edge_risk_lambda=0.25,
     decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
     verbose=True,
     seed=0,
@@ -332,8 +347,9 @@ At each depth, the generator:
 2. filters expanded graphs with the feasibility estimator
 3. scores feasible survivors with the graph classifier
 4. optionally adds a target-model score from `target_estimator`
-5. subtracts fallback repulsion when that mechanism is active
-4. retains a beam made of:
+5. optionally subtracts an online edge-risk penalty from `edge_risk_estimator`
+6. subtracts fallback repulsion when that mechanism is active
+7. retains a beam made of:
    - the top-scoring candidates
    - a random sample from the remaining positive candidates
 
@@ -347,14 +363,24 @@ For classification mode:
 
 ```text
 target_score = P(target_class | graph)
-selection_score = classifier_score + target_lambda * target_score - repulsion_lambda * repulsion
+selection_score = (
+    classifier_score
+    + target_lambda * target_score
+    - edge_risk_lambda * risk_score
+    - repulsion_lambda * repulsion
+)
 ```
 
 For regression mode:
 
 ```text
 target_score = 1 / (1 + abs(predicted_target - requested_target))
-selection_score = classifier_score + target_lambda * target_score - repulsion_lambda * repulsion
+selection_score = (
+    classifier_score
+    + target_lambda * target_score
+    - edge_risk_lambda * risk_score
+    - repulsion_lambda * repulsion
+)
 ```
 
 where:
@@ -362,8 +388,44 @@ where:
 - `classifier_score` is the downstream graph classifier probability for class 1
 - `target_score` is either the requested class probability or a regression closeness score
 - `target_lambda` is the user-controlled weight of the target objective
+- `risk_score` is the predicted future infeasible-descendant ratio for the
+  edge decision that produced the candidate
+- `edge_risk_lambda` is the user-controlled weight of the risk penalty
 - `repulsion` is the maximum cosine similarity to the failed-memory bank
 - `repulsion_lambda` grows with the number of fallback stages already used
+
+## Online Edge Risk Learning
+
+When `edge_risk_estimator` is provided, the generator learns online from its
+own search history.
+
+For every candidate produced by materializing one edge, the estimator input is
+a disjoint graph made from:
+
+- the parent graph before adding the edge
+- the child graph after adding the edge
+
+The target is computed only when a branch episode closes, either because the
+search solves, fails, or enters fallback and replaces the current beam:
+
+```text
+risk = infeasible_descendants / total_descendants
+```
+
+where descendants are the realized search descendants observed below that edge
+decision in the current search policy. The root decision node itself is not
+counted in the ratio.
+
+This model is updated online through an adapter with `partial_fit(...)`
+semantics:
+
+- if the wrapped estimator already supports `partial_fit`, that is used directly
+- otherwise the adapter stores all past training examples in memory and refits
+  the estimator on the full replay buffer each time it is updated
+
+This makes it possible to use `GraphEstimator(..., estimator=RandomForestRegressor(...))`
+as an edge-risk model even though `RandomForestRegressor` does not natively
+support `partial_fit`.
 
 ## Target-Conditioned Fitting
 
@@ -586,6 +648,9 @@ regions.
 - `target_estimator`
   Optional classifier or regressor trained on positive fragments when
   `fit(..., targets=...)` is used.
+- `edge_risk_estimator`
+  Optional online regressor trained from realized search descendants during
+  generation.
 - `target_estimator_mode`
   Either `"classification"` or `"regression"` for target scoring.
 - `decomposition_function`
@@ -606,6 +671,8 @@ regions.
   Exponential growth factor for beam widening after each fallback.
 - `max_beam_size`
   Optional cap on widened beam size.
+- `edge_risk_lambda`
+  Coefficient applied to the predicted edge-risk penalty in candidate ranking.
 - `require_single_connected_component`
   When true, disconnected final-feasible graphs are not accepted at
   `n_edges`; search may spend a bounded number of extra edges trying to merge

@@ -4,7 +4,11 @@ import networkx as nx
 import numpy as np
 import pytest
 
-from abstractgraph_generative.edge_generator import EdgeGenerator, remove_edges
+from abstractgraph_generative.edge_generator import (
+    EdgeGenerator,
+    _OnlineGraphRegressorAdapter,
+    remove_edges,
+)
 
 
 class _RecordingFeasibilityEstimator:
@@ -28,6 +32,33 @@ class _RecordingGraphEstimator:
         self.fit_size = len(graphs)
         self.targets = np.asarray(targets)
         return self
+
+    def _transform_raw(self, graphs):
+        return np.asarray([[graph.number_of_nodes(), graph.number_of_edges()] for graph in graphs], dtype=float)
+
+
+class _RecordingRiskEstimator:
+    def __init__(self):
+        self.fit_calls = []
+
+    def fit(self, graphs, targets):
+        self.fit_calls.append((list(graphs), list(targets)))
+        return self
+
+    def predict(self, graphs):
+        return np.asarray([0.25] * len(graphs), dtype=float)
+
+
+class _NativePartialFitRiskEstimator:
+    def __init__(self):
+        self.partial_fit_calls = []
+
+    def partial_fit(self, graphs, targets):
+        self.partial_fit_calls.append((list(graphs), list(targets)))
+        return self
+
+    def predict(self, graphs):
+        return np.asarray([0.5] * len(graphs), dtype=float)
 
 
 def test_augment_indices_with_nearest_neighbors_adds_k_per_seed_without_duplicates() -> None:
@@ -284,3 +315,111 @@ def test_class_probability_supports_estimators_exposing_classes_directly() -> No
     )
 
     assert probs.tolist() == [0.75]
+
+
+def test_online_graph_regressor_adapter_replays_full_fit_when_partial_fit_is_missing() -> None:
+    estimator = _RecordingRiskEstimator()
+    adapter = _OnlineGraphRegressorAdapter(estimator)
+
+    graphs_a = [nx.path_graph(2)]
+    graphs_b = [nx.path_graph(3)]
+    adapter.partial_fit(graphs_a, [0.2])
+    adapter.partial_fit(graphs_b, [0.8])
+
+    assert adapter.replay_targets_ == [0.2, 0.8]
+    assert len(adapter.estimator_.fit_calls) == 1
+    _, second_targets = adapter.estimator_.fit_calls[0]
+    assert second_targets == [0.2, 0.8]
+    assert adapter.predict([nx.path_graph(4)]).tolist() == [0.25]
+
+
+def test_online_graph_regressor_adapter_uses_native_partial_fit_when_available() -> None:
+    estimator = _NativePartialFitRiskEstimator()
+    adapter = _OnlineGraphRegressorAdapter(estimator)
+
+    adapter.partial_fit([nx.path_graph(2)], [0.3])
+
+    assert len(adapter.estimator_.partial_fit_calls) == 1
+    assert adapter.estimator_.partial_fit_calls[0][1] == [0.3]
+    assert adapter.predict([nx.path_graph(3)]).tolist() == [0.5]
+
+
+def test_make_edge_risk_graph_pair_is_disjoint_and_preserves_attributes() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    parent = nx.Graph()
+    parent.add_node(0, role="parent")
+    parent.add_node(1, role="parent")
+    parent.add_edge(0, 1, label="p")
+    child = nx.Graph()
+    child.add_node("a", role="child")
+    child.add_node("b", role="child")
+    child.add_edge("a", "b", label="c")
+
+    pair_graph = generator._make_edge_risk_graph_pair(parent, child)
+
+    assert pair_graph.number_of_nodes() == 4
+    assert pair_graph.number_of_edges() == 2
+    assert sorted(pair_graph.edges(data="label")) == [(0, 1, "p"), (2, 3, "c")]
+
+
+def test_close_edge_risk_training_states_uses_infeasible_descendant_ratio() -> None:
+    risk_estimator = _RecordingRiskEstimator()
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        edge_risk_estimator=risk_estimator,
+    )
+    generator._reset_edge_risk_attempt_trace()
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    decision = generator._make_state(nx.path_graph(3), parent=root, score=0.9, depth=1)
+    infeasible = generator._make_state(nx.path_graph(4), parent=decision, score=0.0, depth=2)
+    feasible = generator._make_state(nx.path_graph(3), parent=decision, score=0.8, depth=2)
+
+    generator._mark_trace_state_status(decision, "retained")
+    generator._mark_trace_state_status(infeasible, "partial_infeasible")
+    generator._mark_trace_state_status(feasible, "pruned")
+    generator._close_edge_risk_training_states(open_state_ids=set())
+
+    assert len(generator.edge_risk_model_.estimator_.fit_calls) == 1
+    fit_graphs, fit_targets = generator.edge_risk_model_.estimator_.fit_calls[0]
+    assert len(fit_graphs) == 1
+    assert fit_targets == [0.5]
+
+
+def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        feasibility_estimator=_AlwaysFeasibleEstimator(),
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        graph_estimator=object(),
+        edge_risk_estimator=_RecordingRiskEstimator(),
+        edge_risk_lambda=2.0,
+    )
+    generator._reset_edge_risk_attempt_trace()
+    generator.edge_risk_model_.is_fitted_ = True
+    generator.edge_risk_model_.predict = lambda graphs: np.asarray([0.4], dtype=float)
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.2], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=5,
+        target=7,
+        target_lambda=0.5,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert len(feasible_candidates) == 1
+    assert infeasible_candidates == []
+    assert feasible_candidates[0]["risk_score"] == pytest.approx(0.4)
+    assert feasible_candidates[0]["selection_score"] == pytest.approx(0.2)
