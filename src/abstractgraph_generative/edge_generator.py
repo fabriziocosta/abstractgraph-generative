@@ -27,6 +27,7 @@ class _OnlineGraphRegressorAdapter:
         self.estimator_ = copy.deepcopy(estimator)
         self.replay_graphs_ = []
         self.replay_targets_ = []
+        self.n_training_examples_ = 0
         self.is_fitted_ = False
         self.supports_partial_fit_ = hasattr(self.estimator_, "partial_fit")
 
@@ -38,6 +39,7 @@ class _OnlineGraphRegressorAdapter:
         if not graph_list:
             return self
 
+        self.n_training_examples_ += len(graph_list)
         if self.supports_partial_fit_:
             self.estimator_.partial_fit(graph_list, target_array)
         else:
@@ -53,6 +55,9 @@ class _OnlineGraphRegressorAdapter:
             return np.zeros(len(graphs), dtype=float)
         predictions = self.estimator_.predict(graphs)
         return np.asarray(predictions, dtype=float).reshape(-1)
+
+    def training_set_size(self) -> int:
+        return int(self.n_training_examples_)
 
 
 def mix_connected_components(
@@ -1453,9 +1458,15 @@ class EdgeGenerator:
         )
         self._draw_graphs(
             draw_graphs_fn,
-            [repair_context["graph"]] + repair_context["fit_graphs"],
-            n_graphs_per_line=min(len(repair_context["fit_graphs"]) + 1, 7),
-            titles=["query"] + [f"nn:{idx}" for idx in repair_context["neighbor_indices"]],
+            [repair_context["graph"]],
+            n_graphs_per_line=1,
+            titles=["query"],
+        )
+        self._draw_graphs(
+            draw_graphs_fn,
+            repair_context["fit_graphs"],
+            n_graphs_per_line=min(len(repair_context["fit_graphs"]), 7),
+            titles=[f"nn:{idx}" for idx in repair_context["neighbor_indices"]],
         )
 
     def _build_repair_start_states(
@@ -2351,15 +2362,23 @@ class EdgeGenerator:
         search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
         search["step_start_time"] = time.perf_counter()
         if verbose:
+            edge_risk_training_size = self._edge_risk_training_set_size()
             removed_descriptions = [
                 ",".join(str(edge) for edge in state.get("repair_removed_edges", ()))
                 for state in repaired_beam
             ]
-            print(
-                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks} "
-                f"rollback_steps={rollback_steps} surgical_repairs={len(repaired_beam)} "
-                f"to_depth={repaired_depth} beam_limit={beam_limit}"
-            )
+            fallback_parts = [
+                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks}",
+                f"rollback_steps={rollback_steps}",
+                f"surgical_repairs={len(repaired_beam)}",
+                f"to_depth={repaired_depth}",
+                f"beam_limit={beam_limit}",
+            ]
+            if edge_risk_training_size is not None:
+                fallback_parts.append(
+                    f"edge_risk_training_set_size={edge_risk_training_size}"
+                )
+            print(" ".join(fallback_parts))
             print(f"[graph {graph_index}] surgical_removed_edges={removed_descriptions}")
         if verbose and total_phases > 1:
             self._print_phase_banner(
@@ -2388,11 +2407,18 @@ class EdgeGenerator:
         search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
         search["step_start_time"] = time.perf_counter()
         if verbose:
-            print(
-                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks} "
-                f"rollback_steps={rollback_steps} to_depth={fallback_depth} "
-                f"beam_limit={beam_limit}"
-            )
+            fallback_parts = [
+                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks}",
+                f"rollback_steps={rollback_steps}",
+                f"to_depth={fallback_depth}",
+                f"beam_limit={beam_limit}",
+            ]
+            edge_risk_training_size = self._edge_risk_training_set_size()
+            if edge_risk_training_size is not None:
+                fallback_parts.append(
+                    f"edge_risk_training_set_size={edge_risk_training_size}"
+                )
+            print(" ".join(fallback_parts))
         if verbose and total_phases > 1:
             self._print_phase_banner(
                 graph_index=graph_index,
@@ -2415,6 +2441,11 @@ class EdgeGenerator:
             f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
             f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
         )
+
+    def _edge_risk_training_set_size(self) -> int | None:
+        if self.edge_risk_model_ is None or self.edge_risk_estimator is None:
+            return None
+        return self.edge_risk_model_.training_set_size()
 
     def _expand_state(self, state):
         candidates = []
@@ -2914,10 +2945,9 @@ class EdgeGenerator:
             return None
         if not isinstance(target_b, (int, float, np.integer, np.floating)):
             return None
-        mean_target = 0.5 * (float(target_a) + float(target_b))
         if self.target_estimator_mode == "regression":
-            return mean_target
-        return int(round(mean_target))
+            return 0.5 * (float(target_a) + float(target_b))
+        return self.rng.choice([target_a, target_b])
 
     def _build_fragment_datasets(self, graphs):
         dataset_seeds = [self.rng.randrange(10**9) for _ in graphs]
@@ -3284,6 +3314,21 @@ class EdgeGenerator:
             stack.extend(trace["states"][child_id]["child_state_ids"])
         return descendants
 
+    def _trace_failure_ratio_for_state(self, state_id: int) -> float:
+        trace = self.edge_risk_trace_
+        if trace is None or state_id not in trace["states"]:
+            return 0.0
+        descendant_ids = [state_id] + self._collect_trace_descendant_ids(state_id)
+        total_descendants = len(descendant_ids)
+        if total_descendants == 0:
+            return 0.0
+        infeasible_descendants = sum(
+            1
+            for descendant_id in descendant_ids
+            if trace["states"][descendant_id]["status"] in {"partial_infeasible", "final_infeasible"}
+        )
+        return infeasible_descendants / float(total_descendants)
+
     def _close_edge_risk_training_states(self, *, open_state_ids) -> None:
         trace = self.edge_risk_trace_
         if trace is None or self.edge_risk_model_ is None:
@@ -3299,19 +3344,10 @@ class EdgeGenerator:
             if parent is None:
                 trace["trained_state_ids"].add(state_id)
                 continue
-            descendant_ids = self._collect_trace_descendant_ids(state_id)
-            if not descendant_ids:
-                continue
-            total_descendants = len(descendant_ids)
-            infeasible_descendants = sum(
-                1
-                for descendant_id in descendant_ids
-                if trace["states"][descendant_id]["status"] in {"partial_infeasible", "final_infeasible"}
-            )
             training_graphs.append(
                 self._make_edge_risk_graph_pair(parent["graph"], state["graph"])
             )
-            training_targets.append(infeasible_descendants / float(total_descendants))
+            training_targets.append(self._trace_failure_ratio_for_state(state_id))
             trace["trained_state_ids"].add(state_id)
 
         if training_graphs:

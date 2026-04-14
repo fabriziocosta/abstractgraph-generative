@@ -321,7 +321,7 @@ If stored targets exist and no explicit `target=` is passed, `generate_from_pair
 infers a pair target from the endpoint targets:
 
 - regression mode: mean target
-- classification mode: rounded mean target
+- classification mode: uniformly sample one of the two endpoint targets
 
 `repair()` also reuses the stored corpus, but for a single graph query:
 
@@ -399,22 +399,26 @@ where:
 When `edge_risk_estimator` is provided, the generator learns online from its
 own search history.
 
-For every candidate produced by materializing one edge, the estimator input is
-a disjoint graph made from:
+For every closed parent-to-child transition produced by materializing one edge,
+the estimator input is a disjoint graph made from:
 
 - the parent graph before adding the edge
 - the child graph after adding the edge
 
-The target is computed only when a branch episode closes, either because the
-search solves, fails, or enters fallback and replaces the current beam:
+The target is computed when that transition closes, either because the search
+solves, fails, or enters fallback and replaces the current beam:
 
 ```text
 risk = infeasible_descendants / total_descendants
 ```
 
-where descendants are the realized search descendants observed below that edge
-decision in the current search policy. The root decision node itself is not
-counted in the ratio.
+where `total_descendants` includes the child state itself plus all realized
+search descendants observed below it in the current search policy. This means:
+
+- an immediately infeasible leaf contributes one example with target `1.0`
+- an immediately non-infeasible leaf contributes one example with target `0.0`
+- an internal transition contributes one example with a fractional target that
+  summarizes how much of its realized downstream subtree became infeasible
 
 This model is updated online through an adapter with `partial_fit(...)`
 semantics:
@@ -732,6 +736,7 @@ Fallback transitions are logged explicitly, including:
 - rollback distance
 - target depth
 - widened beam limit
+- current `edge_risk_training_set_size` when an edge-risk estimator is active
 
 ## Tradeoffs
 

@@ -286,6 +286,59 @@ def test_generate_from_cached_pair_session_reuses_cached_graphs_and_target(monke
     assert result["return_path"] is False
 
 
+def test_infer_pair_target_returns_mean_in_regression_mode() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        target_estimator_mode="regression",
+    )
+
+    assert generator._infer_pair_target(2, 6) == 4.0
+
+
+def test_infer_pair_target_samples_endpoint_target_in_classification_mode() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        target_estimator_mode="classification",
+        seed=0,
+    )
+
+    assert generator._infer_pair_target(0, 1) == 1
+    assert generator._infer_pair_target(0, 1) == 1
+
+
+def test_log_repair_training_context_draws_query_and_neighbors_on_separate_rows() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    draw_calls = []
+
+    def fake_draw(graphs, **kwargs):
+        draw_calls.append((graphs, kwargs))
+
+    repair_context = {
+        "query_index": 3,
+        "graph": nx.path_graph(3),
+        "fit_graphs": [nx.path_graph(2), nx.path_graph(4)],
+        "neighbor_indices": [1, 7],
+        "neighbor_distances": [0.1, 0.2],
+    }
+
+    generator._log_repair_training_context(
+        repair_context,
+        draw_graphs_fn=fake_draw,
+        verbose=True,
+    )
+
+    assert len(draw_calls) == 2
+    assert draw_calls[0][1] == {"n_graphs_per_line": 1, "titles": ["query"]}
+    assert len(draw_calls[0][0]) == 1
+    assert draw_calls[1][1] == {
+        "n_graphs_per_line": 2,
+        "titles": ["nn:1", "nn:7"],
+    }
+    assert len(draw_calls[1][0]) == 2
+
+
 def test_remove_edges_is_deterministic_with_seed() -> None:
     graph = nx.cycle_graph(6)
 
@@ -327,6 +380,7 @@ def test_online_graph_regressor_adapter_replays_full_fit_when_partial_fit_is_mis
     adapter.partial_fit(graphs_b, [0.8])
 
     assert adapter.replay_targets_ == [0.2, 0.8]
+    assert adapter.training_set_size() == 2
     assert len(adapter.estimator_.fit_calls) == 1
     _, second_targets = adapter.estimator_.fit_calls[0]
     assert second_targets == [0.2, 0.8]
@@ -339,9 +393,43 @@ def test_online_graph_regressor_adapter_uses_native_partial_fit_when_available()
 
     adapter.partial_fit([nx.path_graph(2)], [0.3])
 
+    assert adapter.training_set_size() == 1
     assert len(adapter.estimator_.partial_fit_calls) == 1
     assert adapter.estimator_.partial_fit_calls[0][1] == [0.3]
     assert adapter.predict([nx.path_graph(3)]).tolist() == [0.5]
+
+
+def test_rollback_search_without_repair_logs_edge_risk_training_set_size(capsys) -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        edge_risk_estimator=_RecordingRiskEstimator(),
+        edge_risk_lambda=0.25,
+        max_restarts=4,
+    )
+    generator.edge_risk_model_.n_training_examples_ = 12
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    search = {
+        "beam_history": [[root]],
+        "beam": [root],
+        "depth": 0,
+        "visited": {root["key"]},
+        "fallback_index": 1,
+        "step_start_time": 0.0,
+    }
+
+    generator._rollback_search_without_repair(
+        search,
+        rollback_steps=3,
+        beam_limit=5,
+        n_fallbacks=4,
+        total_phases=5,
+        graph_index=0,
+        verbose=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "edge_risk_training_set_size=12" in out
 
 
 def test_make_edge_risk_graph_pair_is_disjoint_and_preserves_attributes() -> None:
@@ -382,8 +470,8 @@ def test_close_edge_risk_training_states_uses_infeasible_descendant_ratio() -> N
 
     assert len(generator.edge_risk_model_.estimator_.fit_calls) == 1
     fit_graphs, fit_targets = generator.edge_risk_model_.estimator_.fit_calls[0]
-    assert len(fit_graphs) == 1
-    assert fit_targets == [0.5]
+    assert len(fit_graphs) == 3
+    assert fit_targets == [1.0 / 3.0, 1.0, 0.0]
 
 
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:
