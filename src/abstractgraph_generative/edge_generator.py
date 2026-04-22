@@ -2057,7 +2057,7 @@ class EdgeGenerator:
         remaining_edges = max(0, n_edges - current_edges)
         eta_str = self._format_minutes_seconds(remaining_edges * step_elapsed)
         line1 = (
-            f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
+            f"[graph {graph_index}] fallback={fallback_index + 2}/{total_phases} "
             f"depth={next_depth} remaining_edges={remaining_edges} "
             f"step_time={self._format_minutes_seconds(step_elapsed)} eta={eta_str}"
         )
@@ -2203,7 +2203,7 @@ class EdgeGenerator:
                 current_edges = state["graph"].number_of_edges()
                 edge_shortfall = max(0, n_edges - current_edges)
                 print(
-                    f"[graph {graph_index}] solved phase={fallback_index + 2}/{total_phases} "
+                    f"[graph {graph_index}] solved fallback={fallback_index + 2}/{total_phases} "
                     f"depth={state['depth']} max_depth={self.max_depth_} "
                     f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
                     f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
@@ -2256,7 +2256,7 @@ class EdgeGenerator:
             current_edges = best_current["graph"].number_of_edges()
             edge_shortfall = max(0, n_edges - current_edges)
             print(
-                f"[graph {graph_index}] early_stop phase={fallback_index + 2}/{total_phases} "
+                f"[graph {graph_index}] early_stop fallback={fallback_index + 2}/{total_phases} "
                 f"depth={best_current['depth']} max_depth={self.max_depth_} "
                 f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
                 f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
@@ -2497,8 +2497,8 @@ class EdgeGenerator:
         n_fallbacks: int,
     ) -> None:
         print(
-            f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-            f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
+            f"[graph {graph_index}] fallback={fallback_index + 2}/{total_phases} "
+            f"beam_limit={beam_limit}"
         )
 
     def _edge_risk_training_set_size(self) -> int | None:
