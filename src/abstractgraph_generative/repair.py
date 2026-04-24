@@ -21,7 +21,12 @@ import random
 import numpy as np
 import networkx as nx
 
-from abstractgraph.graphs import AbstractGraph, graph_to_abstract_graph, graphs_to_abstract_graphs
+from abstractgraph.graphs import (
+    AbstractGraph,
+    graph_to_abstract_graph,
+    graphs_to_abstract_graphs,
+    is_simple_graph,
+)
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_generative.rewrite import rewrite
 
@@ -227,7 +232,7 @@ class RepairGenerator:
             - If input is a list/sequence: a list of repaired graphs (one per input).
         """
         # Single-graph path
-        if isinstance(graphs, nx.Graph):
+        if is_simple_graph(graphs):
             return self._repair_one(graphs, k_neighbors=k_neighbors, n_iterations=n_iterations)
 
         # Sequence path

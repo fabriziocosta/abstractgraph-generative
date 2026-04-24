@@ -26,6 +26,27 @@ def test_conditional_component_builder_reads_mapped_subgraph() -> None:
     assert component.subgraph.number_of_nodes() == 2
 
 
+def test_conditional_component_builder_accepts_directed_mapped_subgraph() -> None:
+    graph = nx.DiGraph()
+    graph.add_node(0, label="0")
+    graph.add_node(1, label="1")
+    graph.add_node(2, label="2")
+    graph.add_edge(0, 1, label="x")
+    graph.add_edge(1, 2, label="y")
+
+    ag = AbstractGraph(graph=graph)
+    ag.create_default_interpretation_node()
+    ag.create_interpretation_node_with_subgraph_from_edges([(0, 1)])
+    ag.create_interpretation_node_with_subgraph_from_edges([(1, 2)])
+
+    generator = ConditionalAutoregressiveGenerator(decomposition_function=lambda x: x, nbits=6)
+    component = generator._build_component_instance(ag, image_node=1, comp_id=3)
+
+    assert component.comp_id == 3
+    assert component.subgraph.is_directed()
+    assert set(component.subgraph.edges()) == {(0, 1)}
+
+
 def test_conditional_generator_supports_canonical_radius_names() -> None:
     generator = ConditionalAutoregressiveGenerator(
         decomposition_function=lambda ag: ag,

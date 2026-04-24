@@ -100,7 +100,13 @@ from typing import Optional, Sequence
 
 import networkx as nx
 
-from abstractgraph.graphs import AbstractGraph, get_mapped_subgraph, graph_to_abstract_graph
+from abstractgraph.graphs import (
+    AbstractGraph,
+    get_mapped_subgraph,
+    graph_to_abstract_graph,
+    is_simple_graph,
+    make_simple_graph_like,
+)
 from abstractgraph.hashing import hash_graph
 from abstractgraph_generative.rewrite import (
     _cosine_similarity,
@@ -657,13 +663,13 @@ class ConditionalAutoregressiveGenerator:
     def _training_anchor_nodes(self, interpretation_graph: nx.Graph, image_node) -> list:
         """Collect training-time anchor nodes for one interpretation-node mapping."""
         mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[image_node])
-        if not isinstance(mapped_subgraph, nx.Graph):
+        if not is_simple_graph(mapped_subgraph):
             return []
         anchor_nodes = set()
         mapped_nodes = set(mapped_subgraph.nodes())
         for neighbor in interpretation_graph.neighbors(image_node):
             neighbor_mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
-            if not isinstance(neighbor_mapped_subgraph, nx.Graph):
+            if not is_simple_graph(neighbor_mapped_subgraph):
                 continue
             anchor_nodes.update(mapped_nodes & set(neighbor_mapped_subgraph.nodes()))
         return sorted(anchor_nodes, key=lambda node: self._base_node_order_key(mapped_subgraph, node))
@@ -812,8 +818,8 @@ class ConditionalAutoregressiveGenerator:
         interpretation_graph = ag.interpretation_graph
         base_graph = ag.base_graph
         mapped_subgraph_u = get_mapped_subgraph(interpretation_graph.nodes[image_node])
-        if not isinstance(mapped_subgraph_u, nx.Graph):
-            mapped_subgraph_u = nx.Graph()
+        if not is_simple_graph(mapped_subgraph_u):
+            mapped_subgraph_u = make_simple_graph_like(base_graph)
 
         global_nodes = sorted(list(mapped_subgraph_u.nodes()), key=lambda n: self._base_node_order_key(base_graph, n))
         global_to_local = {g: i for i, g in enumerate(global_nodes)}
@@ -822,8 +828,8 @@ class ConditionalAutoregressiveGenerator:
         ports_with_keys: list[tuple[tuple, Port]] = []
         for neighbor in interpretation_graph.neighbors(image_node):
             mapped_subgraph_v = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
-            if not isinstance(mapped_subgraph_v, nx.Graph):
-                mapped_subgraph_v = nx.Graph()
+            if not is_simple_graph(mapped_subgraph_v):
+                mapped_subgraph_v = make_simple_graph_like(base_graph)
             shared_global = [n for n in global_nodes if n in mapped_subgraph_v]
             # Build local ids and types from the same traversal to guarantee
             # one-to-one alignment between anchor_local_nodes and anchor_types.

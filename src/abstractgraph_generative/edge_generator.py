@@ -10,7 +10,7 @@ from typing import Callable
 import networkx as nx
 import numpy as np
 from joblib import Parallel, delayed
-from abstractgraph.graphs import graph_to_abstract_graph
+from abstractgraph.graphs import graph_to_abstract_graph, is_simple_graph
 from abstractgraph.hashing import hash_graph
 from sklearn.metrics import pairwise_distances
 from abstractgraph_generative.interpolate import _build_adjacency
@@ -3503,7 +3503,7 @@ class EdgeGenerator:
         return value_list
 
     def _is_single_graph_input(self, graphs):
-        return isinstance(graphs, nx.Graph)
+        return is_simple_graph(graphs)
 
     def _state_key(self, graph: nx.Graph):
         if nx.is_directed(graph):

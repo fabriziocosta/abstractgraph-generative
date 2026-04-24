@@ -31,7 +31,7 @@ from abstractgraph_generative.rewrite import (
     _cosine_similarity,
     _transform_context_graphs,
 )
-from abstractgraph.graphs import get_mapped_subgraph, graph_to_abstract_graph
+from abstractgraph.graphs import get_mapped_subgraph, graph_to_abstract_graph, is_simple_graph
 from abstractgraph.hashing import hash_graph
 
 
@@ -206,13 +206,13 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             list: Sorted anchor nodes in the original base graph.
         """
         mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[image_node])
-        if not isinstance(mapped_subgraph, nx.Graph):
+        if not is_simple_graph(mapped_subgraph):
             return []
         anchor_nodes = set()
         mapped_nodes = set(mapped_subgraph.nodes())
         for neighbor in interpretation_graph.neighbors(image_node):
             neighbor_mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
-            if not isinstance(neighbor_mapped_subgraph, nx.Graph):
+            if not is_simple_graph(neighbor_mapped_subgraph):
                 continue
             anchor_nodes.update(mapped_nodes & set(neighbor_mapped_subgraph.nodes()))
         return sorted(anchor_nodes, key=lambda node: self._preimage_node_order_key(mapped_subgraph, node))

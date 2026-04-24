@@ -55,7 +55,7 @@ from abstractgraph_generative.rewrite import (
     virtual_rewrite_candidates_at_cut_nodes,
     deduplicate_cut_index,
 )
-from abstractgraph.graphs import graph_to_abstract_graph
+from abstractgraph.graphs import graph_to_abstract_graph, is_simple_graph, make_simple_graph_like
 from abstractgraph.hashing import GraphHashDeduper, hash_graph
 from abstractgraph.vectorize import AbstractGraphTransformer
 from joblib import Parallel, delayed
@@ -292,7 +292,7 @@ def generate_pruning_sequences(
         assoc_count = defaultdict(int)
         for img_node, data in fixed_interpretation_graph.nodes(data=True):
             mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
-            nodes = set(mapped_subgraph.nodes()) if isinstance(mapped_subgraph, nx.Graph) else set()
+            nodes = set(mapped_subgraph.nodes()) if is_simple_graph(mapped_subgraph) else set()
             assoc_nodes_by_image[img_node] = nodes
             for node in nodes:
                 assoc_count[node] += 1
@@ -328,11 +328,12 @@ def generate_pruning_sequences(
                 img_step = fixed_interpretation_graph.copy()
                 for inode, data in img_step.nodes(data=True):
                     mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
-                    if not isinstance(mapped_subgraph, nx.Graph):
+                    if not is_simple_graph(mapped_subgraph):
                         continue
                     if inode in removed_images:
-                        data["mapped_subgraph"] = nx.Graph()
-                        data["association"] = nx.Graph()
+                        empty_graph = make_simple_graph_like(g)
+                        data["mapped_subgraph"] = empty_graph
+                        data["association"] = empty_graph.copy()
                     else:
                         next_subgraph = mapped_subgraph.subgraph(remaining_nodes).copy()
                         data["mapped_subgraph"] = next_subgraph
@@ -354,7 +355,9 @@ def generate_pruning_sequences(
                     if mapped_subgraph is None:
                         mapped_subgraph = fixed_interpretation_graph.nodes[img_node].get("association")
                     mapped_subgraph = (
-                        mapped_subgraph.subgraph(inner_nodes).copy() if isinstance(mapped_subgraph, nx.Graph) else nx.Graph()
+                        mapped_subgraph.subgraph(inner_nodes).copy()
+                        if is_simple_graph(mapped_subgraph)
+                        else make_simple_graph_like(g)
                     )
                     assoc_hash = hash_graph(mapped_subgraph)
                     if use_context_embedding and context_vectorizer is not None:
