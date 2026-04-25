@@ -36,16 +36,53 @@ For the semantic role of this repository, see [../README.md](../README.md).
 - Example and research notebooks bootstrap imports and normalize the working
   directory automatically for the standard ecosystem layout.
 
+## Install
+
+Standalone editable install, after `abstractgraph` and `abstractgraph-ml` are
+available from PyPI or local editable checkouts:
+
+```bash
+python -m pip install -e .
+```
+
+Inside the `abstractgraph-ecosystem` superproject, install sibling packages in
+dependency order:
+
+```bash
+python -m pip install -e repos/abstractgraph --no-deps
+python -m pip install -e repos/abstractgraph-ml --no-deps
+python -m pip install -e repos/abstractgraph-generative --no-deps
+```
+
 ## Dependencies
+
+Sibling dependencies:
 
 - `abstractgraph`
 - `abstractgraph-ml`
 
+Runtime dependencies declared in `pyproject.toml`:
+
+- `networkx`
+- `numpy`
+- `matplotlib`
+
+## Caveats
+
+- Generative workflows build on the core graph representation and ML utilities;
+  install and validate those sibling packages first when working locally.
+- Text-oriented notebooks and backend-generator notebooks have moved to sibling
+  repositories. This repository keeps the core generative workflows.
+- The `legacy/conditional_v0_1/` package is retained for compatibility and
+  historical reference; prefer current modules for new work.
+- Install with `--no-deps` only in a shared ecosystem environment where runtime
+  dependencies are already managed.
+
 ## Local Validation
 
 ```bash
-python -m pip install -e ../abstractgraph --no-deps
-python -m pip install -e ../abstractgraph-ml --no-deps
-python -m pip install -e . --no-deps
+python -m pip install -e ../abstractgraph
+python -m pip install -e ../abstractgraph-ml
+python -m pip install -e .
 python scripts/smoke_test.py
 ```
