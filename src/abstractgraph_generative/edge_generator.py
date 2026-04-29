@@ -11,7 +11,7 @@ import networkx as nx
 import numpy as np
 from joblib import Parallel, delayed
 from abstractgraph.graphs import graph_to_abstract_graph, is_simple_graph
-from abstractgraph.hashing import hash_graph
+from abstractgraph.hashing import GraphHashDeduper, hash_graph
 from sklearn.metrics import pairwise_distances
 from abstractgraph_generative.interpolate import _build_adjacency
 
@@ -544,6 +544,7 @@ class EdgeGenerator:
         seed: int | None = None,
         early_stop_if_final_feasible: bool = True,
         require_single_connected_component: bool = True,
+        enforce_repair_label_set_coverage: bool = True,
     ):
         """Configure an edge-growing graph generator.
 
@@ -621,6 +622,10 @@ class EdgeGenerator:
             Whether final-feasible graphs with more than one connected
             component should continue growing past ``n_edges`` until a single
             connected component is reached, within a bounded extra-edge window.
+        enforce_repair_label_set_coverage : bool, optional
+            Whether ``repair(...)`` should fail early when the query graph has
+            node labels that are absent from the selected repair neighborhood.
+            Extra labels in the neighborhood are tolerated.
 
         Returns
         -------
@@ -673,6 +678,7 @@ class EdgeGenerator:
         self.seed = seed
         self.early_stop_if_final_feasible = early_stop_if_final_feasible
         self.require_single_connected_component = require_single_connected_component
+        self.enforce_repair_label_set_coverage = bool(enforce_repair_label_set_coverage)
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -1152,7 +1158,9 @@ class EdgeGenerator:
             graph,
             n_neighbors=n_neighbors,
         )
-        label_set_mismatch = self._repair_label_set_mismatch(repair_context)
+        label_set_mismatch = None
+        if self.enforce_repair_label_set_coverage:
+            label_set_mismatch = self._repair_label_set_mismatch(repair_context)
         self.last_repair_label_set_mismatch_ = label_set_mismatch
         if label_set_mismatch is not None:
             if verbose:
@@ -3185,15 +3193,7 @@ class EdgeGenerator:
         return [hash_graph(graph) for graph in graphs]
 
     def _unique_graphs(self, graphs):
-        unique_graphs = []
-        seen_hashes = set()
-        for graph in graphs:
-            graph_hash = hash_graph(graph)
-            if graph_hash in seen_hashes:
-                continue
-            seen_hashes.add(graph_hash)
-            unique_graphs.append(graph)
-        return unique_graphs
+        return GraphHashDeduper(hash_func=hash_graph, parallel=False).fit_filter(graphs)
 
     def _graph_embeddings(self, graphs):
         graph_hashes = self._graph_hashes(graphs)

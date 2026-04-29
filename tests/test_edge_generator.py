@@ -37,6 +37,21 @@ class _RecordingGraphEstimator:
         return np.asarray([[graph.number_of_nodes(), graph.number_of_edges()] for graph in graphs], dtype=float)
 
 
+class _SimpleGraphTransformer:
+    def fit_transform(self, graphs, y=None):
+        return self.transform(graphs)
+
+    def transform(self, graphs, y=None):
+        return np.asarray(
+            [[graph.number_of_nodes(), graph.number_of_edges()] for graph in graphs],
+            dtype=float,
+        )
+
+
+class _GraphEstimatorWithTransformer:
+    transformer = _SimpleGraphTransformer()
+
+
 class _RecordingRiskEstimator:
     def __init__(self):
         self.fit_calls = []
@@ -68,6 +83,52 @@ def _labeled_edge_graph(node_labels: list[str]) -> nx.Graph:
     for idx in range(len(node_labels) - 1):
         graph.add_edge(idx, idx + 1, label="single")
     return graph
+
+
+def _directed_path() -> nx.DiGraph:
+    graph = nx.DiGraph()
+    graph.add_node(0, label="A")
+    graph.add_node(1, label="B")
+    graph.add_node(2, label="C")
+    graph.add_edge(0, 1, label="x")
+    graph.add_edge(1, 2, label="y")
+    return graph
+
+
+def _reversed_directed_path() -> nx.DiGraph:
+    graph = nx.DiGraph()
+    graph.add_node(0, label="A")
+    graph.add_node(1, label="B")
+    graph.add_node(2, label="C")
+    graph.add_edge(1, 0, label="x")
+    graph.add_edge(2, 1, label="y")
+    return graph
+
+
+def test_unique_graphs_uses_abstractgraph_directed_hashing() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    graph = _directed_path()
+    reversed_graph = _reversed_directed_path()
+
+    unique_graphs = generator._unique_graphs([graph, graph.copy(), reversed_graph])
+
+    assert len(unique_graphs) == 2
+    assert all(unique_graph.is_directed() for unique_graph in unique_graphs)
+    assert {tuple(sorted(unique_graph.edges())) for unique_graph in unique_graphs} == {
+        ((0, 1), (1, 2)),
+        ((1, 0), (2, 1)),
+    }
+
+
+def test_store_keeps_reversed_directed_graphs_as_distinct_retrieval_entries() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=_GraphEstimatorWithTransformer(),
+    )
+
+    generator.store([_directed_path(), _reversed_directed_path()])
+
+    assert len(generator.stored_graph_hash_to_index_) == 2
 
 
 def test_augment_indices_with_nearest_neighbors_adds_k_per_seed_without_duplicates() -> None:
@@ -319,6 +380,54 @@ def test_repair_allows_extra_neighbor_labels_when_input_labels_are_covered(monke
     assert repaired is not None
     assert sorted(repaired.nodes(data="label")) == sorted(input_graph.nodes(data="label"))
     assert sorted(repaired.edges(data="label")) == sorted(input_graph.edges(data="label"))
+    assert generator.last_repair_label_set_mismatch_ is None
+
+
+def test_repair_can_skip_label_set_coverage_check_when_configured(monkeypatch) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+        enforce_repair_label_set_coverage=False,
+    )
+    input_graph = _labeled_edge_graph(["C", "F"])
+    neighbor_graph = _labeled_edge_graph(["C", "N"])
+    repair_context = {
+        "graph": input_graph.copy(),
+        "query_index": None,
+        "neighbor_indices": [0],
+        "neighbor_distances": [0.0],
+        "fit_graphs": [neighbor_graph],
+        "fit_targets": None,
+    }
+    fit_called = {"value": False}
+
+    monkeypatch.setattr(generator, "_require_stored_dataset", lambda: None)
+    monkeypatch.setattr(
+        generator,
+        "_prepare_repair_training_context",
+        lambda graph, *, n_neighbors: repair_context,
+    )
+    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+
+    def fake_fit(*args, **kwargs):
+        fit_called["value"] = True
+
+    monkeypatch.setattr(generator, "_fit_pair_training_graphs", fake_fit)
+    monkeypatch.setattr(generator.final_feasibility_estimator, "predict", lambda graphs: np.asarray([True]))
+
+    repaired = generator.repair(
+        input_graph,
+        n_neighbors=1,
+        return_path=False,
+        verbose=True,
+    )
+
+    assert fit_called["value"] is True
+    assert repaired is not None
     assert generator.last_repair_label_set_mismatch_ is None
 
 
