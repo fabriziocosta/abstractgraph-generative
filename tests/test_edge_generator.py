@@ -27,6 +27,39 @@ class _RecordingFeasibilityEstimator:
         return np.zeros(len(graphs), dtype=int)
 
 
+class _RejectEdgesFeasibilityEstimator(_RecordingFeasibilityEstimator):
+    def __init__(self, rejected_edges):
+        super().__init__("reject_edges")
+        self.rejected_edges = {tuple(edge) for edge in rejected_edges}
+
+    def predict(self, graphs):
+        return np.asarray(
+            [
+                not any(graph.has_edge(*edge) for edge in self.rejected_edges)
+                for graph in graphs
+            ],
+            dtype=bool,
+        )
+
+    def violating_edge_sets(self, graphs):
+        return [
+            [
+                frozenset(
+                    edge for edge in self.rejected_edges if graph.has_edge(*edge)
+                )
+            ]
+            for graph in graphs
+        ]
+
+
+class _RejectNonEmptyFeasibilityEstimator(_RecordingFeasibilityEstimator):
+    def __init__(self):
+        super().__init__("reject_non_empty")
+
+    def predict(self, graphs):
+        return np.asarray([graph.number_of_edges() == 0 for graph in graphs], dtype=bool)
+
+
 class _RecordingGraphEstimator:
     def fit(self, graphs, targets):
         self.fit_size = len(graphs)
@@ -105,7 +138,7 @@ def _reversed_directed_path() -> nx.DiGraph:
     return graph
 
 
-def test_unique_graphs_uses_abstractgraph_directed_hashing() -> None:
+def test_unique_graphs_keeps_directed_edge_orientation_distinct() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
     graph = _directed_path()
     reversed_graph = _reversed_directed_path()
@@ -118,6 +151,30 @@ def test_unique_graphs_uses_abstractgraph_directed_hashing() -> None:
         ((0, 1), (1, 2)),
         ((1, 0), (2, 1)),
     }
+
+
+def test_unique_graphs_keeps_node_labels_distinct() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    graph = _labeled_edge_graph(["C", "O"])
+    relabeled_graph = _labeled_edge_graph(["C", "N"])
+
+    unique_graphs = generator._unique_graphs([graph, graph.copy(), relabeled_graph])
+
+    assert len(unique_graphs) == 2
+    assert [tuple(label for _, label in unique_graph.nodes(data="label")) for unique_graph in unique_graphs] == [
+        ("C", "O"),
+        ("C", "N"),
+    ]
+
+
+def test_unique_graphs_is_node_id_permutation_invariant() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    graph = _directed_path()
+    relabeled_graph = nx.relabel_nodes(graph, {0: "z", 1: "x", 2: "y"}, copy=True)
+
+    unique_graphs = generator._unique_graphs([graph, relabeled_graph])
+
+    assert len(unique_graphs) == 1
 
 
 def test_store_keeps_reversed_directed_graphs_as_distinct_retrieval_entries() -> None:
@@ -248,6 +305,88 @@ def test_make_repaired_state_removes_selected_edges_and_updates_depth() -> None:
     assert repaired_state["parent"] is state
 
 
+def test_repair_state_until_partial_feasible_removes_partial_violations() -> None:
+    partial_estimator = _RejectEdgesFeasibilityEstimator([(1, 2)])
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=object(),
+    )
+    graph = nx.path_graph(4)
+    state = generator._make_state(
+        graph,
+        parent=None,
+        score=1.0,
+        depth=3,
+        edge_order=((0, 1), (1, 2), (2, 3)),
+    )
+    state["repair_removed_edges"] = ((0, 1),)
+
+    repaired_state = generator._repair_state_until_partial_feasible(state)
+
+    assert repaired_state is not None
+    assert bool(partial_estimator.predict([repaired_state["graph"]])[0])
+    assert not repaired_state["graph"].has_edge(1, 2)
+    assert repaired_state["repair_removed_edges"] == ((0, 1), (1, 2))
+
+
+def test_repair_state_until_partial_feasible_falls_back_to_edge_order() -> None:
+    partial_estimator = _RejectNonEmptyFeasibilityEstimator()
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=object(),
+    )
+    graph = nx.path_graph(3)
+    state = generator._make_state(
+        graph,
+        parent=None,
+        score=1.0,
+        depth=2,
+        edge_order=((0, 1), (1, 2)),
+    )
+
+    repaired_state = generator._repair_state_until_partial_feasible(state)
+
+    assert repaired_state is not None
+    assert repaired_state["graph"].number_of_edges() == 0
+    assert repaired_state["repair_removed_edges"] == ((1, 2), (0, 1))
+
+
+def test_build_repair_start_states_removes_one_random_edge_when_final_violations_have_no_edges(monkeypatch) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=object(),
+        max_restarts=2,
+        fallback_base_steps=1,
+        seed=0,
+    )
+    graph = nx.path_graph(3)
+
+    monkeypatch.setattr(generator, "_positive_scores", lambda graphs: np.asarray([0.5] * len(graphs)))
+    monkeypatch.setattr(generator, "_target_scores", lambda graphs, *, target: np.zeros(len(graphs)))
+    monkeypatch.setattr(
+        generator,
+        "_annotate_infeasible_candidates_with_violating_edge_sets",
+        lambda candidates: [candidate.update({"violating_edge_sets": []}) for candidate in candidates],
+    )
+
+    repaired_states = generator._build_repair_start_states(
+        graph,
+        target=None,
+        target_lambda=0.5,
+    )
+
+    assert repaired_states
+    assert all(state["graph"].number_of_edges() == graph.number_of_edges() - 1 for state in repaired_states)
+    assert all(len(state["repair_removed_edges"]) == 1 for state in repaired_states)
+
+
 def test_select_edges_for_surgical_repair_requires_violation_evidence() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
     graph = nx.path_graph(4)
@@ -288,6 +427,32 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
     assert partial_estimator.fit_sizes == [2]
     assert final_estimator.fit_sizes == [1]
     assert graph_estimator.fit_size > 0
+
+
+def test_fit_can_skip_feasibility_graph_deduplication(monkeypatch) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+    graph = nx.path_graph(3)
+
+    def fail_unique_graphs(graphs):
+        raise AssertionError("_unique_graphs should not be called")
+
+    monkeypatch.setattr(generator, "_unique_graphs", fail_unique_graphs)
+    generator.fit(
+        [graph, graph.copy()],
+        deduplicate_feasibility_graphs=False,
+    )
+
+    assert final_estimator.fit_sizes == [2]
+    assert partial_estimator.fit_sizes[0] > final_estimator.fit_sizes[0]
 
 
 def test_repair_returns_none_when_neighbor_labels_do_not_match_input(monkeypatch, capsys) -> None:

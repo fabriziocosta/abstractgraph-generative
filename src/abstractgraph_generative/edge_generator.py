@@ -10,8 +10,9 @@ from typing import Callable
 import networkx as nx
 import numpy as np
 from joblib import Parallel, delayed
+from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
 from abstractgraph.graphs import graph_to_abstract_graph, is_simple_graph
-from abstractgraph.hashing import GraphHashDeduper, hash_graph
+from abstractgraph.hashing import canonical_bytes, hash_graph
 from sklearn.metrics import pairwise_distances
 from abstractgraph_generative.interpolate import _build_adjacency
 
@@ -743,7 +744,7 @@ class EdgeGenerator:
             resolved_final = copy.deepcopy(resolved_final)
         return resolved_partial, resolved_final
 
-    def fit(self, graphs, targets=None):
+    def fit(self, graphs, targets=None, *, deduplicate_feasibility_graphs: bool = True):
         """Fit the generator from one or more training graphs.
 
         Parameters
@@ -754,6 +755,11 @@ class EdgeGenerator:
         targets : object | iterable[object], optional
             Optional per-graph targets used to fit the target estimator on graph
             fragments.
+        deduplicate_feasibility_graphs : bool, optional
+            Whether to deduplicate graphs before fitting partial/final
+            feasibility estimators. Repair-local fits can disable this because
+            their graph selection is already ID-based and only one neighbor
+            expansion is used.
 
         Returns
         -------
@@ -765,11 +771,14 @@ class EdgeGenerator:
         dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
         self._store_graph_estimator_training_data(dataset_parts)
 
-        partial_fit_graphs = self._unique_graphs(
+        partial_fit_graphs = (
             list(self.seed_graphs_)
             + [graph for graph in self.positives_ if graph.number_of_edges() > 0]
         )
-        final_fit_graphs = self._unique_graphs(list(self.seed_graphs_))
+        final_fit_graphs = list(self.seed_graphs_)
+        if deduplicate_feasibility_graphs:
+            partial_fit_graphs = self._unique_graphs(partial_fit_graphs)
+            final_fit_graphs = self._unique_graphs(final_fit_graphs)
         partial_feasibility_fit_start = time.perf_counter()
         self.partial_feasibility_estimator.fit(partial_fit_graphs)
         partial_feasibility_fit_time = time.perf_counter() - partial_feasibility_fit_start
@@ -1185,6 +1194,7 @@ class EdgeGenerator:
         self._fit_pair_training_graphs(
             repair_context["fit_graphs"],
             repair_context["fit_targets"],
+            deduplicate_feasibility_graphs=False,
         )
 
         start_graph = graph.copy()
@@ -1557,18 +1567,78 @@ class EdgeGenerator:
                 rollback_steps=rollback_steps,
             )
             if not removed_edges:
+                removed_edges = self._random_repair_removed_edge(start_state)
+                repair_score = 0.0
+            if not removed_edges:
                 continue
             repaired_state = self._make_repaired_state(
                 start_state,
                 removed_edges,
                 score=repair_score,
             )
+            repaired_state = self._repair_state_until_partial_feasible(repaired_state)
+            if repaired_state is None:
+                continue
             repaired_hash = repaired_state["graph_hash"]
             if repaired_hash in seen_hashes:
                 continue
             seen_hashes.add(repaired_hash)
             repaired_states.append(repaired_state)
         return repaired_states
+
+    def _repair_state_until_partial_feasible(self, state):
+        current_state = state
+        removed_edges = list(current_state.get("repair_removed_edges", ()))
+        while not bool(self.partial_feasibility_estimator.predict([current_state["graph"]])[0]):
+            if current_state["graph"].number_of_edges() == 0:
+                return current_state
+            candidate = {
+                "graph": current_state["graph"],
+                "score": float(current_state.get("score") or 0.0),
+                "selection_score": float(current_state.get("selection_score") or 0.0),
+                "feasibility_stage": "partial",
+            }
+            self._annotate_infeasible_candidates_with_violating_edge_sets([candidate])
+            next_removed_edges, repair_score = self._select_edges_for_surgical_repair(
+                current_state,
+                [candidate],
+                rollback_steps=1,
+            )
+            if not next_removed_edges:
+                next_removed_edges = self._fallback_repair_removed_edges(
+                    current_state,
+                    rollback_steps=1,
+                )
+                repair_score = 0.0
+            if not next_removed_edges:
+                return None
+            score = float(current_state.get("selection_score") or 0.0) + float(repair_score)
+            current_state = self._make_repaired_state(
+                current_state,
+                next_removed_edges,
+                score=score,
+            )
+            removed_edges.extend(next_removed_edges)
+            current_state["repair_removed_edges"] = tuple(removed_edges)
+        return current_state
+
+    def _fallback_repair_removed_edges(self, state, *, rollback_steps: int = 1):
+        n_remove = max(0, min(int(rollback_steps), state["graph"].number_of_edges()))
+        if n_remove < 1:
+            return []
+        edge_order = tuple(state.get("edge_order", ()))
+        if edge_order:
+            return list(edge_order[-n_remove:])
+        graph_edges = self._canonical_graph_edges(state["graph"])
+        if graph_edges:
+            return list(graph_edges[-n_remove:])
+        return []
+
+    def _random_repair_removed_edge(self, state):
+        graph_edges = list(self._canonical_graph_edges(state["graph"]))
+        if not graph_edges:
+            return []
+        return [self.rng.choice(graph_edges)]
 
     def _select_pair_targets(self, query, selected_indices):
         if query["targets"] is None:
@@ -1639,12 +1709,25 @@ class EdgeGenerator:
             titles.append(label)
         return titles
 
-    def _fit_pair_training_graphs(self, fit_graphs, fit_targets) -> None:
+    def _fit_pair_training_graphs(
+        self,
+        fit_graphs,
+        fit_targets,
+        *,
+        deduplicate_feasibility_graphs: bool = True,
+    ) -> None:
         if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
-            self.fit(fit_graphs, targets=fit_targets)
+            self.fit(
+                fit_graphs,
+                targets=fit_targets,
+                deduplicate_feasibility_graphs=deduplicate_feasibility_graphs,
+            )
             return
 
-        self.fit(fit_graphs)
+        self.fit(
+            fit_graphs,
+            deduplicate_feasibility_graphs=deduplicate_feasibility_graphs,
+        )
         if self.target_estimator is None or fit_targets is None:
             return
         labeled_pairs = [
@@ -3193,7 +3276,41 @@ class EdgeGenerator:
         return [hash_graph(graph) for graph in graphs]
 
     def _unique_graphs(self, graphs):
-        return GraphHashDeduper(hash_func=hash_graph, parallel=False).fit_filter(graphs)
+        unique_graphs = []
+        seen_keys = set()
+        for graph in graphs:
+            graph_key = self._wl_graph_key(graph)
+            if graph_key in seen_keys:
+                continue
+            seen_keys.add(graph_key)
+            unique_graphs.append(graph)
+        return unique_graphs
+
+    def _wl_graph_key(self, graph: nx.Graph):
+        node_attr = "_abstractgraph_wl_node_label"
+        edge_attr = "_abstractgraph_wl_edge_label"
+        wl_graph = graph.__class__()
+        for node, attrs in graph.nodes(data=True):
+            wl_graph.add_node(
+                node,
+                **{node_attr: canonical_bytes(dict(attrs)).decode("utf-8")},
+            )
+        for u, v, attrs in graph.edges(data=True):
+            wl_graph.add_edge(
+                u,
+                v,
+                **{edge_attr: canonical_bytes(dict(attrs)).decode("utf-8")},
+            )
+        return (
+            "directed" if nx.is_directed(graph) else "undirected",
+            graph.number_of_nodes(),
+            graph.number_of_edges(),
+            weisfeiler_lehman_graph_hash(
+                wl_graph,
+                node_attr=node_attr,
+                edge_attr=edge_attr,
+            ),
+        )
 
     def _graph_embeddings(self, graphs):
         graph_hashes = self._graph_hashes(graphs)

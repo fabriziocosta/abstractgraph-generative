@@ -15,6 +15,7 @@ from pathlib import Path
 
 REPO_NAME = "abstractgraph-generative"
 SIBLING_REPOS = ("abstractgraph", "abstractgraph-ml", "abstractgraph-generative", "abstractgraph-graphicalizer")
+EXTERNAL_SIBLING_REPOS = ("NSPPK",)
 
 
 def _is_repo_root(path: Path) -> bool:
@@ -56,9 +57,19 @@ def bootstrap(start: Path | None = None) -> dict[str, Path]:
     repo_root = find_repo_root(start)
     workspace_root = find_workspace_root(repo_root)
 
+    external_search_roots = (
+        workspace_root,
+        workspace_root.parent,
+        workspace_root.parent.parent,
+    )
     candidate_src_dirs = [
         repo_root / "src",
         *(workspace_root / sibling / "src" for sibling in SIBLING_REPOS),
+        *(
+            external_root / sibling / "src"
+            for external_root in external_search_roots
+            for sibling in EXTERNAL_SIBLING_REPOS
+        ),
     ]
     for src_dir in candidate_src_dirs:
         if src_dir.exists():
