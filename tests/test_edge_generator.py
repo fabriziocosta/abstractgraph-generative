@@ -479,7 +479,7 @@ def test_fit_adds_extra_graphs_only_to_partial_feasibility_estimator() -> None:
     assert all(fit_graph.number_of_edges() > 0 for fit_graph in final_estimator.fit_graphs[0])
 
 
-def test_repair_partial_feasibility_bootstrap_graphs_use_query_nodes_and_neighbor_edge_attrs() -> None:
+def test_repair_partial_feasibility_bootstrap_graphs_use_only_query_node_state() -> None:
     generator = EdgeGenerator(
         partial_feasibility_estimator=_RecordingFeasibilityEstimator("partial"),
         final_feasibility_estimator=_RecordingFeasibilityEstimator("final"),
@@ -499,19 +499,10 @@ def test_repair_partial_feasibility_bootstrap_graphs_use_query_nodes_and_neighbo
         [neighbor],
     )
 
-    assert len(bootstrap_graphs) == 3
+    assert len(bootstrap_graphs) == 1
     assert bootstrap_graphs[0].number_of_edges() == 0
-    assert all(set(graph.nodes()) == {"a", "b"} for graph in bootstrap_graphs)
-    one_edge_graphs = [graph for graph in bootstrap_graphs if graph.number_of_edges() == 1]
-    assert {(u, v) for graph in one_edge_graphs for u, v in graph.edges()} == {
-        ("a", "b"),
-        ("b", "a"),
-    }
-    assert all(
-        attrs["label"] == "jump"
-        for graph in one_edge_graphs
-        for _, _, attrs in graph.edges(data=True)
-    )
+    assert set(bootstrap_graphs[0].nodes()) == {"a", "b"}
+    assert dict(bootstrap_graphs[0].nodes(data="label")) == {"a": "A", "b": "B"}
 
 
 def test_repair_returns_none_when_neighbor_labels_do_not_match_input(monkeypatch, capsys) -> None:

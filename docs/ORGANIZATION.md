@@ -17,7 +17,6 @@ For the semantic role of this repository, see [../README.md](../README.md).
 - `src/abstractgraph_generative/interpolation.py`
 - `src/abstractgraph_generative/optimize.py`
 - `src/abstractgraph_generative/repair.py`
-- `src/abstractgraph_generative/legacy/conditional_v0_1/`
 
 ## Documentation
 
@@ -73,8 +72,6 @@ Runtime dependencies declared in `pyproject.toml`:
   install and validate those sibling packages first when working locally.
 - Text-oriented notebooks and backend-generator notebooks have moved to sibling
   repositories. This repository keeps the core generative workflows.
-- The `legacy/conditional_v0_1/` package is retained for compatibility and
-  historical reference; prefer current modules for new work.
 - Install with `--no-deps` only in a shared ecosystem environment where runtime
   dependencies are already managed.
 

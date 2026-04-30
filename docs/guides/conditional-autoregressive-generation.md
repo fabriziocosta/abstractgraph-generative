@@ -786,9 +786,3 @@ from abstractgraph_generative.conditional_batch import (
     ConditionalAutoregressiveGraphsGenerator,
 )
 ```
-
-Legacy helper utilities from the older implementation remain in:
-
-```python
-from abstractgraph_generative.legacy.conditional_v0_1 import ...
-```

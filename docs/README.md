@@ -55,8 +55,6 @@ This repo owns the graph-only generation layer built on top of
 - `repair(...)`
   Fit on the nearest stored neighbors of one query graph, then regrow from a
   surgically repaired infeasible start back to the original edge count.
-- `abstractgraph_generative.legacy.conditional_v0_1`
-  Preserved legacy conditional pipeline.
 
 ## Conventions
 
@@ -69,6 +67,4 @@ This repo owns the graph-only generation layer built on top of
 
 - Active code is migrating to `base_graph`, `interpretation_graph`, and
   `mapped_subgraph`.
-- `abstractgraph_generative.legacy.*` intentionally preserves older
-  terminology for backward compatibility.
 - For repo-level dependency context, see [../ECOSYSTEM.md](../ECOSYSTEM.md).

@@ -114,6 +114,3 @@ samples = gen.generate(n_samples=5)
 - Cut signatures may optionally include edge labels.
 - Candidate enumeration can grow quickly if replacement branching is not
   bounded.
-- The legacy conditional pipeline remains available under
-  `abstractgraph_generative.legacy.conditional_v0_1` when older workflows need
-  to be preserved.

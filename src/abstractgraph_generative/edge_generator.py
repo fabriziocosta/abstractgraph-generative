@@ -1304,15 +1304,7 @@ class EdgeGenerator:
         return node_only_graph
 
     def _repair_partial_feasibility_bootstrap_graphs(self, graph, fit_graphs):
-        node_only_graph = self._node_only_graph_copy(graph)
-        bootstrap_graphs = [node_only_graph]
-        edge_attribute_templates = self._collect_edge_attribute_templates(fit_graphs)
-        for edge in self._missing_edges(node_only_graph):
-            for edge_attrs in edge_attribute_templates:
-                candidate_graph = node_only_graph.copy()
-                candidate_graph.add_edge(*edge, **dict(edge_attrs))
-                bootstrap_graphs.append(candidate_graph)
-        return bootstrap_graphs
+        return [self._node_only_graph_copy(graph)]
 
     def _cache_pair_session(
         self,

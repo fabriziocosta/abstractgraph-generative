@@ -24,8 +24,3 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-abstractgraph_generative = [
-  "legacy/conditional_v0_1/README.md",
-]
