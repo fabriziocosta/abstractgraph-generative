@@ -744,7 +744,14 @@ class EdgeGenerator:
             resolved_final = copy.deepcopy(resolved_final)
         return resolved_partial, resolved_final
 
-    def fit(self, graphs, targets=None, *, deduplicate_feasibility_graphs: bool = True):
+    def fit(
+        self,
+        graphs,
+        targets=None,
+        *,
+        deduplicate_feasibility_graphs: bool = True,
+        partial_feasibility_extra_graphs=None,
+    ):
         """Fit the generator from one or more training graphs.
 
         Parameters
@@ -760,6 +767,11 @@ class EdgeGenerator:
             feasibility estimators. Repair-local fits can disable this because
             their graph selection is already ID-based and only one neighbor
             expansion is used.
+        partial_feasibility_extra_graphs : iterable[nx.Graph], optional
+            Extra graphs used only to fit the partial feasibility estimator.
+            This is useful during repair to make node-only bootstrap states
+            admissible without teaching the final feasibility estimator to
+            accept the repaired query graph.
 
         Returns
         -------
@@ -779,6 +791,10 @@ class EdgeGenerator:
         if deduplicate_feasibility_graphs:
             partial_fit_graphs = self._unique_graphs(partial_fit_graphs)
             final_fit_graphs = self._unique_graphs(final_fit_graphs)
+        if partial_feasibility_extra_graphs is not None:
+            partial_fit_graphs.extend(
+                graph.copy() for graph in partial_feasibility_extra_graphs
+            )
         partial_feasibility_fit_start = time.perf_counter()
         self.partial_feasibility_estimator.fit(partial_fit_graphs)
         partial_feasibility_fit_time = time.perf_counter() - partial_feasibility_fit_start
@@ -1191,10 +1207,17 @@ class EdgeGenerator:
             draw_graphs_fn=draw_graphs_fn,
             verbose=verbose,
         )
+        partial_feasibility_extra_graphs = (
+            self._repair_partial_feasibility_bootstrap_graphs(
+                repair_context["graph"],
+                repair_context["fit_graphs"],
+            )
+        )
         self._fit_pair_training_graphs(
             repair_context["fit_graphs"],
             repair_context["fit_targets"],
             deduplicate_feasibility_graphs=False,
+            partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
         )
 
         start_graph = graph.copy()
@@ -1272,6 +1295,24 @@ class EdgeGenerator:
             "missing_from_neighbors": missing_from_neighbors,
             "extra_in_neighbors": extra_in_neighbors,
         }
+
+    def _node_only_graph_copy(self, graph):
+        node_only_graph = graph.__class__()
+        node_only_graph.graph.update(graph.graph)
+        for node, attrs in graph.nodes(data=True):
+            node_only_graph.add_node(node, **dict(attrs))
+        return node_only_graph
+
+    def _repair_partial_feasibility_bootstrap_graphs(self, graph, fit_graphs):
+        node_only_graph = self._node_only_graph_copy(graph)
+        bootstrap_graphs = [node_only_graph]
+        edge_attribute_templates = self._collect_edge_attribute_templates(fit_graphs)
+        for edge in self._missing_edges(node_only_graph):
+            for edge_attrs in edge_attribute_templates:
+                candidate_graph = node_only_graph.copy()
+                candidate_graph.add_edge(*edge, **dict(edge_attrs))
+                bootstrap_graphs.append(candidate_graph)
+        return bootstrap_graphs
 
     def _cache_pair_session(
         self,
@@ -1715,18 +1756,21 @@ class EdgeGenerator:
         fit_targets,
         *,
         deduplicate_feasibility_graphs: bool = True,
+        partial_feasibility_extra_graphs=None,
     ) -> None:
         if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
             self.fit(
                 fit_graphs,
                 targets=fit_targets,
                 deduplicate_feasibility_graphs=deduplicate_feasibility_graphs,
+                partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
             )
             return
 
         self.fit(
             fit_graphs,
             deduplicate_feasibility_graphs=deduplicate_feasibility_graphs,
+            partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
         )
         if self.target_estimator is None or fit_targets is None:
             return

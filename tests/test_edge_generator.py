@@ -15,9 +15,11 @@ class _RecordingFeasibilityEstimator:
     def __init__(self, label: str):
         self.label = label
         self.fit_sizes = []
+        self.fit_graphs = []
 
     def fit(self, graphs):
         self.fit_sizes.append(len(graphs))
+        self.fit_graphs.append([graph.copy() for graph in graphs])
         return self
 
     def predict(self, graphs):
@@ -453,6 +455,63 @@ def test_fit_can_skip_feasibility_graph_deduplication(monkeypatch) -> None:
 
     assert final_estimator.fit_sizes == [2]
     assert partial_estimator.fit_sizes[0] > final_estimator.fit_sizes[0]
+
+
+def test_fit_adds_extra_graphs_only_to_partial_feasibility_estimator() -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+    graph = nx.path_graph(3)
+    extra_graph = nx.empty_graph(3)
+
+    generator.fit([graph], partial_feasibility_extra_graphs=[extra_graph])
+
+    assert partial_estimator.fit_sizes == [3]
+    assert final_estimator.fit_sizes == [1]
+    assert any(fit_graph.number_of_edges() == 0 for fit_graph in partial_estimator.fit_graphs[0])
+    assert all(fit_graph.number_of_edges() > 0 for fit_graph in final_estimator.fit_graphs[0])
+
+
+def test_repair_partial_feasibility_bootstrap_graphs_use_query_nodes_and_neighbor_edge_attrs() -> None:
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_RecordingFeasibilityEstimator("partial"),
+        final_feasibility_estimator=_RecordingFeasibilityEstimator("final"),
+        graph_estimator=_RecordingGraphEstimator(),
+        allow_self_loops=False,
+    )
+    query = nx.DiGraph()
+    query.add_node("a", label="A")
+    query.add_node("b", label="B")
+    neighbor = nx.DiGraph()
+    neighbor.add_node(0, label="A")
+    neighbor.add_node(1, label="B")
+    neighbor.add_edge(0, 1, label="jump")
+
+    bootstrap_graphs = generator._repair_partial_feasibility_bootstrap_graphs(
+        query,
+        [neighbor],
+    )
+
+    assert len(bootstrap_graphs) == 3
+    assert bootstrap_graphs[0].number_of_edges() == 0
+    assert all(set(graph.nodes()) == {"a", "b"} for graph in bootstrap_graphs)
+    one_edge_graphs = [graph for graph in bootstrap_graphs if graph.number_of_edges() == 1]
+    assert {(u, v) for graph in one_edge_graphs for u, v in graph.edges()} == {
+        ("a", "b"),
+        ("b", "a"),
+    }
+    assert all(
+        attrs["label"] == "jump"
+        for graph in one_edge_graphs
+        for _, _, attrs in graph.edges(data=True)
+    )
 
 
 def test_repair_returns_none_when_neighbor_labels_do_not_match_input(monkeypatch, capsys) -> None:
