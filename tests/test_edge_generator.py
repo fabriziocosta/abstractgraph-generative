@@ -1030,6 +1030,83 @@ def test_completion_budget_prunes_candidates_that_cannot_be_connected() -> None:
     assert cand["completion_slack"] == -1
 
 
+def test_completion_budget_uses_hitting_set_over_final_node_violations() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    class _NodeViolationEstimator(_AlwaysFeasibleEstimator):
+        def __init__(self, node_sets):
+            self.node_sets = node_sets
+
+        def violating_node_labels_sets(self, graphs):
+            return [self.node_sets for _ in graphs]
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_NodeViolationEstimator(
+            [
+                frozenset({0, 1}),
+                frozenset({1, 2}),
+                frozenset({1, 3}),
+            ]
+        ),
+        graph_estimator=object(),
+        require_single_connected_component=False,
+    )
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(4))
+
+    assert generator._minimum_edges_needed_for_completion(
+        graph,
+        generator.final_feasibility_estimator.violating_node_labels_sets([graph])[0],
+        max_total_edges=1,
+    ) == 1
+
+
+def test_completion_budget_prunes_disjoint_final_node_violations() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    class _NodeViolationEstimator(_AlwaysFeasibleEstimator):
+        def violating_node_labels_sets(self, graphs):
+            return [[frozenset({0}), frozenset({1}), frozenset({2})] for _ in graphs]
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_NodeViolationEstimator(),
+        graph_estimator=object(),
+        require_single_connected_component=False,
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(3))
+    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(graph, parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=3,
+        max_total_edges=2,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == []
+    assert infeasible_candidates == [cand]
+    assert cand["feasibility_stage"] == "completion"
+    assert cand["node_violation_completion_edges"] == 3
+    assert cand["completion_slack"] == -1
+
+
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:
     class _AlwaysFeasibleEstimator:
         def predict(self, graphs):

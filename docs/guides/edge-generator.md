@@ -254,19 +254,37 @@ single connected component. If search reaches `n_edges` with a disconnected
 final-feasible graph, it can continue for a bounded number of extra edges to
 try to connect the remaining components.
 
-The search also applies a generic completion-budget check. For any candidate,
-the generator computes the minimum number of additional edges needed to merge
-its current connected components:
+The search also applies generic completion-budget checks. For any candidate,
+the generator computes lower bounds on the number of additional edges needed to
+still reach a final-feasible solution.
+
+The first bound is connectivity:
 
 ```text
 minimum_connecting_edges = connected_components - 1
-completion_slack = remaining_allowed_edges - minimum_connecting_edges
+```
+
+The second bound uses final-estimator node diagnostics when the estimator
+exposes `violating_node_labels_sets(...)`. Each violating mapped-subgraph node
+set is treated as an obligation that must be affected by some future edge. To
+avoid over-counting overlapping neighborhoods and paths, the generator computes
+the minimum hitting-set size over those node sets:
+
+```text
+minimum_node_repair_edges = min |H| such that every violating node set intersects H
+```
+
+The completion lower bound is the maximum of the available bounds:
+
+```text
+completion_edges_needed = max(minimum_connecting_edges, minimum_node_repair_edges)
+completion_slack = remaining_allowed_edges - completion_edges_needed
 ```
 
 Candidates with negative `completion_slack` are marked
 `completion_infeasible` and are not retained in the beam. This catches failures
-where no existing edge is individually wrong, but too many components remain to
-finish the graph inside the remaining edge budget.
+where no existing edge is individually wrong, but too many components or
+node-local final violations remain to finish the graph inside the edge budget.
 
 ## Stored Retrieval Corpus
 
@@ -452,10 +470,12 @@ search descendants observed below it in the current search policy. This means:
 
 Failures include partial-feasibility rejections, final-feasibility rejections,
 completion-budget failures, and blocked states where the beam cannot produce a
-solution. The last two cases are important when the problem is missing future
-edges rather than an explicitly invalid existing edge: there may be no
-`violating_edge_sets(...)` evidence for surgical removal, but the transition can
-still train edge risk because its descendants ended in a dead end.
+solution. Completion-budget failures can come from weak connectivity or from the
+minimum hitting-set bound over final-estimator node violation sets. These cases
+are important when the problem is missing future edges rather than an explicitly
+invalid existing edge: there may be no `violating_edge_sets(...)` evidence for
+surgical removal, but the transition can still train edge risk because its
+descendants ended in a dead end.
 
 This model is updated online through an adapter with `partial_fit(...)`
 semantics:
@@ -728,7 +748,8 @@ regions.
   When true, disconnected final-feasible graphs are not accepted at
   `n_edges`; search may spend a bounded number of extra edges trying to merge
   the remaining connected components. Candidates whose remaining edge budget
-  cannot merge their current components are pruned as completion-infeasible.
+  cannot merge their current components or cover final-estimator node violation
+  sets are pruned as completion-infeasible.
 - `use_similarity_repulsion`
   Whether to activate cosine-similarity repulsion after fallback begins.
 - `repulsion_weight`

@@ -1961,12 +1961,77 @@ class EdgeGenerator:
             return 0
         return max(0, self._graph_component_count(graph) - 1)
 
-    def _completion_slack(self, graph: nx.Graph, *, max_total_edges: int) -> int:
-        remaining_edge_budget = int(max_total_edges) - graph.number_of_edges()
-        return remaining_edge_budget - self._minimum_edges_needed_for_connectivity(graph)
+    def _node_violation_sets(self, graphs) -> list[list[frozenset]]:
+        estimator = self.final_feasibility_estimator
+        if not hasattr(estimator, "violating_node_labels_sets"):
+            return [[] for _ in graphs]
+        return estimator.violating_node_labels_sets(graphs)
 
-    def _is_completion_possible(self, graph: nx.Graph, *, max_total_edges: int) -> bool:
-        return self._completion_slack(graph, max_total_edges=max_total_edges) >= 0
+    def _minimum_node_violation_hitting_set_size(
+        self,
+        node_sets,
+        *,
+        max_size: int | None = None,
+    ) -> int:
+        node_sets = [frozenset(node_set) for node_set in node_sets if node_set]
+        if not node_sets:
+            return 0
+        node_sets.sort(key=len)
+        candidate_nodes = sorted(set().union(*node_sets), key=repr)
+        max_exact_size = len(candidate_nodes) if max_size is None else min(int(max_size), len(candidate_nodes))
+        for size in range(1, max_exact_size + 1):
+            for candidate in combinations(candidate_nodes, size):
+                candidate_set = set(candidate)
+                if all(candidate_set.intersection(node_set) for node_set in node_sets):
+                    return size
+        if max_size is not None and max_exact_size < len(candidate_nodes):
+            return int(max_size) + 1
+        return len(candidate_nodes)
+
+    def _minimum_edges_needed_for_node_violations(
+        self,
+        graph: nx.Graph,
+        node_sets,
+        *,
+        max_total_edges: int,
+    ) -> int:
+        remaining_edge_budget = max(0, int(max_total_edges) - graph.number_of_edges())
+        return self._minimum_node_violation_hitting_set_size(
+            node_sets,
+            max_size=remaining_edge_budget,
+        )
+
+    def _minimum_edges_needed_for_completion(
+        self,
+        graph: nx.Graph,
+        node_sets,
+        *,
+        max_total_edges: int,
+    ) -> int:
+        return max(
+            self._minimum_edges_needed_for_connectivity(graph),
+            self._minimum_edges_needed_for_node_violations(
+                graph,
+                node_sets,
+                max_total_edges=max_total_edges,
+            ),
+        )
+
+    def _completion_slack(self, graph: nx.Graph, *, max_total_edges: int, node_sets=None) -> int:
+        remaining_edge_budget = int(max_total_edges) - graph.number_of_edges()
+        completion_edges_needed = self._minimum_edges_needed_for_completion(
+            graph,
+            [] if node_sets is None else node_sets,
+            max_total_edges=max_total_edges,
+        )
+        return remaining_edge_budget - completion_edges_needed
+
+    def _is_completion_possible(self, graph: nx.Graph, *, max_total_edges: int, node_sets=None) -> bool:
+        return self._completion_slack(
+            graph,
+            max_total_edges=max_total_edges,
+            node_sets=node_sets,
+        ) >= 0
 
     def _max_total_edges_for_generation(self, start_graph: nx.Graph, n_edges: int) -> int:
         base_edges = int(n_edges)
@@ -2055,13 +2120,27 @@ class EdgeGenerator:
         positive_scores = self._positive_scores(generated_graphs)
         target_scores = self._target_scores(generated_graphs, target=target)
         risk_scores = self._edge_risk_scores(generated)
+        node_violation_sets = [[] for _ in generated]
+        partial_feasible_indices = [
+            idx
+            for idx, is_partial_feasible in enumerate(partial_feasibility_mask)
+            if is_partial_feasible
+        ]
+        if partial_feasible_indices:
+            partial_feasible_graphs = [generated_graphs[idx] for idx in partial_feasible_indices]
+            for idx, graph_node_sets in zip(
+                partial_feasible_indices,
+                self._node_violation_sets(partial_feasible_graphs),
+            ):
+                node_violation_sets[idx] = graph_node_sets
         partial_terminal_candidates = []
-        for cand, is_partial_feasible, score, target_score, risk_score in zip(
+        for cand, is_partial_feasible, score, target_score, risk_score, cand_node_sets in zip(
             generated,
             partial_feasibility_mask,
             positive_scores,
             target_scores,
             risk_scores,
+            node_violation_sets,
         ):
             cand["score"] = float(score)
             cand["target_score"] = float(target_score)
@@ -2071,18 +2150,23 @@ class EdgeGenerator:
                 + target_lambda * cand["target_score"]
                 - self.edge_risk_lambda * cand["risk_score"]
             )
-            cand["completion_slack"] = self._completion_slack(
+            node_violation_completion_edges = self._minimum_edges_needed_for_node_violations(
                 cand["graph"],
+                cand_node_sets,
                 max_total_edges=max_total_edges,
             )
+            completion_edges_needed = max(
+                self._minimum_edges_needed_for_connectivity(cand["graph"]),
+                node_violation_completion_edges,
+            )
+            remaining_edge_budget = int(max_total_edges) - cand["graph"].number_of_edges()
+            cand["node_violation_completion_edges"] = node_violation_completion_edges
+            cand["completion_slack"] = remaining_edge_budget - completion_edges_needed
             if not is_partial_feasible:
                 cand["feasibility_stage"] = "partial"
                 self._mark_trace_state_status(cand, "partial_infeasible")
                 infeasible_candidates.append(cand)
-            elif not self._is_completion_possible(
-                cand["graph"],
-                max_total_edges=max_total_edges,
-            ):
+            elif cand["completion_slack"] < 0:
                 cand["feasibility_stage"] = "completion"
                 self._mark_trace_state_status(cand, "completion_infeasible")
                 infeasible_candidates.append(cand)
