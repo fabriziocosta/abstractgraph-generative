@@ -1850,12 +1850,14 @@ class EdgeGenerator:
                 if state["graph"].number_of_edges() < max_total_edges
             ]
             if not expandable_beam:
+                self._mark_unexpandable_beam_as_completion_infeasible(search)
                 break
 
             generated = self._expand_beam(expandable_beam)
             scored = self._score_generated_candidates(
                 generated,
                 n_edges=n_edges,
+                max_total_edges=max_total_edges,
                 target=target,
                 target_lambda=target_lambda,
                 fallback_index=search["fallback_index"],
@@ -1954,6 +1956,18 @@ class EdgeGenerator:
             return False
         return self._is_connectivity_satisfied(graph)
 
+    def _minimum_edges_needed_for_connectivity(self, graph: nx.Graph) -> int:
+        if not self.require_single_connected_component:
+            return 0
+        return max(0, self._graph_component_count(graph) - 1)
+
+    def _completion_slack(self, graph: nx.Graph, *, max_total_edges: int) -> int:
+        remaining_edge_budget = int(max_total_edges) - graph.number_of_edges()
+        return remaining_edge_budget - self._minimum_edges_needed_for_connectivity(graph)
+
+    def _is_completion_possible(self, graph: nx.Graph, *, max_total_edges: int) -> bool:
+        return self._completion_slack(graph, max_total_edges=max_total_edges) >= 0
+
     def _max_total_edges_for_generation(self, start_graph: nx.Graph, n_edges: int) -> int:
         base_edges = int(n_edges)
         if not self.require_single_connected_component:
@@ -1992,6 +2006,7 @@ class EdgeGenerator:
         generated,
         *,
         n_edges: int,
+        max_total_edges: int,
         target,
         target_lambda: float,
         fallback_index: int,
@@ -2003,6 +2018,7 @@ class EdgeGenerator:
             self._partition_candidates_by_feasibility(
                 generated,
                 n_edges=n_edges,
+                max_total_edges=max_total_edges,
                 target=target,
                 target_lambda=target_lambda,
                 feasible_candidates=feasible_candidates,
@@ -2025,6 +2041,7 @@ class EdgeGenerator:
         generated,
         *,
         n_edges: int,
+        max_total_edges: int,
         target,
         target_lambda: float,
         feasible_candidates,
@@ -2054,15 +2071,26 @@ class EdgeGenerator:
                 + target_lambda * cand["target_score"]
                 - self.edge_risk_lambda * cand["risk_score"]
             )
-            if is_partial_feasible:
+            cand["completion_slack"] = self._completion_slack(
+                cand["graph"],
+                max_total_edges=max_total_edges,
+            )
+            if not is_partial_feasible:
+                cand["feasibility_stage"] = "partial"
+                self._mark_trace_state_status(cand, "partial_infeasible")
+                infeasible_candidates.append(cand)
+            elif not self._is_completion_possible(
+                cand["graph"],
+                max_total_edges=max_total_edges,
+            ):
+                cand["feasibility_stage"] = "completion"
+                self._mark_trace_state_status(cand, "completion_infeasible")
+                infeasible_candidates.append(cand)
+            else:
                 if cand["graph"].number_of_edges() >= n_edges:
                     partial_terminal_candidates.append(cand)
                 else:
                     feasible_candidates.append(cand)
-            else:
-                cand["feasibility_stage"] = "partial"
-                self._mark_trace_state_status(cand, "partial_infeasible")
-                infeasible_candidates.append(cand)
         self._promote_final_feasible_candidates(
             partial_terminal_candidates,
             feasible_candidates=feasible_candidates,
@@ -2105,7 +2133,13 @@ class EdgeGenerator:
             cand["selection_score"] = float(
                 cand["selection_score"] - repulsion_lambda * cand["repulsion"]
             )
-        feasible_candidates.sort(key=lambda cand: cand["selection_score"], reverse=True)
+        feasible_candidates.sort(
+            key=lambda cand: (
+                cand["selection_score"],
+                cand.get("completion_slack", 0),
+            ),
+            reverse=True,
+        )
         return repulsion_lambda
 
     def _rank_infeasible_candidates(self, infeasible_candidates) -> None:
@@ -2192,6 +2226,13 @@ class EdgeGenerator:
             f"generated={len(scored['generated'])} feasible={len(scored['feasible_candidates'])} "
             f"retained={len(retained)} tried={self.n_tried_}"
         )
+        completion_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "completion"
+        )
+        if completion_infeasible:
+            line2 = f"{line2} completion_infeasible={completion_infeasible}"
         line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
         if target_active:
             line3_parts.append(
@@ -2260,6 +2301,8 @@ class EdgeGenerator:
                 title_line1_parts.append(f"rep={cand.get('repulsion', 0.0):.3f}")
             if self.edge_risk_lambda > 0.0:
                 title_line1_parts.append(f"risk={cand.get('risk_score', 0.0):.3f}")
+            if cand.get("completion_slack") is not None:
+                title_line1_parts.append(f"slack={cand['completion_slack']}")
             if target_active:
                 title_line2_parts.append(f"tgt={cand.get('target_score', 0.0):.3f}")
             if title_line1_parts:
@@ -2510,6 +2553,14 @@ class EdgeGenerator:
         )
         for state in search["beam"]:
             self._mark_trace_state_status(state, "blocked")
+        self._remember_failed_graphs([state["graph"] for state in search["beam"]])
+
+    def _mark_unexpandable_beam_as_completion_infeasible(self, search) -> None:
+        for state in search["beam"]:
+            if self._is_connectivity_satisfied(state["graph"]):
+                self._mark_trace_state_status(state, "blocked")
+            else:
+                self._mark_trace_state_status(state, "completion_infeasible")
         self._remember_failed_graphs([state["graph"] for state in search["beam"]])
 
     def _restore_repaired_beam(
@@ -3539,10 +3590,16 @@ class EdgeGenerator:
         total_descendants = len(descendant_ids)
         if total_descendants == 0:
             return 0.0
+        failure_statuses = {
+            "partial_infeasible",
+            "final_infeasible",
+            "completion_infeasible",
+            "blocked",
+        }
         infeasible_descendants = sum(
             1
             for descendant_id in descendant_ids
-            if trace["states"][descendant_id]["status"] in {"partial_infeasible", "final_infeasible"}
+            if trace["states"][descendant_id]["status"] in failure_statuses
         )
         return infeasible_descendants / float(total_descendants)
 

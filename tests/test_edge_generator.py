@@ -969,6 +969,67 @@ def test_close_edge_risk_training_states_uses_infeasible_descendant_ratio() -> N
     assert fit_targets == [1.0 / 3.0, 1.0, 0.0]
 
 
+def test_trace_failure_ratio_counts_completion_and_blocked_failures() -> None:
+    risk_estimator = _RecordingRiskEstimator()
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        edge_risk_estimator=risk_estimator,
+    )
+    generator._reset_edge_risk_attempt_trace()
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    decision = generator._make_state(nx.path_graph(3), parent=root, score=0.9, depth=1)
+    completion_failure = generator._make_state(nx.path_graph(4), parent=decision, score=0.0, depth=2)
+    blocked_failure = generator._make_state(nx.path_graph(5), parent=decision, score=0.0, depth=2)
+    pruned = generator._make_state(nx.path_graph(3), parent=decision, score=0.8, depth=2)
+
+    generator._mark_trace_state_status(decision, "retained")
+    generator._mark_trace_state_status(completion_failure, "completion_infeasible")
+    generator._mark_trace_state_status(blocked_failure, "blocked")
+    generator._mark_trace_state_status(pruned, "pruned")
+
+    assert generator._trace_failure_ratio_for_state(decision["state_id"]) == pytest.approx(0.5)
+
+
+def test_completion_budget_prunes_candidates_that_cannot_be_connected() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        feasibility_estimator=_AlwaysFeasibleEstimator(),
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        graph_estimator=object(),
+        require_single_connected_component=True,
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(4))
+    graph.add_edge(0, 1)
+    root = generator._make_state(nx.empty_graph(4), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(graph, parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=3,
+        max_total_edges=2,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == []
+    assert infeasible_candidates == [cand]
+    assert cand["feasibility_stage"] == "completion"
+    assert cand["completion_slack"] == -1
+
+
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:
     class _AlwaysFeasibleEstimator:
         def predict(self, graphs):
@@ -996,6 +1057,7 @@ def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None
     generator._partition_candidates_by_feasibility(
         [cand],
         n_edges=5,
+        max_total_edges=5,
         target=7,
         target_lambda=0.5,
         feasible_candidates=feasible_candidates,

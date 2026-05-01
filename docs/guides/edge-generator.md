@@ -8,6 +8,7 @@
 - an optional target model to bias generation toward a requested class or value
 - an optional online edge-risk model to penalize edge decisions that tend to
   lead to infeasible descendants
+- a generic completion-budget guard for connectivity-constrained generation
 - an optional decomposition-aware training trajectory to bias reconstruction toward complete subgraphs
 - an optional stored retrieval corpus to select path-based fitting subsets from graph pairs
 - a beam search over partial constructions
@@ -253,6 +254,20 @@ single connected component. If search reaches `n_edges` with a disconnected
 final-feasible graph, it can continue for a bounded number of extra edges to
 try to connect the remaining components.
 
+The search also applies a generic completion-budget check. For any candidate,
+the generator computes the minimum number of additional edges needed to merge
+its current connected components:
+
+```text
+minimum_connecting_edges = connected_components - 1
+completion_slack = remaining_allowed_edges - minimum_connecting_edges
+```
+
+Candidates with negative `completion_slack` are marked
+`completion_infeasible` and are not retained in the beam. This catches failures
+where no existing edge is individually wrong, but too many components remain to
+finish the graph inside the remaining edge budget.
+
 ## Stored Retrieval Corpus
 
 `EdgeGenerator.store()` prepares a reusable corpus for multiple pair queries:
@@ -435,6 +450,13 @@ search descendants observed below it in the current search policy. This means:
 - an internal transition contributes one example with a fractional target that
   summarizes how much of its realized downstream subtree became infeasible
 
+Failures include partial-feasibility rejections, final-feasibility rejections,
+completion-budget failures, and blocked states where the beam cannot produce a
+solution. The last two cases are important when the problem is missing future
+edges rather than an explicitly invalid existing edge: there may be no
+`violating_edge_sets(...)` evidence for surgical removal, but the transition can
+still train edge risk because its descendants ended in a dead end.
+
 This model is updated online through an adapter with `partial_fit(...)`
 semantics:
 
@@ -535,6 +557,10 @@ This makes the fallback logic answer two separate questions:
 
 The first still comes from the rollback schedule. The second now comes from
 feasibility evidence whenever the estimator can expose structural violations.
+When a dead end is caused by missing edges rather than bad existing edges,
+surgical repair may have no edge set to remove. Those dead ends are still
+recorded as blocked or completion-infeasible trace states so the online edge-risk
+model can penalize earlier edge additions that repeatedly lead into them.
 
 ### Rollback Schedule
 
@@ -568,6 +594,8 @@ uses that distance, but applies it surgically:
   continuations
 - repeated evidence across several infeasible candidates increases the priority
   of removing that edge
+- missing-edge dead ends still contribute online edge-risk targets, even when no
+  violating edge set can be localized
 
 This is especially effective with feasibility estimators such as
 `FeasibilityEstimatorFeatureCannotExist`, because they can map forbidden motifs
@@ -699,7 +727,8 @@ regions.
 - `require_single_connected_component`
   When true, disconnected final-feasible graphs are not accepted at
   `n_edges`; search may spend a bounded number of extra edges trying to merge
-  the remaining connected components.
+  the remaining connected components. Candidates whose remaining edge budget
+  cannot merge their current components are pruned as completion-infeasible.
 - `use_similarity_repulsion`
   Whether to activate cosine-similarity repulsion after fallback begins.
 - `repulsion_weight`
