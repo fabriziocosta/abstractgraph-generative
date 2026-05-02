@@ -712,6 +712,49 @@ def test_log_search_step_reports_failed_when_no_fallback_phases_remain(capsys) -
     assert "FAILED no feasible candidates remain" in out
 
 
+def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+    )
+    generator.n_tried_ = 594
+    partial_failure = {"feasibility_stage": "partial"}
+    completion_failure = {"feasibility_stage": "completion"}
+    final_failure = {"feasibility_stage": "final"}
+
+    generator._log_search_step(
+        retained=[{"graph": nx.path_graph(4), "score": 0.9}],
+        scored={
+            "repulsion_lambda": 0.0,
+            "generated": [nx.path_graph(2) for _ in range(594)],
+            "feasible_candidates": [{"graph": nx.path_graph(3)} for _ in range(82)],
+            "infeasible_candidates": (
+                [partial_failure for _ in range(414)]
+                + [completion_failure for _ in range(98)]
+                + [final_failure for _ in range(7)]
+            ),
+        },
+        start_graph=nx.path_graph(2),
+        n_edges=5,
+        next_depth=3,
+        target=None,
+        target_lambda=0.5,
+        graph_index=0,
+        total_phases=5,
+        fallback_index=0,
+        beam_limit=3,
+        step_start_time=0.0,
+        draw_graphs_fn=None,
+        verbose=True,
+    )
+
+    out = capsys.readouterr().out
+    assert (
+        "generated=594 partial_feasible=180 viable=82 retained=1 tried=594 "
+        "partial_infeasible=414 completion_infeasible=98 final_infeasible=7"
+    ) in out
+
+
 def test_generate_from_pair_none_none_requires_cached_session() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
 

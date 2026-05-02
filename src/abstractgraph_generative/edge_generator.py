@@ -2316,17 +2316,33 @@ class EdgeGenerator:
             f"depth={next_depth} remaining_edges={remaining_edges} "
             f"step_time={self._format_minutes_seconds(step_elapsed)} eta={eta_str}"
         )
-        line2 = (
-            f"generated={len(scored['generated'])} feasible={len(scored['feasible_candidates'])} "
-            f"retained={len(retained)} tried={self.n_tried_}"
+        partial_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "partial"
         )
         completion_infeasible = sum(
             1
             for cand in scored.get("infeasible_candidates", [])
             if cand.get("feasibility_stage") == "completion"
         )
+        final_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "final"
+        )
+        partial_feasible = max(0, len(scored["generated"]) - partial_infeasible)
+        line2 = (
+            f"generated={len(scored['generated'])} partial_feasible={partial_feasible} "
+            f"viable={len(scored['feasible_candidates'])} retained={len(retained)} "
+            f"tried={self.n_tried_}"
+        )
+        if partial_infeasible:
+            line2 = f"{line2} partial_infeasible={partial_infeasible}"
         if completion_infeasible:
             line2 = f"{line2} completion_infeasible={completion_infeasible}"
+        if final_infeasible:
+            line2 = f"{line2} final_infeasible={final_infeasible}"
         line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
         if target_active:
             line3_parts.append(
