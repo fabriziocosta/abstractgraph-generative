@@ -1251,7 +1251,17 @@ class EdgeGenerator:
                     draw_graphs_fn,
                     [start_graph, repaired_state["graph"]],
                     n_graphs_per_line=2,
-                    titles=["input", "repaired_start"],
+                    titles=[
+                        (
+                            "current repair input\n"
+                            f"edges={start_graph.number_of_edges()} target_edges={target_n_edges}"
+                        ),
+                        (
+                            "pruned repair start\n"
+                            f"edges={repaired_state['graph'].number_of_edges()} "
+                            f"removed_edges={len(removed_edges)}"
+                        ),
+                    ],
                 )
             repaired_path = self.generate(
                 repaired_state["graph"],
