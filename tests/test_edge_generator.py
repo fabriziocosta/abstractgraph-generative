@@ -4,6 +4,8 @@ import networkx as nx
 import numpy as np
 import pytest
 
+from abstractgraph.hashing import hash_graph
+
 from abstractgraph_generative.edge_generator import (
     EdgeGenerator,
     _OnlineGraphRegressorAdapter,
@@ -646,6 +648,94 @@ def test_repair_can_skip_label_set_coverage_check_when_configured(monkeypatch) -
     assert generator.last_repair_label_set_mismatch_ is None
 
 
+def test_prepare_repair_training_context_prioritizes_neighbor_label_set_coverage() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+    )
+    query = _labeled_edge_graph(["A", "B"])
+    incompatible_close = _labeled_edge_graph(["A", "C"])
+    compatible_far = _labeled_edge_graph(["A", "B", "D"])
+    compatible_near = _labeled_edge_graph(["A", "B", "E"])
+    generator.stored_graphs_ = [
+        query.copy(),
+        incompatible_close,
+        compatible_far,
+        compatible_near,
+    ]
+    generator.stored_targets_ = ["query", "incompatible", "far", "near"]
+    generator.stored_graph_hash_to_index_ = {hash_graph(query): 0}
+    generator.stored_distance_matrix_ = np.asarray(
+        [
+            [0.0, 0.1, 0.4, 0.2],
+            [0.1, 0.0, 0.5, 0.3],
+            [0.4, 0.5, 0.0, 0.6],
+            [0.2, 0.3, 0.6, 0.0],
+        ],
+        dtype=float,
+    )
+
+    context = generator._prepare_repair_training_context(query, n_neighbors=2)
+
+    assert context["neighbor_indices"] == [1, 3]
+    assert context["neighbor_distances"] == [0.1, 0.2]
+    assert context["fit_targets"] == ["incompatible", "near"]
+    assert generator._repair_label_set_mismatch(context) is None
+
+
+def test_prepare_repair_training_context_can_cover_query_labels_across_neighbors() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+    )
+    query = _labeled_edge_graph(["A", "B"])
+    covers_a = _labeled_edge_graph(["A", "C"])
+    covers_b = _labeled_edge_graph(["B", "D"])
+    generator.stored_graphs_ = [query.copy(), covers_a, covers_b]
+    generator.stored_targets_ = ["query", "a", "b"]
+    generator.stored_graph_hash_to_index_ = {hash_graph(query): 0}
+    generator.stored_distance_matrix_ = np.asarray(
+        [
+            [0.0, 0.1, 0.2],
+            [0.1, 0.0, 0.3],
+            [0.2, 0.3, 0.0],
+        ],
+        dtype=float,
+    )
+
+    context = generator._prepare_repair_training_context(query, n_neighbors=2)
+
+    assert context["neighbor_indices"] == [1, 2]
+    assert context["fit_targets"] == ["a", "b"]
+    assert generator._repair_label_set_mismatch(context) is None
+
+
+def test_prepare_repair_training_context_can_skip_label_compatible_filter() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        enforce_repair_label_set_coverage=False,
+    )
+    query = _labeled_edge_graph(["A", "B"])
+    incompatible_close = _labeled_edge_graph(["A", "C"])
+    compatible_far = _labeled_edge_graph(["A", "B", "D"])
+    generator.stored_graphs_ = [query.copy(), incompatible_close, compatible_far]
+    generator.stored_targets_ = None
+    generator.stored_graph_hash_to_index_ = {hash_graph(query): 0}
+    generator.stored_distance_matrix_ = np.asarray(
+        [
+            [0.0, 0.1, 0.4],
+            [0.1, 0.0, 0.5],
+            [0.4, 0.5, 0.0],
+        ],
+        dtype=float,
+    )
+
+    context = generator._prepare_repair_training_context(query, n_neighbors=1)
+
+    assert context["neighbor_indices"] == [1]
+
+
 def test_log_search_step_reports_backtrack_when_no_feasible_candidates_remain(capsys) -> None:
     generator = EdgeGenerator(
         feasibility_estimator=object(),
@@ -1148,6 +1238,89 @@ def test_completion_budget_prunes_disjoint_final_node_violations() -> None:
     assert cand["feasibility_stage"] == "completion"
     assert cand["node_violation_completion_edges"] == 3
     assert cand["completion_slack"] == -1
+
+
+def test_terminal_completion_lookahead_prunes_candidates_with_no_final_completion() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    class _RejectAllFinalEstimator:
+        def predict(self, graphs):
+            return np.zeros(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_RejectAllFinalEstimator(),
+        graph_estimator=object(),
+        require_single_connected_component=False,
+    )
+    generator.edge_attribute_templates_ = [{}]
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(3))
+    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(graph, parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=2,
+        max_total_edges=2,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == []
+    assert infeasible_candidates == [cand]
+    assert cand["feasibility_stage"] == "completion"
+    assert cand["terminal_completion_infeasible"] is True
+
+
+def test_terminal_completion_lookahead_uses_full_remaining_edge_budget() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    class _RequireTwoEdgesFinalEstimator:
+        def predict(self, graphs):
+            return np.asarray([graph.number_of_edges() >= 2 for graph in graphs], dtype=bool)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_RequireTwoEdgesFinalEstimator(),
+        graph_estimator=object(),
+        require_single_connected_component=False,
+    )
+    generator.edge_attribute_templates_ = [{}]
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    graph = nx.Graph()
+    graph.add_nodes_from(range(3))
+    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(graph, parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=2,
+        max_total_edges=2,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == [cand]
+    assert infeasible_candidates == []
+    assert "terminal_completion_infeasible" not in cand
 
 
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:

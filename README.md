@@ -48,8 +48,10 @@ under feasibility constraints, graph ranking, optional target guidance, online
 edge-risk penalties, pair retrieval, and local repair workflows.
 
 One practical workflow is `repair(...)`: the generator retrieves similar stored
-graphs, identifies feasibility violations, reduces the problematic start graph,
-and regrows candidate graphs back toward the desired edge count.
+graphs whose combined node labels cover the query graph, identifies feasibility
+violations, reduces the problematic start graph, and regrows candidate graphs
+back toward the desired edge count while pruning candidates that cannot complete
+within the remaining edge budget.
 
 See [Edge Generator](docs/guides/edge-generator.md).
 

@@ -53,8 +53,11 @@ This repo owns the graph-only generation layer built on top of
   Build a local fitting subset from a stored retrieval corpus and generate from
   a mixed pair start graph.
 - `repair(...)`
-  Fit on the nearest stored neighbors of one query graph, then regrow from a
-  surgically repaired infeasible start back to the original edge count.
+  Fit on nearest stored neighbors whose combined node-label set covers one
+  query graph, then regrow from a surgically repaired infeasible start back to
+  the original edge count. Edge search uses completion-budget and bounded
+  terminal-completion diagnostics to avoid retaining candidates that cannot
+  finish inside the remaining edge budget.
 
 ## Conventions
 

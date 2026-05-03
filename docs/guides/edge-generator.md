@@ -92,6 +92,7 @@ generator = EdgeGenerator(
     max_beam_size=8,
     edge_risk_lambda=0.25,
     require_single_connected_component=True,
+    max_terminal_completion_lookahead_states=512,
     verbose=True,
     seed=0,
 ).fit(fit_graphs, fit_targets)
@@ -169,11 +170,13 @@ Behavior:
 
 - the target edge count is always `graph.number_of_edges()`
 - if the graph is already final-feasible, repair returns it unchanged
-- before fitting the local repair models, `repair()` checks that the unique
-  node-label set in the input graph is covered by the union of unique
-  node labels present in the retrieved repair neighborhood; if any input label
-  is missing from the neighborhood, repair fails fast and returns no repair
-  instead of fitting incompatible feasibility models
+- when selecting the local repair fitting set, `repair()` scans stored graphs in
+  nearest-neighbor order and prioritizes candidates that add missing input
+  labels until the selected neighborhood's union of unique node labels covers
+  the input graph; extra labels in stored graphs are allowed
+- after compatible neighbors are selected, `repair()` still checks the union of
+  retrieved labels as a guard; if any input label is missing, repair fails fast
+  and returns no repair instead of fitting incompatible feasibility models
 - if the graph is final-infeasible, repair asks the final-feasibility estimator
   for violating edge sets, removes the most implicated edges according to the
   fallback rollback schedule, and regrows from those repaired starts
@@ -255,8 +258,8 @@ final-feasible graph, it can continue for a bounded number of extra edges to
 try to connect the remaining components.
 
 The search also applies generic completion-budget checks. For any candidate,
-the generator computes lower bounds on the number of additional edges needed to
-still reach a final-feasible solution.
+the generator estimates whether the remaining edge budget can still reach a
+final-feasible solution.
 
 The first bound is connectivity:
 
@@ -285,6 +288,42 @@ Candidates with negative `completion_slack` are marked
 `completion_infeasible` and are not retained in the beam. This catches failures
 where no existing edge is individually wrong, but too many components or
 node-local final violations remain to finish the graph inside the edge budget.
+
+When the lower bound does not prove impossibility, the generator can also run a
+bounded terminal-completion lookahead. Starting from the candidate, it explores
+future edge additions up to the full remaining allowed edge budget and evaluates
+terminal completions with the final-feasibility estimator. If no terminal
+completion is final-feasible before the search space is exhausted, the candidate
+is marked `completion_infeasible` with
+`terminal_completion_infeasible=True`.
+
+The lookahead is controlled by
+`max_terminal_completion_lookahead_states`:
+
+```python
+generator = EdgeGenerator(
+    ...,
+    max_terminal_completion_lookahead_states=512,
+)
+```
+
+- use a larger value for smaller graphs or stricter repair diagnostics
+- use a smaller value when verbose repair becomes too slow
+- use `0` to disable terminal-completion lookahead
+
+If the cap is reached, the candidate is kept because impossibility was not
+proven. Verbose logs report this as `terminal_completion_unknown`.
+
+Verbose feasibility counts:
+
+- `partial_infeasible`: rejected by the partial estimator
+- `completion_infeasible`: rejected by budget or terminal-completion analysis
+- `terminal_completion_infeasible`: no final-feasible terminal completion exists
+  within the explored remaining budget
+- `terminal_completion_unknown`: lookahead reached its cap, so the candidate was
+  retained
+- `final_infeasible`: reached a terminal edge count but failed the final
+  estimator
 
 ## Stored Retrieval Corpus
 

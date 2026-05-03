@@ -546,6 +546,7 @@ class EdgeGenerator:
         early_stop_if_final_feasible: bool = True,
         require_single_connected_component: bool = True,
         enforce_repair_label_set_coverage: bool = True,
+        max_terminal_completion_lookahead_states: int = 512,
     ):
         """Configure an edge-growing graph generator.
 
@@ -627,6 +628,12 @@ class EdgeGenerator:
             Whether ``repair(...)`` should fail early when the query graph has
             node labels that are absent from the selected repair neighborhood.
             Extra labels in the neighborhood are tolerated.
+        max_terminal_completion_lookahead_states : int, optional
+            Maximum number of future completion states explored per candidate
+            when estimating whether the remaining edge budget can still reach a
+            final-feasible graph. If the cap is reached, the candidate is kept
+            because impossibility was not proven. Set to ``0`` to disable this
+            lookahead.
 
         Returns
         -------
@@ -680,6 +687,9 @@ class EdgeGenerator:
         self.early_stop_if_final_feasible = early_stop_if_final_feasible
         self.require_single_connected_component = require_single_connected_component
         self.enforce_repair_label_set_coverage = bool(enforce_repair_label_set_coverage)
+        self.max_terminal_completion_lookahead_states = int(
+            max_terminal_completion_lookahead_states
+        )
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -1147,11 +1157,12 @@ class EdgeGenerator:
         """Repair one graph by refitting on stored nearest neighbors.
 
         The method reuses the stored retrieval corpus to select the nearest
-        ``n_neighbors`` training graphs, refits the generator on that local
-        neighborhood, keeps the original graph edge count as the repair target,
-        and, when the input graph is final-infeasible, seeds generation from
-        one or more surgically repaired rollback states derived from the
-        estimator's violating-edge sets.
+        ``n_neighbors`` training graphs whose node-label sets cover the input
+        graph labels, refits the generator on that local neighborhood, keeps
+        the original graph edge count as the repair target, and, when the input
+        graph is final-infeasible, seeds generation from one or more surgically
+        repaired rollback states derived from the estimator's violating-edge
+        sets.
 
         Parameters
         ----------
@@ -1505,13 +1516,32 @@ class EdgeGenerator:
                 np.asarray(self.stored_retrieval_vectors_, dtype=float),
             ).ravel()
 
-        neighbor_indices = []
+        sorted_candidate_indices = []
         for idx in np.argsort(distances, kind="stable"):
             idx = int(idx)
             if stored_idx is not None and idx == stored_idx:
                 continue
             if not np.isfinite(distances[idx]):
                 continue
+            sorted_candidate_indices.append(idx)
+
+        neighbor_indices = []
+        if self.enforce_repair_label_set_coverage:
+            missing_labels = set(self._graph_unique_node_labels(graph_copy))
+            for idx in sorted_candidate_indices:
+                candidate_labels = self._graph_unique_node_labels(self.stored_graphs_[idx])
+                if not missing_labels.intersection(candidate_labels):
+                    continue
+                neighbor_indices.append(idx)
+                missing_labels.difference_update(candidate_labels)
+                if not missing_labels:
+                    break
+
+        for idx in sorted_candidate_indices:
+            if idx in neighbor_indices:
+                continue
+            if len(neighbor_indices) >= int(n_neighbors):
+                break
             neighbor_indices.append(idx)
             if len(neighbor_indices) >= int(n_neighbors):
                 break
@@ -2043,6 +2073,76 @@ class EdgeGenerator:
             node_sets=node_sets,
         ) >= 0
 
+    def _has_final_feasible_completion_within_budget(
+        self,
+        graph: nx.Graph,
+        *,
+        n_edges: int,
+        max_total_edges: int,
+    ) -> bool | None:
+        state_cap = int(self.max_terminal_completion_lookahead_states)
+        if state_cap <= 0:
+            return None
+        if self.edge_attribute_templates_ is None:
+            return None
+        remaining_budget = int(max_total_edges) - graph.number_of_edges()
+        if remaining_budget < 0:
+            return False
+
+        frontier = [graph.copy()]
+        seen_hashes = {hash_graph(graph)}
+        explored_states = 1
+        for depth in range(remaining_budget + 1):
+            terminal_graphs = [
+                candidate
+                for candidate in frontier
+                if self._is_terminal_solution_graph(candidate, n_edges=n_edges)
+            ]
+            if terminal_graphs:
+                final_mask = np.asarray(
+                    self.final_feasibility_estimator.predict(terminal_graphs),
+                    dtype=bool,
+                )
+                if bool(np.any(final_mask)):
+                    return True
+
+            if depth >= remaining_budget:
+                break
+
+            next_frontier = []
+            for candidate in frontier:
+                if candidate.number_of_edges() >= int(max_total_edges):
+                    continue
+                for edge in self._missing_edges(candidate):
+                    for edge_attrs in self.edge_attribute_templates_:
+                        completion_graph = candidate.copy()
+                        completion_graph.add_edge(*edge, **edge_attrs)
+                        graph_hash = hash_graph(completion_graph)
+                        if graph_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(graph_hash)
+                        next_frontier.append(completion_graph)
+                        explored_states += 1
+                        if explored_states > state_cap:
+                            return None
+
+            if not next_frontier:
+                break
+
+            partial_mask = np.asarray(
+                self.partial_feasibility_estimator.predict(next_frontier),
+                dtype=bool,
+            )
+            frontier = [
+                candidate
+                for candidate, is_partial_feasible in zip(next_frontier, partial_mask)
+                if is_partial_feasible
+            ]
+            if not frontier:
+                break
+
+        return False
+
     def _max_total_edges_for_generation(self, start_graph: nx.Graph, n_edges: int) -> int:
         base_edges = int(n_edges)
         if not self.require_single_connected_component:
@@ -2172,6 +2272,19 @@ class EdgeGenerator:
             remaining_edge_budget = int(max_total_edges) - cand["graph"].number_of_edges()
             cand["node_violation_completion_edges"] = node_violation_completion_edges
             cand["completion_slack"] = remaining_edge_budget - completion_edges_needed
+            terminal_completion_possible = None
+            if (
+                is_partial_feasible
+                and cand["completion_slack"] >= 0
+                and cand["graph"].number_of_edges() < int(n_edges)
+            ):
+                terminal_completion_possible = (
+                    self._has_final_feasible_completion_within_budget(
+                        cand["graph"],
+                        n_edges=n_edges,
+                        max_total_edges=max_total_edges,
+                    )
+                )
             if not is_partial_feasible:
                 cand["feasibility_stage"] = "partial"
                 self._mark_trace_state_status(cand, "partial_infeasible")
@@ -2180,6 +2293,17 @@ class EdgeGenerator:
                 cand["feasibility_stage"] = "completion"
                 self._mark_trace_state_status(cand, "completion_infeasible")
                 infeasible_candidates.append(cand)
+            elif terminal_completion_possible is False:
+                cand["feasibility_stage"] = "completion"
+                cand["terminal_completion_infeasible"] = True
+                self._mark_trace_state_status(cand, "completion_infeasible")
+                infeasible_candidates.append(cand)
+            elif terminal_completion_possible is None:
+                cand["terminal_completion_unknown"] = True
+                if cand["graph"].number_of_edges() >= n_edges:
+                    partial_terminal_candidates.append(cand)
+                else:
+                    feasible_candidates.append(cand)
             else:
                 if cand["graph"].number_of_edges() >= n_edges:
                     partial_terminal_candidates.append(cand)
@@ -2326,6 +2450,16 @@ class EdgeGenerator:
             for cand in scored.get("infeasible_candidates", [])
             if cand.get("feasibility_stage") == "completion"
         )
+        terminal_completion_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("terminal_completion_infeasible")
+        )
+        terminal_completion_unknown = sum(
+            1
+            for cand in scored.get("feasible_candidates", [])
+            if cand.get("terminal_completion_unknown")
+        )
         final_infeasible = sum(
             1
             for cand in scored.get("infeasible_candidates", [])
@@ -2341,6 +2475,12 @@ class EdgeGenerator:
             line2 = f"{line2} partial_infeasible={partial_infeasible}"
         if completion_infeasible:
             line2 = f"{line2} completion_infeasible={completion_infeasible}"
+        if terminal_completion_infeasible:
+            line2 = (
+                f"{line2} terminal_completion_infeasible={terminal_completion_infeasible}"
+            )
+        if terminal_completion_unknown:
+            line2 = f"{line2} terminal_completion_unknown={terminal_completion_unknown}"
         if final_infeasible:
             line2 = f"{line2} final_infeasible={final_infeasible}"
         line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
