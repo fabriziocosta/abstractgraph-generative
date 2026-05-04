@@ -2,11 +2,17 @@
 
 This directory is the documentation root for `abstractgraph-generative`.
 
+## Start Here
+
+- [Overview](overview.md)
+- [Repository Organization](ORGANIZATION.md)
+- [Notebook Guide](notebooks.md)
+
 ## Guides
 
-- [Autoregressive Generator and Rewrite](guides/autoregressive-generator-and-rewrite.md)
-- [Conditional Autoregressive Generation](guides/conditional-autoregressive-generation.md)
-- [Edge Generator](guides/edge-generator.md)
+- [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md)
+- [Conditional Autoregressive Generation](conditional-autoregressive-generation.md)
+- [Edge Generator](edge-generator.md)
 
 ## Scope
 
@@ -62,12 +68,14 @@ This repo owns the graph-only generation layer built on top of
 ## Conventions
 
 - Active narrative documentation lives in `docs/`.
-- Long-form guides live in `docs/guides/`.
+- Long-form guides live directly in `docs/`.
 - Guide filenames use kebab-case.
-- `README.md` files act as landing pages for directories.
+- `README.md` files outside `docs/` act as short pointers to canonical docs.
+- `README.md` files inside `docs/` act as landing pages for directories.
 
 ## Notes
 
 - Active code is migrating to `base_graph`, `interpretation_graph`, and
   `mapped_subgraph`.
-- For repo-level dependency context, see [../ECOSYSTEM.md](../ECOSYSTEM.md).
+- For repo-level dependency context, see the
+  [AbstractGraph ecosystem README](../../../README.md).

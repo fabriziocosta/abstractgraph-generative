@@ -3,7 +3,7 @@
 This document covers code organization, local setup, validation, and supporting
 documentation for `abstractgraph-generative`.
 
-For the semantic role of this repository, see [../README.md](../README.md).
+For the semantic role of this repository, see [overview.md](overview.md).
 
 ## Package Layout
 
@@ -21,9 +21,11 @@ For the semantic role of this repository, see [../README.md](../README.md).
 ## Documentation
 
 - [README.md](README.md)
-- [Autoregressive Generator and Rewrite](guides/autoregressive-generator-and-rewrite.md)
-- [Conditional Autoregressive Generation](guides/conditional-autoregressive-generation.md)
-- [Edge Generator](guides/edge-generator.md)
+- [Overview](overview.md)
+- [Notebook Guide](notebooks.md)
+- [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md)
+- [Conditional Autoregressive Generation](conditional-autoregressive-generation.md)
+- [Edge Generator](edge-generator.md)
 
 ## Notebooks
 
