@@ -524,6 +524,7 @@ class EdgeGenerator:
         *,
         partial_feasibility_estimator=None,
         final_feasibility_estimator=None,
+        lookahead_feasibility_estimator=None,
         n_negative_per_positive: int = 3,
         n_replicates: int = 1,
         beam_size: int = 10,
@@ -546,7 +547,6 @@ class EdgeGenerator:
         early_stop_if_final_feasible: bool = True,
         require_single_connected_component: bool = True,
         enforce_repair_label_set_coverage: bool = True,
-        max_terminal_completion_lookahead_states: int = 512,
     ):
         """Configure an edge-growing graph generator.
 
@@ -572,6 +572,9 @@ class EdgeGenerator:
             Estimator checked on intermediate states during search.
         final_feasibility_estimator : object, optional
             Estimator checked on terminal states with the requested edge count.
+        lookahead_feasibility_estimator : object, optional
+            Optional estimator checked on intermediate states by comparing
+            ``number_of_violations`` against the remaining target-edge budget.
         n_negative_per_positive : int, optional
             Number of negative graphs sampled per positive fragment during
             training-set construction.
@@ -628,13 +631,6 @@ class EdgeGenerator:
             Whether ``repair(...)`` should fail early when the query graph has
             node labels that are absent from the selected repair neighborhood.
             Extra labels in the neighborhood are tolerated.
-        max_terminal_completion_lookahead_states : int, optional
-            Maximum number of future completion states explored per candidate
-            when estimating whether the remaining edge budget can still reach a
-            final-feasible graph. If the cap is reached, the candidate is kept
-            because impossibility was not proven. Set to ``0`` to disable this
-            lookahead.
-
         Returns
         -------
         None
@@ -645,10 +641,12 @@ class EdgeGenerator:
         (
             self.partial_feasibility_estimator,
             self.final_feasibility_estimator,
+            self.lookahead_feasibility_estimator,
         ) = self._resolve_feasibility_estimators(
             feasibility_estimator=feasibility_estimator,
             partial_feasibility_estimator=partial_feasibility_estimator,
             final_feasibility_estimator=final_feasibility_estimator,
+            lookahead_feasibility_estimator=lookahead_feasibility_estimator,
         )
         if graph_estimator is None:
             raise ValueError("graph_estimator is required")
@@ -687,9 +685,6 @@ class EdgeGenerator:
         self.early_stop_if_final_feasible = early_stop_if_final_feasible
         self.require_single_connected_component = require_single_connected_component
         self.enforce_repair_label_set_coverage = bool(enforce_repair_label_set_coverage)
-        self.max_terminal_completion_lookahead_states = int(
-            max_terminal_completion_lookahead_states
-        )
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -734,6 +729,7 @@ class EdgeGenerator:
         feasibility_estimator,
         partial_feasibility_estimator,
         final_feasibility_estimator,
+        lookahead_feasibility_estimator,
     ):
         resolved_partial = (
             partial_feasibility_estimator
@@ -752,7 +748,40 @@ class EdgeGenerator:
             )
         if resolved_partial is resolved_final:
             resolved_final = copy.deepcopy(resolved_final)
-        return resolved_partial, resolved_final
+        resolved_lookahead = self._resolve_lookahead_feasibility_estimator(
+            lookahead_feasibility_estimator,
+            resolved_partial=resolved_partial,
+            resolved_final=resolved_final,
+            feasibility_estimator=feasibility_estimator,
+            partial_feasibility_estimator=partial_feasibility_estimator,
+            final_feasibility_estimator=final_feasibility_estimator,
+        )
+        return resolved_partial, resolved_final, resolved_lookahead
+
+    def _resolve_lookahead_feasibility_estimator(
+        self,
+        lookahead_feasibility_estimator,
+        *,
+        resolved_partial,
+        resolved_final,
+        feasibility_estimator,
+        partial_feasibility_estimator,
+        final_feasibility_estimator,
+    ):
+        if lookahead_feasibility_estimator is None:
+            return None
+        if (
+            lookahead_feasibility_estimator is resolved_final
+            or lookahead_feasibility_estimator is final_feasibility_estimator
+        ):
+            return resolved_final
+        if (
+            lookahead_feasibility_estimator is resolved_partial
+            or lookahead_feasibility_estimator is partial_feasibility_estimator
+            or lookahead_feasibility_estimator is feasibility_estimator
+        ):
+            return copy.deepcopy(lookahead_feasibility_estimator)
+        return lookahead_feasibility_estimator
 
     def fit(
         self,
@@ -773,10 +802,10 @@ class EdgeGenerator:
             Optional per-graph targets used to fit the target estimator on graph
             fragments.
         deduplicate_feasibility_graphs : bool, optional
-            Whether to deduplicate graphs before fitting partial/final
-            feasibility estimators. Repair-local fits can disable this because
-            their graph selection is already ID-based and only one neighbor
-            expansion is used.
+            Whether to deduplicate graphs before fitting partial, final, and
+            lookahead feasibility estimators. Repair-local fits can disable
+            this because their graph selection is already ID-based and only one
+            neighbor expansion is used.
         partial_feasibility_extra_graphs : iterable[nx.Graph], optional
             Extra graphs used only to fit the partial feasibility estimator.
             This is useful during repair to make node-only bootstrap states
@@ -811,6 +840,16 @@ class EdgeGenerator:
         final_feasibility_fit_start = time.perf_counter()
         self.final_feasibility_estimator.fit(final_fit_graphs)
         final_feasibility_fit_time = time.perf_counter() - final_feasibility_fit_start
+        lookahead_feasibility_fit_time = None
+        if (
+            self.lookahead_feasibility_estimator is not None
+            and self.lookahead_feasibility_estimator is not self.final_feasibility_estimator
+        ):
+            lookahead_feasibility_fit_start = time.perf_counter()
+            self.lookahead_feasibility_estimator.fit(final_fit_graphs)
+            lookahead_feasibility_fit_time = (
+                time.perf_counter() - lookahead_feasibility_fit_start
+            )
         if self.verbose:
             partial_fit_min = int(partial_feasibility_fit_time // 60)
             partial_fit_sec = partial_feasibility_fit_time - 60 * partial_fit_min
@@ -824,6 +863,15 @@ class EdgeGenerator:
                 f"partial_time={partial_fit_min}m {partial_fit_sec:.1f}s "
                 f"final_time={final_fit_min}m {final_fit_sec:.1f}s"
             )
+            if lookahead_feasibility_fit_time is not None:
+                lookahead_fit_min = int(lookahead_feasibility_fit_time // 60)
+                lookahead_fit_sec = (
+                    lookahead_feasibility_fit_time - 60 * lookahead_fit_min
+                )
+                print(
+                    f"[fit] lookahead_feasibility_graphs={len(final_fit_graphs)} "
+                    f"lookahead_time={lookahead_fit_min}m {lookahead_fit_sec:.1f}s"
+                )
 
         self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
         train_graphs = [graph for graph, label in self.dataset_]
@@ -1996,153 +2044,6 @@ class EdgeGenerator:
             return False
         return self._is_connectivity_satisfied(graph)
 
-    def _minimum_edges_needed_for_connectivity(self, graph: nx.Graph) -> int:
-        if not self.require_single_connected_component:
-            return 0
-        return max(0, self._graph_component_count(graph) - 1)
-
-    def _node_violation_sets(self, graphs) -> list[list[frozenset]]:
-        estimator = self.final_feasibility_estimator
-        if not hasattr(estimator, "violating_node_labels_sets"):
-            return [[] for _ in graphs]
-        return estimator.violating_node_labels_sets(graphs)
-
-    def _minimum_node_violation_hitting_set_size(
-        self,
-        node_sets,
-        *,
-        max_size: int | None = None,
-    ) -> int:
-        node_sets = [frozenset(node_set) for node_set in node_sets if node_set]
-        if not node_sets:
-            return 0
-        node_sets.sort(key=len)
-        candidate_nodes = sorted(set().union(*node_sets), key=repr)
-        max_exact_size = len(candidate_nodes) if max_size is None else min(int(max_size), len(candidate_nodes))
-        for size in range(1, max_exact_size + 1):
-            for candidate in combinations(candidate_nodes, size):
-                candidate_set = set(candidate)
-                if all(candidate_set.intersection(node_set) for node_set in node_sets):
-                    return size
-        if max_size is not None and max_exact_size < len(candidate_nodes):
-            return int(max_size) + 1
-        return len(candidate_nodes)
-
-    def _minimum_edges_needed_for_node_violations(
-        self,
-        graph: nx.Graph,
-        node_sets,
-        *,
-        max_total_edges: int,
-    ) -> int:
-        remaining_edge_budget = max(0, int(max_total_edges) - graph.number_of_edges())
-        return self._minimum_node_violation_hitting_set_size(
-            node_sets,
-            max_size=remaining_edge_budget,
-        )
-
-    def _minimum_edges_needed_for_completion(
-        self,
-        graph: nx.Graph,
-        node_sets,
-        *,
-        max_total_edges: int,
-    ) -> int:
-        return max(
-            self._minimum_edges_needed_for_connectivity(graph),
-            self._minimum_edges_needed_for_node_violations(
-                graph,
-                node_sets,
-                max_total_edges=max_total_edges,
-            ),
-        )
-
-    def _completion_slack(self, graph: nx.Graph, *, max_total_edges: int, node_sets=None) -> int:
-        remaining_edge_budget = int(max_total_edges) - graph.number_of_edges()
-        completion_edges_needed = self._minimum_edges_needed_for_completion(
-            graph,
-            [] if node_sets is None else node_sets,
-            max_total_edges=max_total_edges,
-        )
-        return remaining_edge_budget - completion_edges_needed
-
-    def _is_completion_possible(self, graph: nx.Graph, *, max_total_edges: int, node_sets=None) -> bool:
-        return self._completion_slack(
-            graph,
-            max_total_edges=max_total_edges,
-            node_sets=node_sets,
-        ) >= 0
-
-    def _has_final_feasible_completion_within_budget(
-        self,
-        graph: nx.Graph,
-        *,
-        n_edges: int,
-        max_total_edges: int,
-    ) -> bool | None:
-        state_cap = int(self.max_terminal_completion_lookahead_states)
-        if state_cap <= 0:
-            return None
-        if self.edge_attribute_templates_ is None:
-            return None
-        remaining_budget = int(max_total_edges) - graph.number_of_edges()
-        if remaining_budget < 0:
-            return False
-
-        frontier = [graph.copy()]
-        seen_hashes = {hash_graph(graph)}
-        explored_states = 1
-        for depth in range(remaining_budget + 1):
-            terminal_graphs = [
-                candidate
-                for candidate in frontier
-                if self._is_terminal_solution_graph(candidate, n_edges=n_edges)
-            ]
-            if terminal_graphs:
-                final_mask = np.asarray(
-                    self.final_feasibility_estimator.predict(terminal_graphs),
-                    dtype=bool,
-                )
-                if bool(np.any(final_mask)):
-                    return True
-
-            if depth >= remaining_budget:
-                break
-
-            next_frontier = []
-            for candidate in frontier:
-                if candidate.number_of_edges() >= int(max_total_edges):
-                    continue
-                for edge in self._missing_edges(candidate):
-                    for edge_attrs in self.edge_attribute_templates_:
-                        completion_graph = candidate.copy()
-                        completion_graph.add_edge(*edge, **edge_attrs)
-                        graph_hash = hash_graph(completion_graph)
-                        if graph_hash in seen_hashes:
-                            continue
-                        seen_hashes.add(graph_hash)
-                        next_frontier.append(completion_graph)
-                        explored_states += 1
-                        if explored_states > state_cap:
-                            return None
-
-            if not next_frontier:
-                break
-
-            partial_mask = np.asarray(
-                self.partial_feasibility_estimator.predict(next_frontier),
-                dtype=bool,
-            )
-            frontier = [
-                candidate
-                for candidate, is_partial_feasible in zip(next_frontier, partial_mask)
-                if is_partial_feasible
-            ]
-            if not frontier:
-                break
-
-        return False
-
     def _max_total_edges_for_generation(self, start_graph: nx.Graph, n_edges: int) -> int:
         base_edges = int(n_edges)
         if not self.require_single_connected_component:
@@ -2230,27 +2131,29 @@ class EdgeGenerator:
         positive_scores = self._positive_scores(generated_graphs)
         target_scores = self._target_scores(generated_graphs, target=target)
         risk_scores = self._edge_risk_scores(generated)
-        node_violation_sets = [[] for _ in generated]
-        partial_feasible_indices = [
+        lookahead_violation_counts = [None for _ in generated]
+        lookahead_indices = [
             idx
-            for idx, is_partial_feasible in enumerate(partial_feasibility_mask)
-            if is_partial_feasible
+            for idx, (cand, is_partial_feasible) in enumerate(
+                zip(generated, partial_feasibility_mask)
+            )
+            if is_partial_feasible and cand["graph"].number_of_edges() < int(n_edges)
         ]
-        if partial_feasible_indices:
-            partial_feasible_graphs = [generated_graphs[idx] for idx in partial_feasible_indices]
-            for idx, graph_node_sets in zip(
-                partial_feasible_indices,
-                self._node_violation_sets(partial_feasible_graphs),
+        if self.lookahead_feasibility_estimator is not None and lookahead_indices:
+            lookahead_graphs = [generated_graphs[idx] for idx in lookahead_indices]
+            for idx, violation_count in zip(
+                lookahead_indices,
+                self._lookahead_violation_counts(lookahead_graphs),
             ):
-                node_violation_sets[idx] = graph_node_sets
+                lookahead_violation_counts[idx] = violation_count
         partial_terminal_candidates = []
-        for cand, is_partial_feasible, score, target_score, risk_score, cand_node_sets in zip(
+        for cand, is_partial_feasible, score, target_score, risk_score, lookahead_violation_count in zip(
             generated,
             partial_feasibility_mask,
             positive_scores,
             target_scores,
             risk_scores,
-            node_violation_sets,
+            lookahead_violation_counts,
         ):
             cand["score"] = float(score)
             cand["target_score"] = float(target_score)
@@ -2260,60 +2163,52 @@ class EdgeGenerator:
                 + target_lambda * cand["target_score"]
                 - self.edge_risk_lambda * cand["risk_score"]
             )
-            node_violation_completion_edges = self._minimum_edges_needed_for_node_violations(
-                cand["graph"],
-                cand_node_sets,
-                max_total_edges=max_total_edges,
-            )
-            completion_edges_needed = max(
-                self._minimum_edges_needed_for_connectivity(cand["graph"]),
-                node_violation_completion_edges,
-            )
-            remaining_edge_budget = int(max_total_edges) - cand["graph"].number_of_edges()
-            cand["node_violation_completion_edges"] = node_violation_completion_edges
-            cand["completion_slack"] = remaining_edge_budget - completion_edges_needed
-            terminal_completion_possible = None
-            if (
-                is_partial_feasible
-                and cand["completion_slack"] >= 0
-                and cand["graph"].number_of_edges() < int(n_edges)
-            ):
-                terminal_completion_possible = (
-                    self._has_final_feasible_completion_within_budget(
-                        cand["graph"],
-                        n_edges=n_edges,
-                        max_total_edges=max_total_edges,
-                    )
-                )
             if not is_partial_feasible:
                 cand["feasibility_stage"] = "partial"
                 self._mark_trace_state_status(cand, "partial_infeasible")
                 infeasible_candidates.append(cand)
-            elif cand["completion_slack"] < 0:
-                cand["feasibility_stage"] = "completion"
-                self._mark_trace_state_status(cand, "completion_infeasible")
+            elif cand["graph"].number_of_edges() >= n_edges:
+                partial_terminal_candidates.append(cand)
+            elif self._is_lookahead_infeasible(
+                cand,
+                violation_count=lookahead_violation_count,
+                n_edges=n_edges,
+            ):
+                cand["feasibility_stage"] = "lookahead"
+                self._mark_trace_state_status(cand, "lookahead_infeasible")
                 infeasible_candidates.append(cand)
-            elif terminal_completion_possible is False:
-                cand["feasibility_stage"] = "completion"
-                cand["terminal_completion_infeasible"] = True
-                self._mark_trace_state_status(cand, "completion_infeasible")
-                infeasible_candidates.append(cand)
-            elif terminal_completion_possible is None:
-                cand["terminal_completion_unknown"] = True
-                if cand["graph"].number_of_edges() >= n_edges:
-                    partial_terminal_candidates.append(cand)
-                else:
-                    feasible_candidates.append(cand)
             else:
-                if cand["graph"].number_of_edges() >= n_edges:
-                    partial_terminal_candidates.append(cand)
-                else:
-                    feasible_candidates.append(cand)
+                feasible_candidates.append(cand)
         self._promote_final_feasible_candidates(
             partial_terminal_candidates,
             feasible_candidates=feasible_candidates,
             infeasible_candidates=infeasible_candidates,
         )
+
+    def _lookahead_violation_counts(self, graphs):
+        estimator = self.lookahead_feasibility_estimator
+        if estimator is None:
+            return np.zeros(len(graphs), dtype=float)
+        if not hasattr(estimator, "number_of_violations"):
+            raise ValueError(
+                "lookahead_feasibility_estimator must provide "
+                "number_of_violations(graphs)"
+            )
+        return np.asarray(estimator.number_of_violations(graphs), dtype=float).reshape(-1)
+
+    def _is_lookahead_infeasible(
+        self,
+        cand,
+        *,
+        violation_count,
+        n_edges: int,
+    ) -> bool:
+        if self.lookahead_feasibility_estimator is None:
+            return False
+        remaining_moves = int(n_edges) - cand["graph"].number_of_edges()
+        cand["lookahead_violation_count"] = float(violation_count)
+        cand["remaining_moves"] = int(remaining_moves)
+        return float(violation_count) > float(remaining_moves)
 
     def _promote_final_feasible_candidates(
         self,
@@ -2354,7 +2249,6 @@ class EdgeGenerator:
         feasible_candidates.sort(
             key=lambda cand: (
                 cand["selection_score"],
-                cand.get("completion_slack", 0),
             ),
             reverse=True,
         )
@@ -2445,25 +2339,15 @@ class EdgeGenerator:
             for cand in scored.get("infeasible_candidates", [])
             if cand.get("feasibility_stage") == "partial"
         )
-        completion_infeasible = sum(
-            1
-            for cand in scored.get("infeasible_candidates", [])
-            if cand.get("feasibility_stage") == "completion"
-        )
-        terminal_completion_infeasible = sum(
-            1
-            for cand in scored.get("infeasible_candidates", [])
-            if cand.get("terminal_completion_infeasible")
-        )
-        terminal_completion_unknown = sum(
-            1
-            for cand in scored.get("feasible_candidates", [])
-            if cand.get("terminal_completion_unknown")
-        )
         final_infeasible = sum(
             1
             for cand in scored.get("infeasible_candidates", [])
             if cand.get("feasibility_stage") == "final"
+        )
+        lookahead_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "lookahead"
         )
         partial_feasible = max(0, len(scored["generated"]) - partial_infeasible)
         line2 = (
@@ -2473,14 +2357,8 @@ class EdgeGenerator:
         )
         if partial_infeasible:
             line2 = f"{line2} partial_infeasible={partial_infeasible}"
-        if completion_infeasible:
-            line2 = f"{line2} completion_infeasible={completion_infeasible}"
-        if terminal_completion_infeasible:
-            line2 = (
-                f"{line2} terminal_completion_infeasible={terminal_completion_infeasible}"
-            )
-        if terminal_completion_unknown:
-            line2 = f"{line2} terminal_completion_unknown={terminal_completion_unknown}"
+        if lookahead_infeasible:
+            line2 = f"{line2} lookahead_infeasible={lookahead_infeasible}"
         if final_infeasible:
             line2 = f"{line2} final_infeasible={final_infeasible}"
         line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
@@ -2551,8 +2429,6 @@ class EdgeGenerator:
                 title_line1_parts.append(f"rep={cand.get('repulsion', 0.0):.3f}")
             if self.edge_risk_lambda > 0.0:
                 title_line1_parts.append(f"risk={cand.get('risk_score', 0.0):.3f}")
-            if cand.get("completion_slack") is not None:
-                title_line1_parts.append(f"slack={cand['completion_slack']}")
             if target_active:
                 title_line2_parts.append(f"tgt={cand.get('target_score', 0.0):.3f}")
             if title_line1_parts:
@@ -3077,6 +2953,8 @@ class EdgeGenerator:
     def _feasibility_estimator_for_stage(self, stage: str):
         if stage == "final":
             return self.final_feasibility_estimator
+        if stage == "lookahead":
+            return self.lookahead_feasibility_estimator
         return self.partial_feasibility_estimator
 
     def _annotate_infeasible_candidates_with_violations(self, candidates) -> None:

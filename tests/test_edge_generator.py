@@ -841,7 +841,7 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     out = capsys.readouterr().out
     assert (
         "generated=594 partial_feasible=180 viable=82 retained=1 tried=594 "
-        "partial_infeasible=414 completion_infeasible=98 final_infeasible=7"
+        "partial_infeasible=414 final_infeasible=7"
     ) in out
 
 
@@ -1124,7 +1124,7 @@ def test_trace_failure_ratio_counts_completion_and_blocked_failures() -> None:
     assert generator._trace_failure_ratio_for_state(decision["state_id"]) == pytest.approx(0.5)
 
 
-def test_completion_budget_prunes_candidates_that_cannot_be_connected() -> None:
+def test_partition_candidates_keeps_partial_feasible_non_terminal_candidates() -> None:
     class _AlwaysFeasibleEstimator:
         def predict(self, graphs):
             return np.ones(len(graphs), dtype=bool)
@@ -1157,170 +1157,9 @@ def test_completion_budget_prunes_candidates_that_cannot_be_connected() -> None:
         infeasible_candidates=infeasible_candidates,
     )
 
-    assert feasible_candidates == []
-    assert infeasible_candidates == [cand]
-    assert cand["feasibility_stage"] == "completion"
-    assert cand["completion_slack"] == -1
-
-
-def test_completion_budget_uses_hitting_set_over_final_node_violations() -> None:
-    class _AlwaysFeasibleEstimator:
-        def predict(self, graphs):
-            return np.ones(len(graphs), dtype=bool)
-
-    class _NodeViolationEstimator(_AlwaysFeasibleEstimator):
-        def __init__(self, node_sets):
-            self.node_sets = node_sets
-
-        def violating_node_labels_sets(self, graphs):
-            return [self.node_sets for _ in graphs]
-
-    generator = EdgeGenerator(
-        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
-        final_feasibility_estimator=_NodeViolationEstimator(
-            [
-                frozenset({0, 1}),
-                frozenset({1, 2}),
-                frozenset({1, 3}),
-            ]
-        ),
-        graph_estimator=object(),
-        require_single_connected_component=False,
-    )
-
-    graph = nx.Graph()
-    graph.add_nodes_from(range(4))
-
-    assert generator._minimum_edges_needed_for_completion(
-        graph,
-        generator.final_feasibility_estimator.violating_node_labels_sets([graph])[0],
-        max_total_edges=1,
-    ) == 1
-
-
-def test_completion_budget_prunes_disjoint_final_node_violations() -> None:
-    class _AlwaysFeasibleEstimator:
-        def predict(self, graphs):
-            return np.ones(len(graphs), dtype=bool)
-
-    class _NodeViolationEstimator(_AlwaysFeasibleEstimator):
-        def violating_node_labels_sets(self, graphs):
-            return [[frozenset({0}), frozenset({1}), frozenset({2})] for _ in graphs]
-
-    generator = EdgeGenerator(
-        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
-        final_feasibility_estimator=_NodeViolationEstimator(),
-        graph_estimator=object(),
-        require_single_connected_component=False,
-    )
-    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
-    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
-
-    graph = nx.Graph()
-    graph.add_nodes_from(range(3))
-    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
-    cand = generator._make_state(graph, parent=root, score=None, depth=1)
-    feasible_candidates = []
-    infeasible_candidates = []
-
-    generator._partition_candidates_by_feasibility(
-        [cand],
-        n_edges=3,
-        max_total_edges=2,
-        target=None,
-        target_lambda=1.0,
-        feasible_candidates=feasible_candidates,
-        infeasible_candidates=infeasible_candidates,
-    )
-
-    assert feasible_candidates == []
-    assert infeasible_candidates == [cand]
-    assert cand["feasibility_stage"] == "completion"
-    assert cand["node_violation_completion_edges"] == 3
-    assert cand["completion_slack"] == -1
-
-
-def test_terminal_completion_lookahead_prunes_candidates_with_no_final_completion() -> None:
-    class _AlwaysFeasibleEstimator:
-        def predict(self, graphs):
-            return np.ones(len(graphs), dtype=bool)
-
-    class _RejectAllFinalEstimator:
-        def predict(self, graphs):
-            return np.zeros(len(graphs), dtype=bool)
-
-    generator = EdgeGenerator(
-        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
-        final_feasibility_estimator=_RejectAllFinalEstimator(),
-        graph_estimator=object(),
-        require_single_connected_component=False,
-    )
-    generator.edge_attribute_templates_ = [{}]
-    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
-    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
-
-    graph = nx.Graph()
-    graph.add_nodes_from(range(3))
-    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
-    cand = generator._make_state(graph, parent=root, score=None, depth=1)
-    feasible_candidates = []
-    infeasible_candidates = []
-
-    generator._partition_candidates_by_feasibility(
-        [cand],
-        n_edges=2,
-        max_total_edges=2,
-        target=None,
-        target_lambda=1.0,
-        feasible_candidates=feasible_candidates,
-        infeasible_candidates=infeasible_candidates,
-    )
-
-    assert feasible_candidates == []
-    assert infeasible_candidates == [cand]
-    assert cand["feasibility_stage"] == "completion"
-    assert cand["terminal_completion_infeasible"] is True
-
-
-def test_terminal_completion_lookahead_uses_full_remaining_edge_budget() -> None:
-    class _AlwaysFeasibleEstimator:
-        def predict(self, graphs):
-            return np.ones(len(graphs), dtype=bool)
-
-    class _RequireTwoEdgesFinalEstimator:
-        def predict(self, graphs):
-            return np.asarray([graph.number_of_edges() >= 2 for graph in graphs], dtype=bool)
-
-    generator = EdgeGenerator(
-        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
-        final_feasibility_estimator=_RequireTwoEdgesFinalEstimator(),
-        graph_estimator=object(),
-        require_single_connected_component=False,
-    )
-    generator.edge_attribute_templates_ = [{}]
-    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
-    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
-
-    graph = nx.Graph()
-    graph.add_nodes_from(range(3))
-    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
-    cand = generator._make_state(graph, parent=root, score=None, depth=1)
-    feasible_candidates = []
-    infeasible_candidates = []
-
-    generator._partition_candidates_by_feasibility(
-        [cand],
-        n_edges=2,
-        max_total_edges=2,
-        target=None,
-        target_lambda=1.0,
-        feasible_candidates=feasible_candidates,
-        infeasible_candidates=infeasible_candidates,
-    )
-
     assert feasible_candidates == [cand]
     assert infeasible_candidates == []
-    assert "terminal_completion_infeasible" not in cand
+    assert "feasibility_stage" not in cand
 
 
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:

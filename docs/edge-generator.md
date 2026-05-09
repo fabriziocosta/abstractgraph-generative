@@ -8,7 +8,6 @@
 - an optional target model to bias generation toward a requested class or value
 - an optional online edge-risk model to penalize edge decisions that tend to
   lead to infeasible descendants
-- a generic completion-budget guard for connectivity-constrained generation
 - an optional decomposition-aware training trajectory to bias reconstruction toward complete subgraphs
 - an optional stored retrieval corpus to select path-based fitting subsets from graph pairs
 - a beam search over partial constructions
@@ -92,7 +91,6 @@ generator = EdgeGenerator(
     max_beam_size=8,
     edge_risk_lambda=0.25,
     require_single_connected_component=True,
-    max_terminal_completion_lookahead_states=512,
     verbose=True,
     seed=0,
 ).fit(fit_graphs, fit_targets)
@@ -257,71 +255,9 @@ single connected component. If search reaches `n_edges` with a disconnected
 final-feasible graph, it can continue for a bounded number of extra edges to
 try to connect the remaining components.
 
-The search also applies generic completion-budget checks. For any candidate,
-the generator estimates whether the remaining edge budget can still reach a
-final-feasible solution.
-
-The first bound is connectivity:
-
-```text
-minimum_connecting_edges = connected_components - 1
-```
-
-The second bound uses final-estimator node diagnostics when the estimator
-exposes `violating_node_labels_sets(...)`. Each violating mapped-subgraph node
-set is treated as an obligation that must be affected by some future edge. To
-avoid over-counting overlapping neighborhoods and paths, the generator computes
-the minimum hitting-set size over those node sets:
-
-```text
-minimum_node_repair_edges = min |H| such that every violating node set intersects H
-```
-
-The completion lower bound is the maximum of the available bounds:
-
-```text
-completion_edges_needed = max(minimum_connecting_edges, minimum_node_repair_edges)
-completion_slack = remaining_allowed_edges - completion_edges_needed
-```
-
-Candidates with negative `completion_slack` are marked
-`completion_infeasible` and are not retained in the beam. This catches failures
-where no existing edge is individually wrong, but too many components or
-node-local final violations remain to finish the graph inside the edge budget.
-
-When the lower bound does not prove impossibility, the generator can also run a
-bounded terminal-completion lookahead. Starting from the candidate, it explores
-future edge additions up to the full remaining allowed edge budget and evaluates
-terminal completions with the final-feasibility estimator. If no terminal
-completion is final-feasible before the search space is exhausted, the candidate
-is marked `completion_infeasible` with
-`terminal_completion_infeasible=True`.
-
-The lookahead is controlled by
-`max_terminal_completion_lookahead_states`:
-
-```python
-generator = EdgeGenerator(
-    ...,
-    max_terminal_completion_lookahead_states=512,
-)
-```
-
-- use a larger value for smaller graphs or stricter repair diagnostics
-- use a smaller value when verbose repair becomes too slow
-- use `0` to disable terminal-completion lookahead
-
-If the cap is reached, the candidate is kept because impossibility was not
-proven. Verbose logs report this as `terminal_completion_unknown`.
-
 Verbose feasibility counts:
 
 - `partial_infeasible`: rejected by the partial estimator
-- `completion_infeasible`: rejected by budget or terminal-completion analysis
-- `terminal_completion_infeasible`: no final-feasible terminal completion exists
-  within the explored remaining budget
-- `terminal_completion_unknown`: lookahead reached its cap, so the candidate was
-  retained
 - `final_infeasible`: reached a terminal edge count but failed the final
   estimator
 
@@ -508,10 +444,8 @@ search descendants observed below it in the current search policy. This means:
   summarizes how much of its realized downstream subtree became infeasible
 
 Failures include partial-feasibility rejections, final-feasibility rejections,
-completion-budget failures, and blocked states where the beam cannot produce a
-solution. Completion-budget failures can come from weak connectivity or from the
-minimum hitting-set bound over final-estimator node violation sets. These cases
-are important when the problem is missing future edges rather than an explicitly
+and blocked states where the beam cannot produce a solution. These cases are
+important when the problem is missing future edges rather than an explicitly
 invalid existing edge: there may be no `violating_edge_sets(...)` evidence for
 surgical removal, but the transition can still train edge risk because its
 descendants ended in a dead end.
