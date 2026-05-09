@@ -3,6 +3,8 @@
 `EdgeGenerator` builds graphs by adding edges one step at a time, using:
 
 - a partial-stage feasibility model to reject invalid intermediate graphs
+- an optional lookahead feasibility model to prune candidates whose unresolved
+  final violations exceed the remaining edge budget
 - a final-graph feasibility model to validate completed graphs
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
