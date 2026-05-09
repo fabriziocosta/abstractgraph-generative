@@ -281,6 +281,7 @@ class ConditionalAutoregressiveGenerator:
         *,
         decomposition_function,
         nbits: int,
+        label_mode: str = "operator_hash",
         feasibility_estimator=None,
         base_cut_radius: Optional[int] = None,
         interpretation_cut_radius: Optional[int] = None,
@@ -297,6 +298,7 @@ class ConditionalAutoregressiveGenerator:
         Args:
             decomposition_function: Decomposition function for AbstractGraph conversion.
             nbits: Hash bit width for hashing base and interpretation neighborhoods.
+            label_mode: str = "operator_hash" (default) or "histogram" or "histogram_values" for AbstractGraph node labeling.
             feasibility_estimator: Optional final-graph feasibility estimator.
             base_cut_radius: Canonical radius for anchor neighborhood hashes.
             interpretation_cut_radius: Canonical radius for interpretation-node neighborhood hashes.
@@ -351,7 +353,7 @@ class ConditionalAutoregressiveGenerator:
             self.debug_level = max(1, requested_debug_level)
         else:
             self.debug_level = 0
-        self.label_mode = "operator_hash"
+        self.label_mode = label_mode
 
         self._components: dict[int, ComponentInstance] = {}
         self._bucket: dict[tuple[int, int], list[int]] = {}
