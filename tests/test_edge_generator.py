@@ -940,7 +940,7 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     lines = out.splitlines()
     assert "[graph 0] remaining_edges=2" in lines
     assert any(
-        line.startswith("fallback=2/5 depth=3 step_time=") and " eta=" in line
+        line.startswith("search_phase=2/5 depth=3 step_time=") and " eta=" in line
         for line in lines
     )
     assert (
@@ -1161,6 +1161,7 @@ def test_rollback_search_without_repair_logs_edge_risk_training_set_size(capsys)
     )
 
     out = capsys.readouterr().out
+    assert "[graph 0] repair_fallback=2/4" in out
     assert "edge_risk_training_set_size=12" in out
     assert "edge_risk_fit_time=0m 0.2s" in out
 

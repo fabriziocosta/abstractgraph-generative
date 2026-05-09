@@ -2333,7 +2333,7 @@ class EdgeGenerator:
         eta_str = self._format_minutes_seconds(remaining_edges * step_elapsed)
         line1 = f"[graph {graph_index}] remaining_edges={remaining_edges}"
         line2 = (
-            f"fallback={fallback_index + 2}/{total_phases} "
+            f"search_phase={fallback_index + 2}/{total_phases} "
             f"depth={next_depth} "
             f"step_time={self._format_minutes_seconds(step_elapsed)} eta={eta_str}"
         )
@@ -2398,12 +2398,12 @@ class EdgeGenerator:
             if remaining_fallbacks > 0:
                 log_lines.append(
                     f"[graph {graph_index}] BACKTRACK no feasible candidates remain; "
-                    f"{remaining_fallbacks} fallback phase(s) left"
+                    f"{remaining_fallbacks} search phase(s) left"
                 )
             else:
                 log_lines.append(
                     f"[graph {graph_index}] FAILED no feasible candidates remain; "
-                    "no fallback phases left"
+                    "no search phases left"
                 )
         print("\n".join(log_lines))
         self._draw_retained_candidates(
@@ -2509,7 +2509,7 @@ class EdgeGenerator:
                 current_edges = state["graph"].number_of_edges()
                 edge_shortfall = max(0, n_edges - current_edges)
                 print(
-                    f"[graph {graph_index}] solved fallback={fallback_index + 2}/{total_phases} "
+                    f"[graph {graph_index}] solved search_phase={fallback_index + 2}/{total_phases} "
                     f"depth={state['depth']} max_depth={self.max_depth_} "
                     f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
                     f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
@@ -2562,7 +2562,7 @@ class EdgeGenerator:
             current_edges = best_current["graph"].number_of_edges()
             edge_shortfall = max(0, n_edges - current_edges)
             print(
-                f"[graph {graph_index}] early_stop fallback={fallback_index + 2}/{total_phases} "
+                f"[graph {graph_index}] early_stop search_phase={fallback_index + 2}/{total_phases} "
                 f"depth={best_current['depth']} max_depth={self.max_depth_} "
                 f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
                 f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
@@ -2729,7 +2729,7 @@ class EdgeGenerator:
                 for state in repaired_beam
             ]
             fallback_parts = [
-                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks}",
+                f"[graph {graph_index}] repair_fallback={search['fallback_index'] + 1}/{n_fallbacks}",
                 f"rollback_steps={rollback_steps}",
                 f"surgical_repairs={len(repaired_beam)}",
                 f"to_depth={repaired_depth}",
@@ -2776,7 +2776,7 @@ class EdgeGenerator:
         )
         if verbose:
             fallback_parts = [
-                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks}",
+                f"[graph {graph_index}] repair_fallback={search['fallback_index'] + 1}/{n_fallbacks}",
                 f"rollback_steps={rollback_steps}",
                 f"to_depth={fallback_depth}",
                 f"beam_limit={beam_limit}",
@@ -2811,7 +2811,7 @@ class EdgeGenerator:
         n_fallbacks: int,
     ) -> None:
         print(
-            f"[graph {graph_index}] fallback={fallback_index + 2}/{total_phases} "
+            f"[graph {graph_index}] search_phase={fallback_index + 2}/{total_phases} "
             f"beam_limit={beam_limit}"
         )
 
