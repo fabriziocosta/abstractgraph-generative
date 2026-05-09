@@ -31,6 +31,27 @@ class _RecordingFeasibilityEstimator:
         return np.zeros(len(graphs), dtype=int)
 
 
+class _CountingViolationsFeasibilityEstimator(_RecordingFeasibilityEstimator):
+    def __init__(self, violations):
+        super().__init__("counting_violations")
+        self.violations = violations
+        self.number_of_violations_calls = []
+
+    def number_of_violations(self, graphs):
+        self.number_of_violations_calls.append([graph.copy() for graph in graphs])
+        if callable(self.violations):
+            return np.asarray([self.violations(graph) for graph in graphs], dtype=float)
+        return np.full(len(graphs), self.violations, dtype=float)
+
+
+class _NoNumberOfViolationsEstimator:
+    def fit(self, graphs):
+        return self
+
+    def predict(self, graphs):
+        return np.ones(len(graphs), dtype=bool)
+
+
 class _RejectEdgesFeasibilityEstimator(_RecordingFeasibilityEstimator):
     def __init__(self, rejected_edges):
         super().__init__("reject_edges")
@@ -415,11 +436,13 @@ def test_select_edges_for_surgical_repair_requires_violation_evidence() -> None:
 def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_sets() -> None:
     partial_estimator = _RecordingFeasibilityEstimator("partial")
     final_estimator = _RecordingFeasibilityEstimator("final")
+    lookahead_estimator = _RecordingFeasibilityEstimator("lookahead")
     graph_estimator = _RecordingGraphEstimator()
     generator = EdgeGenerator(
         feasibility_estimator=partial_estimator,
         partial_feasibility_estimator=partial_estimator,
         final_feasibility_estimator=final_estimator,
+        lookahead_feasibility_estimator=lookahead_estimator,
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
@@ -430,7 +453,49 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
 
     assert partial_estimator.fit_sizes == [2]
     assert final_estimator.fit_sizes == [1]
+    assert lookahead_estimator.fit_sizes == [1]
+    assert [
+        graph.number_of_edges() for graph in lookahead_estimator.fit_graphs[0]
+    ] == [graph.number_of_edges()]
     assert graph_estimator.fit_size > 0
+
+
+def test_fit_reuses_final_feasibility_estimator_for_lookahead_when_shared() -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        lookahead_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+
+    generator.fit([nx.path_graph(3)])
+
+    assert generator.lookahead_feasibility_estimator is generator.final_feasibility_estimator
+    assert final_estimator.fit_sizes == [1]
+
+
+def test_fit_copies_partial_feasibility_estimator_for_lookahead_when_shared() -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=_RecordingFeasibilityEstimator("final"),
+        lookahead_feasibility_estimator=partial_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+
+    generator.fit([nx.path_graph(3)])
+
+    assert generator.lookahead_feasibility_estimator is not partial_estimator
+    assert partial_estimator.fit_sizes == [2]
+    assert generator.lookahead_feasibility_estimator.fit_sizes == [1]
 
 
 def test_fit_can_skip_feasibility_graph_deduplication(monkeypatch) -> None:
@@ -809,6 +874,7 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     )
     generator.n_tried_ = 594
     partial_failure = {"feasibility_stage": "partial"}
+    lookahead_failure = {"feasibility_stage": "lookahead"}
     completion_failure = {"feasibility_stage": "completion"}
     final_failure = {"feasibility_stage": "final"}
 
@@ -820,6 +886,7 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
             "feasible_candidates": [{"graph": nx.path_graph(3)} for _ in range(82)],
             "infeasible_candidates": (
                 [partial_failure for _ in range(414)]
+                + [lookahead_failure for _ in range(5)]
                 + [completion_failure for _ in range(98)]
                 + [final_failure for _ in range(7)]
             ),
@@ -840,8 +907,9 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
 
     out = capsys.readouterr().out
     assert (
-        "generated=594 partial_feasible=180 viable=82 retained=1 tried=594 "
-        "partial_infeasible=414 final_infeasible=7"
+        "tried=594 generated=594 partial_infeasible=414 "
+        "lookahead_infeasible=5 partial_feasible=180 viable=82 retained=1 "
+        "final_infeasible=7"
     ) in out
 
 
@@ -1160,6 +1228,191 @@ def test_partition_candidates_keeps_partial_feasible_non_terminal_candidates() -
     assert feasible_candidates == [cand]
     assert infeasible_candidates == []
     assert "feasibility_stage" not in cand
+
+
+def test_partition_candidates_does_not_call_lookahead_when_omitted() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        graph_estimator=object(),
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=4,
+        max_total_edges=4,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == [cand]
+    assert infeasible_candidates == []
+    assert generator.lookahead_feasibility_estimator is None
+
+
+def test_partition_candidates_prunes_lookahead_violations_over_remaining_moves() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.zeros(len(graphs), dtype=int)
+
+    lookahead_estimator = _CountingViolationsFeasibilityEstimator(2)
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        lookahead_feasibility_estimator=lookahead_estimator,
+        graph_estimator=object(),
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=3,
+        max_total_edges=5,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == []
+    assert infeasible_candidates == [cand]
+    assert cand["feasibility_stage"] == "lookahead"
+    assert cand["lookahead_violation_count"] == pytest.approx(2.0)
+    assert cand["remaining_moves"] == 1
+
+
+def test_partition_candidates_keeps_lookahead_violations_equal_to_remaining_moves() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.zeros(len(graphs), dtype=int)
+
+    lookahead_estimator = _CountingViolationsFeasibilityEstimator(1)
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        lookahead_feasibility_estimator=lookahead_estimator,
+        graph_estimator=object(),
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=3,
+        max_total_edges=5,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == [cand]
+    assert infeasible_candidates == []
+    assert cand["lookahead_violation_count"] == pytest.approx(1.0)
+    assert cand["remaining_moves"] == 1
+
+
+def test_partition_candidates_skips_lookahead_for_terminal_candidates() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.zeros(len(graphs), dtype=int)
+
+    class _RejectFinalEstimator(_AlwaysFeasibleEstimator):
+        def predict(self, graphs):
+            return np.zeros(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_RejectFinalEstimator(),
+        lookahead_feasibility_estimator=_NoNumberOfViolationsEstimator(),
+        graph_estimator=object(),
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=2,
+        max_total_edges=5,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == []
+    assert infeasible_candidates == [cand]
+    assert cand["feasibility_stage"] == "final"
+
+
+def test_partition_candidates_requires_lookahead_number_of_violations() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.zeros(len(graphs), dtype=int)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        lookahead_feasibility_estimator=_NoNumberOfViolationsEstimator(),
+        graph_estimator=object(),
+    )
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+
+    with pytest.raises(ValueError, match="number_of_violations"):
+        generator._partition_candidates_by_feasibility(
+            [cand],
+            n_edges=3,
+            max_total_edges=5,
+            target=None,
+            target_lambda=1.0,
+            feasible_candidates=[],
+            infeasible_candidates=[],
+        )
 
 
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:

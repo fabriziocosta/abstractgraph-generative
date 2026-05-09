@@ -2350,17 +2350,24 @@ class EdgeGenerator:
             if cand.get("feasibility_stage") == "lookahead"
         )
         partial_feasible = max(0, len(scored["generated"]) - partial_infeasible)
-        line2 = (
-            f"generated={len(scored['generated'])} partial_feasible={partial_feasible} "
-            f"viable={len(scored['feasible_candidates'])} retained={len(retained)} "
-            f"tried={self.n_tried_}"
-        )
+        line2_parts = [
+            f"tried={self.n_tried_}",
+            f"generated={len(scored['generated'])}",
+        ]
         if partial_infeasible:
-            line2 = f"{line2} partial_infeasible={partial_infeasible}"
+            line2_parts.append(f"partial_infeasible={partial_infeasible}")
         if lookahead_infeasible:
-            line2 = f"{line2} lookahead_infeasible={lookahead_infeasible}"
+            line2_parts.append(f"lookahead_infeasible={lookahead_infeasible}")
+        line2_parts.extend(
+            [
+                f"partial_feasible={partial_feasible}",
+                f"viable={len(scored['feasible_candidates'])}",
+                f"retained={len(retained)}",
+            ]
+        )
         if final_infeasible:
-            line2 = f"{line2} final_infeasible={final_infeasible}"
+            line2_parts.append(f"final_infeasible={final_infeasible}")
+        line2 = " ".join(line2_parts)
         line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
         if target_active:
             line3_parts.append(
@@ -3720,6 +3727,7 @@ class EdgeGenerator:
             return 0.0
         failure_statuses = {
             "partial_infeasible",
+            "lookahead_infeasible",
             "final_infeasible",
             "completion_infeasible",
             "blocked",

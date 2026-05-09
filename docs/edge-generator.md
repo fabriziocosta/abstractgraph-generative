@@ -110,6 +110,7 @@ Stored-corpus pair workflow:
 ```python
 generator = EdgeGenerator(
     partial_feasibility_estimator=partial_feasibility_estimator,
+    lookahead_feasibility_estimator=lookahead_feasibility_estimator,
     final_feasibility_estimator=final_feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
@@ -202,28 +203,47 @@ whose total node count is closest to the average node count of the two inputs.
 
 ## Feasibility Stages
 
-`EdgeGenerator` supports two feasibility models:
+`EdgeGenerator` supports three feasibility roles:
 
 - `partial_feasibility_estimator`: trained on partial reconstruction stages and
   used while edges are being added
+- `lookahead_feasibility_estimator`: optional estimator trained on full graphs
+  and used while edges are being added to reject candidates whose
+  `number_of_violations(...)` exceeds the remaining target-edge moves
 - `final_feasibility_estimator`: trained on full graphs and used only when a
   candidate has reached the requested final edge count
 
-This is useful when some constraints should apply only to completed graphs. For
-example, an intermediate graph may temporarily contain aromatic bonds that do
-not yet form a full aromatic cycle, while the final graph must satisfy that
+This is useful when some constraints should apply only to completed graphs, but
+still expose a direct count of unresolved final violations during construction.
+For example, an intermediate graph may temporarily contain aromatic bonds that
+do not yet form a full aromatic cycle, while the final graph must satisfy that
 constraint.
 
 Backward compatibility:
 
 - if you pass only `feasibility_estimator=...`, the generator uses it as the
   partial estimator and deep-copies it for the final estimator
+- lookahead pruning is disabled unless `lookahead_feasibility_estimator` is
+  explicitly provided
 
 Training behavior:
 
 - the partial estimator is fit on the fragment set used during edge-regression
   training
 - the final estimator is fit only on the full seed graphs
+- the lookahead estimator is fit on the same full seed graphs as the final
+  estimator
+
+Lookahead pruning contract:
+
+```text
+remaining_moves = target_edges - candidate_edges
+keep_candidate = number_of_violations(candidate) <= remaining_moves
+```
+
+If `lookahead_feasibility_estimator` is provided, it must implement
+`number_of_violations(graphs)`. The check applies only to non-terminal
+candidates; terminal candidates are still validated by `final_feasibility_estimator`.
 
 ## Generate Semantics
 
@@ -258,6 +278,8 @@ try to connect the remaining components.
 Verbose feasibility counts:
 
 - `partial_infeasible`: rejected by the partial estimator
+- `lookahead_infeasible`: rejected because lookahead violations exceed the
+  remaining target-edge moves
 - `final_infeasible`: reached a terminal edge count but failed the final
   estimator
 
