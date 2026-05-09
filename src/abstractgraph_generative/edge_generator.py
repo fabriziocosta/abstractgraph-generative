@@ -857,10 +857,12 @@ class EdgeGenerator:
             final_fit_sec = final_feasibility_fit_time - 60 * final_fit_min
             print(
                 f"[fit] partial_feasibility_graphs={len(partial_fit_graphs)} "
-                f"final_feasibility_graphs={len(final_fit_graphs)} "
                 f"positives={len(self.positives_)} negatives={len(self.negatives_)} "
                 f"dataset={len(self.dataset_)} "
-                f"partial_time={partial_fit_min}m {partial_fit_sec:.1f}s "
+                f"partial_time={partial_fit_min}m {partial_fit_sec:.1f}s"
+            )
+            print(
+                f"[fit] final_feasibility_graphs={len(final_fit_graphs)} "
                 f"final_time={final_fit_min}m {final_fit_sec:.1f}s"
             )
             if lookahead_feasibility_fit_time is not None:

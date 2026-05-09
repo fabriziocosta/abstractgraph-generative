@@ -460,6 +460,37 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
     assert graph_estimator.fit_size > 0
 
 
+def test_fit_logs_each_feasibility_estimator_on_its_own_line(capsys) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    lookahead_estimator = _RecordingFeasibilityEstimator("lookahead")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        lookahead_feasibility_estimator=lookahead_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+        verbose=True,
+    )
+
+    generator.fit([nx.path_graph(3)])
+
+    fit_lines = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("[fit]")
+    ]
+    assert "partial_feasibility_graphs=" in fit_lines[0]
+    assert "final_feasibility_graphs=" not in fit_lines[0]
+    assert "lookahead_feasibility_graphs=" not in fit_lines[0]
+    assert "final_feasibility_graphs=" in fit_lines[1]
+    assert "partial_feasibility_graphs=" not in fit_lines[1]
+    assert "lookahead_feasibility_graphs=" not in fit_lines[1]
+    assert "lookahead_feasibility_graphs=" in fit_lines[2]
+    assert "partial_feasibility_graphs=" not in fit_lines[2]
+    assert "final_feasibility_graphs=" not in fit_lines[2]
+
+
 def test_fit_reuses_final_feasibility_estimator_for_lookahead_when_shared() -> None:
     partial_estimator = _RecordingFeasibilityEstimator("partial")
     final_estimator = _RecordingFeasibilityEstimator("final")
