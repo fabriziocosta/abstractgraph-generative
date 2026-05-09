@@ -937,6 +937,12 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     )
 
     out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert "[graph 0] remaining_edges=2" in lines
+    assert any(
+        line.startswith("fallback=2/5 depth=3 step_time=") and " eta=" in line
+        for line in lines
+    )
     assert (
         "tried=594 generated=594 partial_infeasible=414 "
         "partial_feasible=180 lookahead_infeasible=5 viable=82 retained=1 "

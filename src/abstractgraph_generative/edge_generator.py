@@ -2331,9 +2331,10 @@ class EdgeGenerator:
         )
         remaining_edges = max(0, n_edges - current_edges)
         eta_str = self._format_minutes_seconds(remaining_edges * step_elapsed)
-        line1 = (
-            f"[graph {graph_index}] fallback={fallback_index + 2}/{total_phases} "
-            f"depth={next_depth} remaining_edges={remaining_edges} "
+        line1 = f"[graph {graph_index}] remaining_edges={remaining_edges}"
+        line2 = (
+            f"fallback={fallback_index + 2}/{total_phases} "
+            f"depth={next_depth} "
             f"step_time={self._format_minutes_seconds(step_elapsed)} eta={eta_str}"
         )
         partial_infeasible = sum(
@@ -2352,46 +2353,46 @@ class EdgeGenerator:
             if cand.get("feasibility_stage") == "lookahead"
         )
         partial_feasible = max(0, len(scored["generated"]) - partial_infeasible)
-        line2_parts = [
+        line3_parts = [
             f"tried={self.n_tried_}",
             f"generated={len(scored['generated'])}",
         ]
         if partial_infeasible:
-            line2_parts.append(f"partial_infeasible={partial_infeasible}")
-        line2_parts.append(f"partial_feasible={partial_feasible}")
+            line3_parts.append(f"partial_infeasible={partial_infeasible}")
+        line3_parts.append(f"partial_feasible={partial_feasible}")
         if lookahead_infeasible:
-            line2_parts.append(f"lookahead_infeasible={lookahead_infeasible}")
-        line2_parts.extend(
+            line3_parts.append(f"lookahead_infeasible={lookahead_infeasible}")
+        line3_parts.extend(
             [
                 f"viable={len(scored['feasible_candidates'])}",
                 f"retained={len(retained)}",
             ]
         )
         if final_infeasible:
-            line2_parts.append(f"final_infeasible={final_infeasible}")
-        line2 = " ".join(line2_parts)
-        line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
+            line3_parts.append(f"final_infeasible={final_infeasible}")
+        line3 = " ".join(line3_parts)
+        line4_parts = [f"best_score={self._format_optional_score(best_score)}"]
         if target_active:
-            line3_parts.append(
+            line4_parts.append(
                 f"best_target_score={self._format_optional_score(best_target_score)}"
             )
         if target_active or repulsion_active:
-            line3_parts.append(
+            line4_parts.append(
                 f"best_selection_score={self._format_optional_score(best_selection_score)}"
             )
         if repulsion_active:
-            line3_parts.append(f"best_repulsion={best_repulsion:.3f}")
+            line4_parts.append(f"best_repulsion={best_repulsion:.3f}")
         if self.edge_risk_lambda > 0.0:
-            line3_parts.append(f"best_risk={best_risk:.3f}")
-        line4_parts = []
+            line4_parts.append(f"best_risk={best_risk:.3f}")
+        line5_parts = []
         if target_active:
-            line4_parts.append(f"target_lambda={target_lambda:.3f}")
+            line5_parts.append(f"target_lambda={target_lambda:.3f}")
         if repulsion_active:
-            line4_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
+            line5_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
         if self.edge_risk_lambda > 0.0 and self.edge_risk_estimator is not None:
-            line4_parts.append(f"edge_risk_lambda={self.edge_risk_lambda:.3f}")
-        line4_parts.append(f"beam_limit={beam_limit}")
-        log_lines = [line1, line2, " ".join(line3_parts), " ".join(line4_parts)]
+            line5_parts.append(f"edge_risk_lambda={self.edge_risk_lambda:.3f}")
+        line5_parts.append(f"beam_limit={beam_limit}")
+        log_lines = [line1, line2, line3, " ".join(line4_parts), " ".join(line5_parts)]
         if len(scored["feasible_candidates"]) == 0:
             remaining_fallbacks = max(0, total_phases - (fallback_index + 2))
             if remaining_fallbacks > 0:
