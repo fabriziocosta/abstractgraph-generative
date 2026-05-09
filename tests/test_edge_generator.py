@@ -939,7 +939,7 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     out = capsys.readouterr().out
     assert (
         "tried=594 generated=594 partial_infeasible=414 "
-        "lookahead_infeasible=5 partial_feasible=180 viable=82 retained=1 "
+        "partial_feasible=180 lookahead_infeasible=5 viable=82 retained=1 "
         "final_infeasible=7"
     ) in out
 

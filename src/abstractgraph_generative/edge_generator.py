@@ -2358,11 +2358,11 @@ class EdgeGenerator:
         ]
         if partial_infeasible:
             line2_parts.append(f"partial_infeasible={partial_infeasible}")
+        line2_parts.append(f"partial_feasible={partial_feasible}")
         if lookahead_infeasible:
             line2_parts.append(f"lookahead_infeasible={lookahead_infeasible}")
         line2_parts.extend(
             [
-                f"partial_feasible={partial_feasible}",
                 f"viable={len(scored['feasible_candidates'])}",
                 f"retained={len(retained)}",
             ]
