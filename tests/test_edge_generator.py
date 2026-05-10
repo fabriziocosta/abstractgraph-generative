@@ -744,6 +744,79 @@ def test_repair_can_skip_label_set_coverage_check_when_configured(monkeypatch) -
     assert generator.last_repair_label_set_mismatch_ is None
 
 
+def test_repair_attempt_log_reports_removed_edge_count_and_titles(
+    monkeypatch, capsys
+) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RecordingFeasibilityEstimator("final")
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        graph_estimator=graph_estimator,
+    )
+    input_graph = nx.path_graph(4)
+    feasible_graph = input_graph.copy()
+    feasible_graph.remove_edges_from([(0, 1), (1, 2)])
+    repair_context = {
+        "graph": input_graph.copy(),
+        "query_index": None,
+        "neighbor_indices": [0],
+        "neighbor_distances": [0.0],
+        "fit_graphs": [input_graph.copy()],
+        "fit_targets": None,
+    }
+    draw_calls = []
+
+    def fake_draw(graphs, **kwargs):
+        draw_calls.append((graphs, kwargs))
+
+    monkeypatch.setattr(generator, "_require_stored_dataset", lambda: None)
+    monkeypatch.setattr(
+        generator,
+        "_prepare_repair_training_context",
+        lambda graph, *, n_neighbors: repair_context,
+    )
+    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(generator, "_fit_pair_training_graphs", lambda *args, **kwargs: None)
+    monkeypatch.setattr(generator.final_feasibility_estimator, "predict", lambda graphs: np.asarray([False]))
+    monkeypatch.setattr(
+        generator,
+        "_build_repair_start_states",
+        lambda *args, **kwargs: [
+            {
+                "graph": feasible_graph,
+                "repair_removed_edges": ((0, 1), (1, 2)),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        generator,
+        "generate",
+        lambda *args, **kwargs: [feasible_graph],
+    )
+
+    repaired = generator.repair(
+        input_graph,
+        n_neighbors=1,
+        draw_graphs_fn=fake_draw,
+        verbose=True,
+    )
+
+    out = capsys.readouterr().out
+    assert "removed_edges=2" in out
+    assert "removed_edges=[(0, 1), (1, 2)]" not in out
+    assert len(repaired) == 2
+    assert sorted(repaired[0].edges()) == sorted(input_graph.edges())
+    assert sorted(repaired[1].edges()) == sorted(feasible_graph.edges())
+    assert len(draw_calls) == 1
+    assert draw_calls[0][1]["n_graphs_per_line"] == 2
+    assert draw_calls[0][1]["titles"] == [
+        "original input\nedges=3 target_edges=3",
+        "feasible input\nedges=1 removed_edges=2",
+    ]
+
+
 def test_prepare_repair_training_context_prioritizes_neighbor_label_set_coverage() -> None:
     generator = EdgeGenerator(
         feasibility_estimator=object(),
@@ -1067,6 +1140,26 @@ def test_log_repair_training_context_draws_query_and_neighbors_on_separate_rows(
         "titles": ["nn:1", "nn:7"],
     }
     assert len(draw_calls[1][0]) == 2
+
+
+def test_draw_graphs_retries_with_titles_when_layout_kwargs_are_rejected() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    draw_calls = []
+
+    def fake_draw(graphs, **kwargs):
+        if "n_graphs_per_line" in kwargs:
+            raise TypeError("multiple values for n_graphs_per_line")
+        draw_calls.append((graphs, kwargs))
+
+    generator._draw_graphs(
+        fake_draw,
+        [nx.path_graph(2), nx.path_graph(3)],
+        n_graphs_per_line=2,
+        titles=["original input", "feasible input"],
+    )
+
+    assert len(draw_calls) == 1
+    assert draw_calls[0][1] == {"titles": ["original input", "feasible input"]}
 
 
 def test_remove_edges_is_deterministic_with_seed() -> None:

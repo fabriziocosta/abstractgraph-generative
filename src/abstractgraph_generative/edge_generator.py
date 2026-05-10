@@ -1305,8 +1305,9 @@ class EdgeGenerator:
                 removed_edges = repaired_state.get("repair_removed_edges", ())
                 print(
                     f"[repair] attempt={repair_index}/{len(repaired_states)} "
-                    f"start_edges={repaired_state['graph'].number_of_edges()} "
-                    f"target_edges={target_n_edges} removed_edges={list(removed_edges)}"
+                    f"original_edges={start_graph.number_of_edges()} "
+                    f"feasible_edges={repaired_state['graph'].number_of_edges()} "
+                    f"target_edges={target_n_edges} removed_edges={len(removed_edges)}"
                 )
                 self._draw_graphs(
                     draw_graphs_fn,
@@ -1314,11 +1315,11 @@ class EdgeGenerator:
                     n_graphs_per_line=2,
                     titles=[
                         (
-                            "current repair input\n"
+                            "original input\n"
                             f"edges={start_graph.number_of_edges()} target_edges={target_n_edges}"
                         ),
                         (
-                            "pruned repair start\n"
+                            "feasible input\n"
                             f"edges={repaired_state['graph'].number_of_edges()} "
                             f"removed_edges={len(removed_edges)}"
                         ),
@@ -3891,4 +3892,10 @@ class EdgeGenerator:
                     kwargs["titles"] = titles
                 draw_graphs_fn(graphs, **kwargs)
             except TypeError:
+                if titles is not None:
+                    try:
+                        draw_graphs_fn(graphs, titles=titles)
+                        return
+                    except TypeError:
+                        pass
                 draw_graphs_fn(graphs)
