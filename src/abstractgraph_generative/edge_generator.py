@@ -4,6 +4,7 @@ import copy
 import math
 import random
 import time
+import warnings
 from itertools import combinations, permutations
 from typing import Callable
 
@@ -722,6 +723,7 @@ class EdgeGenerator:
         self.last_repair_training_graphs_ = None
         self.last_repair_training_targets_ = None
         self.last_repair_label_set_mismatch_ = None
+        self.last_lookahead_failsafe_ = None
 
     def _resolve_feasibility_estimators(
         self,
@@ -821,6 +823,9 @@ class EdgeGenerator:
         self.seed_graphs_ = [graph.copy() for graph in graph_list]
         dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
         self._store_graph_estimator_training_data(dataset_parts)
+        self._lookahead_failsafe_examples_ = (
+            self._lookahead_failsafe_examples_from_dataset_parts(dataset_parts)
+        )
 
         partial_fit_graphs = (
             list(self.seed_graphs_)
@@ -1280,6 +1285,7 @@ class EdgeGenerator:
             deduplicate_feasibility_graphs=False,
             partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
         )
+        self._deactivate_bad_repair_lookahead_feasibility_estimator(verbose=verbose)
 
         start_graph = graph.copy()
         target_n_edges = int(start_graph.number_of_edges())
@@ -1377,6 +1383,91 @@ class EdgeGenerator:
 
     def _repair_partial_feasibility_bootstrap_graphs(self, graph, fit_graphs):
         return [self._node_only_graph_copy(graph)]
+
+    def _lookahead_failsafe_examples_from_dataset_parts(self, dataset_parts):
+        examples = []
+        for seed_graph, (positives, _, _) in zip(self.seed_graphs_, dataset_parts):
+            final_n_edges = int(seed_graph.number_of_edges())
+            for positive_graph in positives:
+                remaining_edges = final_n_edges - int(positive_graph.number_of_edges())
+                if remaining_edges < 0:
+                    continue
+                examples.append((positive_graph.copy(), remaining_edges))
+        return examples
+
+    def _deactivate_bad_repair_lookahead_feasibility_estimator(
+        self,
+        *,
+        verbose: bool,
+    ) -> None:
+        self.last_lookahead_failsafe_ = None
+        if self.lookahead_feasibility_estimator is None:
+            return
+        examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
+        if not examples:
+            return
+
+        graphs = [graph for graph, _ in examples]
+        remaining_edges = np.asarray(
+            [remaining for _, remaining in examples],
+            dtype=float,
+        )
+        try:
+            violation_counts = self._lookahead_violation_counts(graphs)
+        except Exception as exc:
+            self.last_lookahead_failsafe_ = {
+                "checked": len(examples),
+                "false_infeasible": None,
+                "deactivated": True,
+                "error": str(exc),
+            }
+            warnings.warn(
+                "lookahead_feasibility_estimator failed repair failsafe validation "
+                f"on {len(examples)} known repair-positive graphs; deactivating "
+                f"lookahead pruning for this repair. error={exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if verbose:
+                print(
+                    "[repair] lookahead_failsafe deactivated=True "
+                    f"checked={len(examples)} error={exc}"
+                )
+            self.lookahead_feasibility_estimator = None
+            return
+
+        false_infeasible_mask = violation_counts > remaining_edges
+        false_infeasible_count = int(np.sum(false_infeasible_mask))
+        self.last_lookahead_failsafe_ = {
+            "checked": len(examples),
+            "false_infeasible": false_infeasible_count,
+            "deactivated": false_infeasible_count > 0,
+        }
+        if false_infeasible_count <= 0:
+            return
+
+        max_excess = float(
+            np.max(
+                violation_counts[false_infeasible_mask]
+                - remaining_edges[false_infeasible_mask]
+            )
+        )
+        warnings.warn(
+            "lookahead_feasibility_estimator marked "
+            f"{false_infeasible_count}/{len(examples)} known repair-positive "
+            "edge-removal graphs infeasible despite enough remaining edge moves; "
+            "deactivating lookahead pruning for this repair. "
+            f"max_excess_violations={max_excess:.3f}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        if verbose:
+            print(
+                "[repair] lookahead_failsafe deactivated=True "
+                f"false_infeasible={false_infeasible_count}/{len(examples)} "
+                f"max_excess_violations={max_excess:.3f}"
+            )
+        self.lookahead_feasibility_estimator = None
 
     def _cache_pair_session(
         self,

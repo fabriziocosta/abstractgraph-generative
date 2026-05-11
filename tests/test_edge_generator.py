@@ -679,7 +679,11 @@ def test_repair_allows_extra_neighbor_labels_when_input_labels_are_covered(monke
         "_prepare_repair_training_context",
         lambda graph, *, n_neighbors: repair_context,
     )
-    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_log_repair_training_context",
+        lambda *args, **kwargs: None,
+    )
     monkeypatch.setattr(generator, "_fit_pair_training_graphs", lambda *args, **kwargs: None)
     monkeypatch.setattr(generator.final_feasibility_estimator, "predict", lambda graphs: np.asarray([True]))
 
@@ -724,7 +728,11 @@ def test_repair_can_skip_label_set_coverage_check_when_configured(monkeypatch) -
         "_prepare_repair_training_context",
         lambda graph, *, n_neighbors: repair_context,
     )
-    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_log_repair_training_context",
+        lambda *args, **kwargs: None,
+    )
 
     def fake_fit(*args, **kwargs):
         fit_called["value"] = True
@@ -815,6 +823,125 @@ def test_repair_attempt_log_reports_removed_edge_count_and_titles(
         "original input\nedges=3 target_edges=3",
         "feasible input\nedges=1 removed_edges=2",
     ]
+
+
+def test_repair_deactivates_bad_lookahead_estimator_after_local_fit(
+    monkeypatch, recwarn
+) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RejectEdgesFeasibilityEstimator([(0, 1)])
+    lookahead_estimator = _CountingViolationsFeasibilityEstimator(99)
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        lookahead_feasibility_estimator=lookahead_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+    input_graph = nx.path_graph(4)
+    feasible_graph = input_graph.copy()
+    feasible_graph.remove_edge(0, 1)
+    repair_context = {
+        "graph": input_graph.copy(),
+        "query_index": None,
+        "neighbor_indices": [0],
+        "neighbor_distances": [0.0],
+        "fit_graphs": [input_graph.copy()],
+        "fit_targets": None,
+    }
+
+    monkeypatch.setattr(generator, "_require_stored_dataset", lambda: None)
+    monkeypatch.setattr(
+        generator,
+        "_prepare_repair_training_context",
+        lambda graph, *, n_neighbors: repair_context,
+    )
+    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_build_repair_start_states",
+        lambda *args, **kwargs: [
+            {
+                "graph": feasible_graph,
+                "repair_removed_edges": ((0, 1),),
+            }
+        ],
+    )
+
+    def fake_generate(*args, **kwargs):
+        assert generator.lookahead_feasibility_estimator is None
+        return [feasible_graph]
+
+    monkeypatch.setattr(generator, "generate", fake_generate)
+
+    repaired = generator.repair(input_graph, n_neighbors=1, return_path=False)
+
+    assert repaired is feasible_graph
+    assert generator.lookahead_feasibility_estimator is None
+    assert generator.last_lookahead_failsafe_ == {
+        "checked": 3,
+        "false_infeasible": 3,
+        "deactivated": True,
+    }
+    warning = recwarn.pop(RuntimeWarning)
+    assert "known repair-positive edge-removal graphs infeasible" in str(warning.message)
+
+
+def test_repair_keeps_valid_lookahead_estimator_after_local_fit(monkeypatch) -> None:
+    partial_estimator = _RecordingFeasibilityEstimator("partial")
+    final_estimator = _RejectEdgesFeasibilityEstimator([(0, 1)])
+    lookahead_estimator = _CountingViolationsFeasibilityEstimator(0)
+    graph_estimator = _RecordingGraphEstimator()
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=partial_estimator,
+        final_feasibility_estimator=final_estimator,
+        lookahead_feasibility_estimator=lookahead_estimator,
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+    )
+    input_graph = nx.path_graph(4)
+    feasible_graph = input_graph.copy()
+    feasible_graph.remove_edge(0, 1)
+    repair_context = {
+        "graph": input_graph.copy(),
+        "query_index": None,
+        "neighbor_indices": [0],
+        "neighbor_distances": [0.0],
+        "fit_graphs": [input_graph.copy()],
+        "fit_targets": None,
+    }
+
+    monkeypatch.setattr(generator, "_require_stored_dataset", lambda: None)
+    monkeypatch.setattr(
+        generator,
+        "_prepare_repair_training_context",
+        lambda graph, *, n_neighbors: repair_context,
+    )
+    monkeypatch.setattr(generator, "_log_repair_training_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        generator,
+        "_build_repair_start_states",
+        lambda *args, **kwargs: [
+            {
+                "graph": feasible_graph,
+                "repair_removed_edges": ((0, 1),),
+            }
+        ],
+    )
+    monkeypatch.setattr(generator, "generate", lambda *args, **kwargs: [feasible_graph])
+
+    repaired = generator.repair(input_graph, n_neighbors=1, return_path=False)
+
+    assert repaired is feasible_graph
+    assert generator.lookahead_feasibility_estimator is lookahead_estimator
+    assert generator.last_lookahead_failsafe_ == {
+        "checked": 3,
+        "false_infeasible": 0,
+        "deactivated": False,
+    }
 
 
 def test_prepare_repair_training_context_prioritizes_neighbor_label_set_coverage() -> None:
