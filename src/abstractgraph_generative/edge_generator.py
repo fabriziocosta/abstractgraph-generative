@@ -525,7 +525,6 @@ class EdgeGenerator:
         *,
         partial_feasibility_estimator=None,
         final_feasibility_estimator=None,
-        lookahead_feasibility_estimator=None,
         n_negative_per_positive: int = 3,
         n_replicates: int = 1,
         beam_size: int = 10,
@@ -573,9 +572,6 @@ class EdgeGenerator:
             Estimator checked on intermediate states during search.
         final_feasibility_estimator : object, optional
             Estimator checked on terminal states with the requested edge count.
-        lookahead_feasibility_estimator : object, optional
-            Optional estimator checked on intermediate states by comparing
-            ``number_of_violations`` against the remaining target-edge budget.
         n_negative_per_positive : int, optional
             Number of negative graphs sampled per positive fragment during
             training-set construction.
@@ -642,12 +638,10 @@ class EdgeGenerator:
         (
             self.partial_feasibility_estimator,
             self.final_feasibility_estimator,
-            self.lookahead_feasibility_estimator,
         ) = self._resolve_feasibility_estimators(
             feasibility_estimator=feasibility_estimator,
             partial_feasibility_estimator=partial_feasibility_estimator,
             final_feasibility_estimator=final_feasibility_estimator,
-            lookahead_feasibility_estimator=lookahead_feasibility_estimator,
         )
         if graph_estimator is None:
             raise ValueError("graph_estimator is required")
@@ -723,6 +717,8 @@ class EdgeGenerator:
         self.last_repair_training_graphs_ = None
         self.last_repair_training_targets_ = None
         self.last_repair_label_set_mismatch_ = None
+        self.lookahead_violation_thresholds_ = None
+        self.lookahead_pruning_active_ = False
         self.last_lookahead_failsafe_ = None
 
     def _resolve_feasibility_estimators(
@@ -731,7 +727,6 @@ class EdgeGenerator:
         feasibility_estimator,
         partial_feasibility_estimator,
         final_feasibility_estimator,
-        lookahead_feasibility_estimator,
     ):
         resolved_partial = (
             partial_feasibility_estimator
@@ -750,40 +745,7 @@ class EdgeGenerator:
             )
         if resolved_partial is resolved_final:
             resolved_final = copy.deepcopy(resolved_final)
-        resolved_lookahead = self._resolve_lookahead_feasibility_estimator(
-            lookahead_feasibility_estimator,
-            resolved_partial=resolved_partial,
-            resolved_final=resolved_final,
-            feasibility_estimator=feasibility_estimator,
-            partial_feasibility_estimator=partial_feasibility_estimator,
-            final_feasibility_estimator=final_feasibility_estimator,
-        )
-        return resolved_partial, resolved_final, resolved_lookahead
-
-    def _resolve_lookahead_feasibility_estimator(
-        self,
-        lookahead_feasibility_estimator,
-        *,
-        resolved_partial,
-        resolved_final,
-        feasibility_estimator,
-        partial_feasibility_estimator,
-        final_feasibility_estimator,
-    ):
-        if lookahead_feasibility_estimator is None:
-            return None
-        if (
-            lookahead_feasibility_estimator is resolved_final
-            or lookahead_feasibility_estimator is final_feasibility_estimator
-        ):
-            return resolved_final
-        if (
-            lookahead_feasibility_estimator is resolved_partial
-            or lookahead_feasibility_estimator is partial_feasibility_estimator
-            or lookahead_feasibility_estimator is feasibility_estimator
-        ):
-            return copy.deepcopy(lookahead_feasibility_estimator)
-        return lookahead_feasibility_estimator
+        return resolved_partial, resolved_final
 
     def fit(
         self,
@@ -804,10 +766,10 @@ class EdgeGenerator:
             Optional per-graph targets used to fit the target estimator on graph
             fragments.
         deduplicate_feasibility_graphs : bool, optional
-            Whether to deduplicate graphs before fitting partial, final, and
-            lookahead feasibility estimators. Repair-local fits can disable
-            this because their graph selection is already ID-based and only one
-            neighbor expansion is used.
+            Whether to deduplicate graphs before fitting partial and final
+            feasibility estimators. Repair-local fits can disable this because
+            their graph selection is already ID-based and only one neighbor
+            expansion is used.
         partial_feasibility_extra_graphs : iterable[nx.Graph], optional
             Extra graphs used only to fit the partial feasibility estimator.
             This is useful during repair to make node-only bootstrap states
@@ -845,16 +807,7 @@ class EdgeGenerator:
         final_feasibility_fit_start = time.perf_counter()
         self.final_feasibility_estimator.fit(final_fit_graphs)
         final_feasibility_fit_time = time.perf_counter() - final_feasibility_fit_start
-        lookahead_feasibility_fit_time = None
-        if (
-            self.lookahead_feasibility_estimator is not None
-            and self.lookahead_feasibility_estimator is not self.final_feasibility_estimator
-        ):
-            lookahead_feasibility_fit_start = time.perf_counter()
-            self.lookahead_feasibility_estimator.fit(final_fit_graphs)
-            lookahead_feasibility_fit_time = (
-                time.perf_counter() - lookahead_feasibility_fit_start
-            )
+        self._fit_lookahead_violation_envelope()
         if self.verbose:
             partial_fit_min = int(partial_feasibility_fit_time // 60)
             partial_fit_sec = partial_feasibility_fit_time - 60 * partial_fit_min
@@ -870,14 +823,10 @@ class EdgeGenerator:
                 f"[fit] final_feasibility_graphs={len(final_fit_graphs)} "
                 f"final_time={final_fit_min}m {final_fit_sec:.1f}s"
             )
-            if lookahead_feasibility_fit_time is not None:
-                lookahead_fit_min = int(lookahead_feasibility_fit_time // 60)
-                lookahead_fit_sec = (
-                    lookahead_feasibility_fit_time - 60 * lookahead_fit_min
-                )
+            if self.lookahead_pruning_active_:
                 print(
-                    f"[fit] lookahead_feasibility_graphs={len(final_fit_graphs)} "
-                    f"lookahead_time={lookahead_fit_min}m {lookahead_fit_sec:.1f}s"
+                    f"[fit] lookahead_envelope_stages={len(self.lookahead_violation_thresholds_)} "
+                    f"lookahead_examples={len(self._lookahead_failsafe_examples_)}"
                 )
 
         self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
@@ -1285,7 +1234,7 @@ class EdgeGenerator:
             deduplicate_feasibility_graphs=False,
             partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
         )
-        self._deactivate_bad_repair_lookahead_feasibility_estimator(verbose=verbose)
+        self._validate_repair_lookahead_envelope(verbose=verbose)
 
         start_graph = graph.copy()
         target_n_edges = int(start_graph.number_of_edges())
@@ -1395,23 +1344,63 @@ class EdgeGenerator:
                 examples.append((positive_graph.copy(), remaining_edges))
         return examples
 
-    def _deactivate_bad_repair_lookahead_feasibility_estimator(
+    def _fit_lookahead_violation_envelope(self) -> None:
+        self.lookahead_violation_thresholds_ = None
+        self.lookahead_pruning_active_ = False
+        examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
+        if not examples:
+            return
+        if not hasattr(self.final_feasibility_estimator, "number_of_violations"):
+            return
+
+        graphs = [graph for graph, _ in examples]
+        try:
+            violation_counts = np.asarray(
+                self.final_feasibility_estimator.number_of_violations(graphs),
+                dtype=float,
+            ).reshape(-1)
+        except Exception as exc:
+            warnings.warn(
+                "final_feasibility_estimator.number_of_violations failed while "
+                "calibrating lookahead pruning; lookahead pruning is disabled. "
+                f"error={exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        if len(violation_counts) != len(examples):
+            warnings.warn(
+                "final_feasibility_estimator.number_of_violations returned "
+                f"{len(violation_counts)} values for {len(examples)} graphs; "
+                "lookahead pruning is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        thresholds = {}
+        for (_, remaining_edges), violation_count in zip(examples, violation_counts):
+            remaining_edges = int(remaining_edges)
+            threshold = thresholds.get(remaining_edges)
+            if threshold is None or float(violation_count) > threshold:
+                thresholds[remaining_edges] = float(violation_count)
+        if not thresholds:
+            return
+        self.lookahead_violation_thresholds_ = thresholds
+        self.lookahead_pruning_active_ = True
+
+    def _validate_repair_lookahead_envelope(
         self,
         *,
         verbose: bool,
     ) -> None:
         self.last_lookahead_failsafe_ = None
-        if self.lookahead_feasibility_estimator is None:
+        if not self.lookahead_pruning_active_:
             return
         examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
         if not examples:
             return
 
         graphs = [graph for graph, _ in examples]
-        remaining_edges = np.asarray(
-            [remaining for _, remaining in examples],
-            dtype=float,
-        )
         try:
             violation_counts = self._lookahead_violation_counts(graphs)
         except Exception as exc:
@@ -1422,7 +1411,7 @@ class EdgeGenerator:
                 "error": str(exc),
             }
             warnings.warn(
-                "lookahead_feasibility_estimator failed repair failsafe validation "
+                "final_feasibility_estimator failed repair lookahead validation "
                 f"on {len(examples)} known repair-positive graphs; deactivating "
                 f"lookahead pruning for this repair. error={exc}",
                 RuntimeWarning,
@@ -1433,10 +1422,20 @@ class EdgeGenerator:
                     "[repair] lookahead_failsafe deactivated=True "
                     f"checked={len(examples)} error={exc}"
                 )
-            self.lookahead_feasibility_estimator = None
+            self.lookahead_pruning_active_ = False
             return
 
-        false_infeasible_mask = violation_counts > remaining_edges
+        thresholds = self.lookahead_violation_thresholds_ or {}
+        false_infeasible_mask = np.asarray(
+            [
+                float(violation_count) > float(thresholds[int(remaining_edges)])
+                for violation_count, (_, remaining_edges) in zip(
+                    violation_counts,
+                    examples,
+                )
+            ],
+            dtype=bool,
+        )
         false_infeasible_count = int(np.sum(false_infeasible_mask))
         self.last_lookahead_failsafe_ = {
             "checked": len(examples),
@@ -1446,16 +1445,20 @@ class EdgeGenerator:
         if false_infeasible_count <= 0:
             return
 
+        indexed_thresholds = np.asarray(
+            [thresholds[int(remaining_edges)] for _, remaining_edges in examples],
+            dtype=float,
+        )
         max_excess = float(
             np.max(
                 violation_counts[false_infeasible_mask]
-                - remaining_edges[false_infeasible_mask]
+                - indexed_thresholds[false_infeasible_mask]
             )
         )
         warnings.warn(
-            "lookahead_feasibility_estimator marked "
+            "final_feasibility_estimator lookahead envelope marked "
             f"{false_infeasible_count}/{len(examples)} known repair-positive "
-            "edge-removal graphs infeasible despite enough remaining edge moves; "
+            "edge-removal graphs infeasible; "
             "deactivating lookahead pruning for this repair. "
             f"max_excess_violations={max_excess:.3f}",
             RuntimeWarning,
@@ -1467,7 +1470,7 @@ class EdgeGenerator:
                 f"false_infeasible={false_infeasible_count}/{len(examples)} "
                 f"max_excess_violations={max_excess:.3f}"
             )
-        self.lookahead_feasibility_estimator = None
+        self.lookahead_pruning_active_ = False
 
     def _cache_pair_session(
         self,
@@ -2233,7 +2236,7 @@ class EdgeGenerator:
             )
             if is_partial_feasible and cand["graph"].number_of_edges() < int(n_edges)
         ]
-        if self.lookahead_feasibility_estimator is not None and lookahead_indices:
+        if self.lookahead_pruning_active_ and lookahead_indices:
             lookahead_graphs = [generated_graphs[idx] for idx in lookahead_indices]
             for idx, violation_count in zip(
                 lookahead_indices,
@@ -2280,15 +2283,17 @@ class EdgeGenerator:
         )
 
     def _lookahead_violation_counts(self, graphs):
-        estimator = self.lookahead_feasibility_estimator
-        if estimator is None:
+        if not self.lookahead_pruning_active_:
             return np.zeros(len(graphs), dtype=float)
-        if not hasattr(estimator, "number_of_violations"):
+        if not hasattr(self.final_feasibility_estimator, "number_of_violations"):
             raise ValueError(
-                "lookahead_feasibility_estimator must provide "
+                "final_feasibility_estimator must provide "
                 "number_of_violations(graphs)"
             )
-        return np.asarray(estimator.number_of_violations(graphs), dtype=float).reshape(-1)
+        return np.asarray(
+            self.final_feasibility_estimator.number_of_violations(graphs),
+            dtype=float,
+        ).reshape(-1)
 
     def _is_lookahead_infeasible(
         self,
@@ -2297,12 +2302,20 @@ class EdgeGenerator:
         violation_count,
         n_edges: int,
     ) -> bool:
-        if self.lookahead_feasibility_estimator is None:
+        if not self.lookahead_pruning_active_:
             return False
         remaining_moves = int(n_edges) - cand["graph"].number_of_edges()
+        threshold = self._lookahead_violation_threshold(remaining_moves)
+        if threshold is None:
+            return False
         cand["lookahead_violation_count"] = float(violation_count)
         cand["remaining_moves"] = int(remaining_moves)
-        return float(violation_count) > float(remaining_moves)
+        cand["lookahead_violation_threshold"] = float(threshold)
+        return float(violation_count) > float(threshold)
+
+    def _lookahead_violation_threshold(self, remaining_moves: int):
+        thresholds = self.lookahead_violation_thresholds_ or {}
+        return thresholds.get(int(remaining_moves))
 
     def _promote_final_feasible_candidates(
         self,
@@ -3056,7 +3069,7 @@ class EdgeGenerator:
         if stage == "final":
             return self.final_feasibility_estimator
         if stage == "lookahead":
-            return self.lookahead_feasibility_estimator
+            return self.final_feasibility_estimator
         return self.partial_feasibility_estimator
 
     def _annotate_infeasible_candidates_with_violations(self, candidates) -> None:

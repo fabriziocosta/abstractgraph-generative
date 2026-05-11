@@ -3,9 +3,9 @@
 `EdgeGenerator` builds graphs by adding edges one step at a time, using:
 
 - a partial-stage feasibility model to reject invalid intermediate graphs
-- an optional lookahead feasibility model to prune candidates whose unresolved
-  final violations exceed the remaining edge budget
 - a final-graph feasibility model to validate completed graphs
+- calibrated lookahead pruning from the final model's violation counts, when
+  available
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
 - an optional online edge-risk model to penalize edge decisions that tend to
@@ -112,7 +112,6 @@ Stored-corpus pair workflow:
 ```python
 generator = EdgeGenerator(
     partial_feasibility_estimator=partial_feasibility_estimator,
-    lookahead_feasibility_estimator=lookahead_feasibility_estimator,
     final_feasibility_estimator=final_feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
@@ -205,15 +204,18 @@ whose total node count is closest to the average node count of the two inputs.
 
 ## Feasibility Stages
 
-`EdgeGenerator` supports three feasibility roles:
+`EdgeGenerator` supports two feasibility estimators and one calibrated
+lookahead rule:
 
 - `partial_feasibility_estimator`: trained on partial reconstruction stages and
   used while edges are being added
-- `lookahead_feasibility_estimator`: optional estimator trained on full graphs
-  and used while edges are being added to reject candidates whose
-  `number_of_violations(...)` exceeds the remaining target-edge moves
 - `final_feasibility_estimator`: trained on full graphs and used only when a
   candidate has reached the requested final edge count
+- lookahead pruning: if the final estimator implements
+  `number_of_violations(graphs)`, the generator learns the maximum violation
+  count observed among positive edge-removal examples at each remaining-edge
+  distance from the final graph, then prunes only candidates exceeding that
+  stage-specific envelope
 
 This is useful when some constraints should apply only to completed graphs, but
 still expose a direct count of unresolved final violations during construction.
@@ -225,27 +227,29 @@ Backward compatibility:
 
 - if you pass only `feasibility_estimator=...`, the generator uses it as the
   partial estimator and deep-copies it for the final estimator
-- lookahead pruning is disabled unless `lookahead_feasibility_estimator` is
-  explicitly provided
+- lookahead pruning is disabled automatically if the final estimator does not
+  implement `number_of_violations(graphs)`
 
 Training behavior:
 
 - the partial estimator is fit on the fragment set used during edge-regression
   training
 - the final estimator is fit only on the full seed graphs
-- the lookahead estimator is fit on the same full seed graphs as the final
-  estimator
+- the lookahead envelope is calibrated from positive edge-removal fragments
+  after the final estimator has been fit
 
 Lookahead pruning contract:
 
 ```text
 remaining_moves = target_edges - candidate_edges
-keep_candidate = number_of_violations(candidate) <= remaining_moves
+threshold = max_positive_number_of_violations_seen_at[remaining_moves]
+keep_candidate = number_of_violations(candidate) <= threshold
 ```
 
-If `lookahead_feasibility_estimator` is provided, it must implement
-`number_of_violations(graphs)`. The check applies only to non-terminal
-candidates; terminal candidates are still validated by `final_feasibility_estimator`.
+If no positive examples were observed for a candidate's `remaining_moves`,
+lookahead pruning is skipped for that candidate. The check applies only to
+non-terminal candidates; terminal candidates are still validated by
+`final_feasibility_estimator`.
 
 ## Generate Semantics
 
@@ -280,8 +284,8 @@ try to connect the remaining components.
 Verbose feasibility counts:
 
 - `partial_infeasible`: rejected by the partial estimator
-- `lookahead_infeasible`: rejected because lookahead violations exceed the
-  remaining target-edge moves
+- `lookahead_infeasible`: rejected because final-estimator violation counts
+  exceed the learned positive envelope for that remaining-edge distance
 - `final_infeasible`: reached a terminal edge count but failed the final
   estimator
 
