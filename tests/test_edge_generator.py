@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -444,6 +446,7 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
     )
     graph = nx.path_graph(3)
 
@@ -466,6 +469,7 @@ def test_fit_logs_lookahead_envelope_when_final_estimator_supports_violations(ca
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
         verbose=True,
     )
 
@@ -496,12 +500,34 @@ def test_fit_disables_lookahead_when_final_estimator_has_no_violation_counts() -
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
     )
 
     generator.fit([nx.path_graph(3)])
 
     assert generator.lookahead_pruning_active_ is False
     assert generator.lookahead_violation_thresholds_ is None
+
+
+def test_constructor_validates_lookahead_rejection_options() -> None:
+    with pytest.raises(ValueError, match="lookahead_rejection_model"):
+        EdgeGenerator(
+            feasibility_estimator=object(),
+            graph_estimator=object(),
+            lookahead_rejection_model="bad",
+        )
+    with pytest.raises(ValueError, match="lookahead_rejection_quantile"):
+        EdgeGenerator(
+            feasibility_estimator=object(),
+            graph_estimator=object(),
+            lookahead_rejection_quantile=1.0,
+        )
+    with pytest.raises(ValueError, match="lookahead_rejection_temperature"):
+        EdgeGenerator(
+            feasibility_estimator=object(),
+            graph_estimator=object(),
+            lookahead_rejection_temperature=0.0,
+        )
 
 
 def test_fit_can_skip_feasibility_graph_deduplication(monkeypatch) -> None:
@@ -514,6 +540,7 @@ def test_fit_can_skip_feasibility_graph_deduplication(monkeypatch) -> None:
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
     )
     graph = nx.path_graph(3)
 
@@ -1519,6 +1546,7 @@ def test_partition_candidates_prunes_lookahead_violations_over_stage_envelope() 
         partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
         final_feasibility_estimator=_CountingViolationsFeasibilityEstimator(3),
         graph_estimator=object(),
+        lookahead_rejection_model="max_envelope",
     )
     generator.lookahead_pruning_active_ = True
     generator.lookahead_violation_thresholds_ = {1: 2.0}
@@ -1557,6 +1585,7 @@ def test_partition_candidates_keeps_lookahead_violations_equal_to_stage_envelope
         partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
         final_feasibility_estimator=_CountingViolationsFeasibilityEstimator(2),
         graph_estimator=object(),
+        lookahead_rejection_model="max_envelope",
     )
     generator.lookahead_pruning_active_ = True
     generator.lookahead_violation_thresholds_ = {1: 2.0}
@@ -1594,6 +1623,7 @@ def test_partition_candidates_skips_lookahead_when_stage_has_no_envelope() -> No
         partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
         final_feasibility_estimator=_CountingViolationsFeasibilityEstimator(99),
         graph_estimator=object(),
+        lookahead_rejection_model="max_envelope",
     )
     generator.lookahead_pruning_active_ = True
     generator.lookahead_violation_thresholds_ = {2: 0.0}
@@ -1618,6 +1648,87 @@ def test_partition_candidates_skips_lookahead_when_stage_has_no_envelope() -> No
     assert feasible_candidates == [cand]
     assert infeasible_candidates == []
     assert "lookahead_violation_count" not in cand
+
+
+def test_partition_candidates_samples_lognormal_tail_rejection() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_CountingViolationsFeasibilityEstimator(100),
+        graph_estimator=object(),
+        lookahead_rejection_model="lognormal_tail",
+        lookahead_rejection_quantile=0.0,
+        seed=0,
+    )
+    generator.lookahead_pruning_active_ = True
+    generator.lookahead_lognormal_params_ = {
+        1: {"n": 3, "mu": 0.0, "sigma": 1.0, "max": 2.0}
+    }
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=3,
+        max_total_edges=5,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == []
+    assert infeasible_candidates == [cand]
+    assert cand["feasibility_stage"] == "lookahead"
+    assert cand["lookahead_reject_prob"] > 0.99
+
+
+def test_partition_candidates_keeps_lognormal_tail_below_quantile() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_CountingViolationsFeasibilityEstimator(1),
+        graph_estimator=object(),
+        lookahead_rejection_model="lognormal_tail",
+        lookahead_rejection_quantile=0.95,
+        seed=0,
+    )
+    generator.lookahead_pruning_active_ = True
+    generator.lookahead_lognormal_params_ = {
+        1: {"n": 3, "mu": math.log1p(1.0), "sigma": 1.0, "max": 2.0}
+    }
+    generator._positive_scores = lambda graphs: np.asarray([0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.asarray([0.0], dtype=float)
+
+    root = generator._make_state(nx.path_graph(2), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(nx.path_graph(3), parent=root, score=None, depth=1)
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand],
+        n_edges=3,
+        max_total_edges=5,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+
+    assert feasible_candidates == [cand]
+    assert infeasible_candidates == []
+    assert cand["lookahead_reject_prob"] == pytest.approx(0.0)
 
 
 def test_partition_candidates_skips_lookahead_for_terminal_candidates() -> None:

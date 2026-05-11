@@ -547,6 +547,9 @@ class EdgeGenerator:
         early_stop_if_final_feasible: bool = True,
         require_single_connected_component: bool = True,
         enforce_repair_label_set_coverage: bool = True,
+        lookahead_rejection_model: str = "lognormal_tail",
+        lookahead_rejection_quantile: float = 0.95,
+        lookahead_rejection_temperature: float = 1.0,
     ):
         """Configure an edge-growing graph generator.
 
@@ -628,6 +631,17 @@ class EdgeGenerator:
             Whether ``repair(...)`` should fail early when the query graph has
             node labels that are absent from the selected repair neighborhood.
             Extra labels in the neighborhood are tolerated.
+        lookahead_rejection_model : str, optional
+            ``"lognormal_tail"`` samples candidate rejection from a per-stage
+            lognormal tail model fitted to final-estimator violation counts on
+            known positive fragments. ``"max_envelope"`` deterministically
+            rejects only counts above the maximum positive count seen at the
+            same remaining-edge distance.
+        lookahead_rejection_quantile : float, optional
+            Tail quantile below which ``"lognormal_tail"`` never rejects.
+        lookahead_rejection_temperature : float, optional
+            Positive exponent temperature applied to the sampled rejection
+            probability in ``"lognormal_tail"`` mode.
         Returns
         -------
         None
@@ -680,6 +694,17 @@ class EdgeGenerator:
         self.early_stop_if_final_feasible = early_stop_if_final_feasible
         self.require_single_connected_component = require_single_connected_component
         self.enforce_repair_label_set_coverage = bool(enforce_repair_label_set_coverage)
+        if lookahead_rejection_model not in {"max_envelope", "lognormal_tail"}:
+            raise ValueError(
+                "lookahead_rejection_model must be 'max_envelope' or 'lognormal_tail'"
+            )
+        if not 0.0 <= float(lookahead_rejection_quantile) < 1.0:
+            raise ValueError("lookahead_rejection_quantile must be in [0, 1)")
+        if float(lookahead_rejection_temperature) <= 0.0:
+            raise ValueError("lookahead_rejection_temperature must be > 0")
+        self.lookahead_rejection_model = lookahead_rejection_model
+        self.lookahead_rejection_quantile = float(lookahead_rejection_quantile)
+        self.lookahead_rejection_temperature = float(lookahead_rejection_temperature)
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -718,6 +743,7 @@ class EdgeGenerator:
         self.last_repair_training_targets_ = None
         self.last_repair_label_set_mismatch_ = None
         self.lookahead_violation_thresholds_ = None
+        self.lookahead_lognormal_params_ = None
         self.lookahead_pruning_active_ = False
         self.last_lookahead_failsafe_ = None
 
@@ -826,7 +852,8 @@ class EdgeGenerator:
             if self.lookahead_pruning_active_:
                 print(
                     f"[fit] lookahead_envelope_stages={len(self.lookahead_violation_thresholds_)} "
-                    f"lookahead_examples={len(self._lookahead_failsafe_examples_)}"
+                    f"lookahead_examples={len(self._lookahead_failsafe_examples_)} "
+                    f"lookahead_rejection_model={self.lookahead_rejection_model}"
                 )
 
         self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
@@ -1346,6 +1373,7 @@ class EdgeGenerator:
 
     def _fit_lookahead_violation_envelope(self) -> None:
         self.lookahead_violation_thresholds_ = None
+        self.lookahead_lognormal_params_ = None
         self.lookahead_pruning_active_ = False
         examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
         if not examples:
@@ -1378,15 +1406,35 @@ class EdgeGenerator:
             )
             return
         thresholds = {}
+        buckets = {}
         for (_, remaining_edges), violation_count in zip(examples, violation_counts):
             remaining_edges = int(remaining_edges)
+            violation_count = float(violation_count)
             threshold = thresholds.get(remaining_edges)
-            if threshold is None or float(violation_count) > threshold:
-                thresholds[remaining_edges] = float(violation_count)
+            if threshold is None or violation_count > threshold:
+                thresholds[remaining_edges] = violation_count
+            buckets.setdefault(remaining_edges, []).append(violation_count)
         if not thresholds:
             return
         self.lookahead_violation_thresholds_ = thresholds
+        self.lookahead_lognormal_params_ = self._fit_lookahead_lognormal_params(buckets)
         self.lookahead_pruning_active_ = True
+
+    def _fit_lookahead_lognormal_params(self, buckets):
+        params = {}
+        for remaining_edges, values in buckets.items():
+            log_values = np.log1p(np.asarray(values, dtype=float))
+            if log_values.size < 1:
+                continue
+            mu = float(np.mean(log_values))
+            sigma = float(np.std(log_values))
+            params[int(remaining_edges)] = {
+                "n": int(log_values.size),
+                "mu": mu,
+                "sigma": max(sigma, 1e-12),
+                "max": float(np.max(values)),
+            }
+        return params
 
     def _validate_repair_lookahead_envelope(
         self,
@@ -1395,6 +1443,15 @@ class EdgeGenerator:
     ) -> None:
         self.last_lookahead_failsafe_ = None
         if not self.lookahead_pruning_active_:
+            return
+        if self.lookahead_rejection_model != "max_envelope":
+            examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
+            self.last_lookahead_failsafe_ = {
+                "checked": len(examples),
+                "false_infeasible": 0,
+                "deactivated": False,
+                "model": self.lookahead_rejection_model,
+            }
             return
         examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
         if not examples:
@@ -2305,17 +2362,51 @@ class EdgeGenerator:
         if not self.lookahead_pruning_active_:
             return False
         remaining_moves = int(n_edges) - cand["graph"].number_of_edges()
-        threshold = self._lookahead_violation_threshold(remaining_moves)
-        if threshold is None:
-            return False
         cand["lookahead_violation_count"] = float(violation_count)
         cand["remaining_moves"] = int(remaining_moves)
-        cand["lookahead_violation_threshold"] = float(threshold)
-        return float(violation_count) > float(threshold)
+        if self.lookahead_rejection_model == "max_envelope":
+            threshold = self._lookahead_violation_threshold(remaining_moves)
+            if threshold is None:
+                return False
+            cand["lookahead_violation_threshold"] = float(threshold)
+            return float(violation_count) > float(threshold)
+
+        reject_prob = self._lookahead_lognormal_reject_probability(
+            float(violation_count),
+            remaining_moves,
+        )
+        if reject_prob is None:
+            return False
+        cand["lookahead_reject_prob"] = float(reject_prob)
+        return self.rng.random() < float(reject_prob)
 
     def _lookahead_violation_threshold(self, remaining_moves: int):
         thresholds = self.lookahead_violation_thresholds_ or {}
         return thresholds.get(int(remaining_moves))
+
+    def _lookahead_lognormal_reject_probability(
+        self,
+        violation_count: float,
+        remaining_moves: int,
+    ):
+        params_by_stage = self.lookahead_lognormal_params_ or {}
+        params = params_by_stage.get(int(remaining_moves))
+        if params is None:
+            return None
+        sigma = float(params["sigma"])
+        if sigma <= 0.0:
+            return None
+        z = (math.log1p(max(0.0, float(violation_count))) - float(params["mu"])) / sigma
+        tail_prob = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        quantile = self.lookahead_rejection_quantile
+        if tail_prob <= quantile:
+            reject_prob = 0.0
+        else:
+            reject_prob = (tail_prob - quantile) / (1.0 - quantile)
+        reject_prob = min(1.0, max(0.0, reject_prob))
+        if reject_prob <= 0.0:
+            return 0.0
+        return reject_prob ** (1.0 / self.lookahead_rejection_temperature)
 
     def _promote_final_feasible_candidates(
         self,
