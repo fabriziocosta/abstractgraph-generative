@@ -2362,12 +2362,12 @@ class EdgeGenerator:
         if not self.lookahead_pruning_active_:
             return False
         remaining_moves = int(n_edges) - cand["graph"].number_of_edges()
-        cand["lookahead_violation_count"] = float(violation_count)
-        cand["remaining_moves"] = int(remaining_moves)
         if self.lookahead_rejection_model == "max_envelope":
             threshold = self._lookahead_violation_threshold(remaining_moves)
             if threshold is None:
                 return False
+            cand["lookahead_violation_count"] = float(violation_count)
+            cand["remaining_moves"] = int(remaining_moves)
             cand["lookahead_violation_threshold"] = float(threshold)
             return float(violation_count) > float(threshold)
 
@@ -2377,6 +2377,8 @@ class EdgeGenerator:
         )
         if reject_prob is None:
             return False
+        cand["lookahead_violation_count"] = float(violation_count)
+        cand["remaining_moves"] = int(remaining_moves)
         cand["lookahead_reject_prob"] = float(reject_prob)
         return self.rng.random() < float(reject_prob)
 

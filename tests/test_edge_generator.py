@@ -510,6 +510,14 @@ def test_fit_disables_lookahead_when_final_estimator_has_no_violation_counts() -
 
 
 def test_constructor_validates_lookahead_rejection_options() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+    )
+    assert generator.lookahead_rejection_model == "lognormal_tail"
+    assert generator.lookahead_rejection_quantile == pytest.approx(0.95)
+    assert generator.lookahead_rejection_temperature == pytest.approx(1.0)
+
     with pytest.raises(ValueError, match="lookahead_rejection_model"):
         EdgeGenerator(
             feasibility_estimator=object(),
@@ -567,6 +575,7 @@ def test_fit_adds_extra_graphs_only_to_partial_feasibility_estimator() -> None:
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
     )
     graph = nx.path_graph(3)
     extra_graph = nx.empty_graph(3)
@@ -849,6 +858,7 @@ def test_repair_deactivates_inconsistent_lookahead_envelope_after_local_fit(
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
     )
     input_graph = nx.path_graph(4)
     feasible_graph = input_graph.copy()
@@ -913,6 +923,7 @@ def test_repair_keeps_valid_lookahead_envelope_after_local_fit(monkeypatch) -> N
         graph_estimator=graph_estimator,
         n_negative_per_positive=1,
         n_replicates=1,
+        lookahead_rejection_model="max_envelope",
     )
     input_graph = nx.path_graph(4)
     feasible_graph = input_graph.copy()

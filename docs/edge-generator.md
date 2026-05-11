@@ -4,8 +4,8 @@
 
 - a partial-stage feasibility model to reject invalid intermediate graphs
 - a final-graph feasibility model to validate completed graphs
-- calibrated lookahead pruning from the final model's violation counts, when
-  available
+- calibrated lookahead pruning from the final model's violation counts, using a
+  stochastic lognormal tail model by default
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
 - an optional online edge-risk model to penalize edge decisions that tend to
@@ -212,10 +212,9 @@ lookahead rule:
 - `final_feasibility_estimator`: trained on full graphs and used only when a
   candidate has reached the requested final edge count
 - lookahead pruning: if the final estimator implements
-  `number_of_violations(graphs)`, the generator learns the maximum violation
-  count observed among positive edge-removal examples at each remaining-edge
-  distance from the final graph, then prunes only candidates exceeding that
-  stage-specific envelope
+  `number_of_violations(graphs)`, the generator calibrates violation-count
+  behavior from positive edge-removal examples at each remaining-edge distance
+  from the final graph
 
 This is useful when some constraints should apply only to completed graphs, but
 still expose a direct count of unresolved final violations during construction.
@@ -235,10 +234,31 @@ Training behavior:
 - the partial estimator is fit on the fragment set used during edge-regression
   training
 - the final estimator is fit only on the full seed graphs
-- the lookahead envelope is calibrated from positive edge-removal fragments
-  after the final estimator has been fit
+- lookahead calibration is fit from positive edge-removal fragments after the
+  final estimator has been fit
 
-Lookahead pruning contract:
+Lookahead pruning modes:
+
+- `lookahead_rejection_model="lognormal_tail"` (default): fit a per-distance
+  lognormal model to `log1p(number_of_violations)` on positive fragments, then
+  sample rejection from the upper tail.
+- `lookahead_rejection_model="max_envelope"`: deterministically reject only
+  candidates whose violation count exceeds the maximum positive count seen at
+  the same remaining-edge distance.
+
+Default stochastic rejection:
+
+```text
+tail_prob = lognormal_cdf(number_of_violations(candidate))
+if tail_prob <= lookahead_rejection_quantile:
+    reject_prob = 0.0
+else:
+    reject_prob = (tail_prob - lookahead_rejection_quantile) / (1.0 - lookahead_rejection_quantile)
+reject_prob = reject_prob ** (1.0 / lookahead_rejection_temperature)
+reject = rng.random() < reject_prob
+```
+
+Deterministic envelope rejection:
 
 ```text
 remaining_moves = target_edges - candidate_edges
@@ -247,7 +267,7 @@ keep_candidate = number_of_violations(candidate) <= threshold
 ```
 
 If no positive examples were observed for a candidate's `remaining_moves`,
-lookahead pruning is skipped for that candidate. The check applies only to
+lookahead pruning is skipped for that candidate. Lookahead applies only to
 non-terminal candidates; terminal candidates are still validated by
 `final_feasibility_estimator`.
 
