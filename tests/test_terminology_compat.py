@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import warnings
+import random
 
 import networkx as nx
 
@@ -21,9 +21,31 @@ def test_conditional_component_builder_reads_mapped_subgraph() -> None:
     ag.create_interpretation_node_with_subgraph_from_nodes([1, 2])
 
     generator = ConditionalAutoregressiveGenerator(decomposition_function=lambda x: x, nbits=6)
-    component = generator._build_component_instance(ag, image_node=1, comp_id=7)
+    component = generator._build_component_instance(ag, interpretation_node=1, comp_id=7)
     assert component.comp_id == 7
+    assert isinstance(component.interpretation_type, int)
     assert component.subgraph.number_of_nodes() == 2
+
+
+def test_conditional_component_builder_accepts_directed_mapped_subgraph() -> None:
+    graph = nx.DiGraph()
+    graph.add_node(0, label="0")
+    graph.add_node(1, label="1")
+    graph.add_node(2, label="2")
+    graph.add_edge(0, 1, label="x")
+    graph.add_edge(1, 2, label="y")
+
+    ag = AbstractGraph(graph=graph)
+    ag.create_default_interpretation_node()
+    ag.create_interpretation_node_with_subgraph_from_edges([(0, 1)])
+    ag.create_interpretation_node_with_subgraph_from_edges([(1, 2)])
+
+    generator = ConditionalAutoregressiveGenerator(decomposition_function=lambda x: x, nbits=6)
+    component = generator._build_component_instance(ag, interpretation_node=1, comp_id=3)
+
+    assert component.comp_id == 3
+    assert component.subgraph.is_directed()
+    assert component.subgraph.number_of_edges() == 1
 
 
 def test_conditional_generator_supports_canonical_radius_names() -> None:
@@ -35,13 +57,6 @@ def test_conditional_generator_supports_canonical_radius_names() -> None:
     )
     assert generator.base_cut_radius == 2
     assert generator.interpretation_cut_radius == 3
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        assert generator.preimage_cut_radius == 2
-        assert generator.image_cut_radius == 3
-
-    assert len(caught) == 2
 
 
 def test_generate_accepts_interpretation_graphs_alias() -> None:
@@ -66,6 +81,60 @@ def test_generate_accepts_interpretation_graphs_alias() -> None:
         max_total_attempts=1,
     )
     assert isinstance(outputs, list)
+
+
+def test_conditional_generator_store_prepares_local_neighbor_context() -> None:
+    graphs = []
+    for n_nodes in (3, 4, 5):
+        graph = nx.path_graph(n_nodes)
+        for node in graph.nodes:
+            graph.nodes[node]["label"] = str(node % 2)
+        graphs.append(graph)
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=node_operator(),
+        nbits=6,
+        base_cut_radius=0,
+        interpretation_cut_radius=0,
+        n_jobs=1,
+    )
+    generator.store(graphs)
+
+    pool = generator._prepare_stored_generation_context(
+        rng=random.Random(0),
+        n_neighbors=1,
+    )
+
+    assert len(pool) == 1
+    assert generator.last_sampled_index_ is not None
+    assert len(generator.last_neighbor_indices_) == 1
+    assert len(generator.last_generation_training_graphs_) == 1
+    assert generator._is_fitted
+
+
+def test_conditional_generator_sample_alias_uses_generate(monkeypatch) -> None:
+    graph = nx.path_graph(3)
+    for node in graph.nodes:
+        graph.nodes[node]["label"] = str(node)
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=node_operator(),
+        nbits=6,
+        base_cut_radius=0,
+        interpretation_cut_radius=0,
+    )
+
+    seen = {}
+
+    def fake_generate(*, n_samples=1, **kwargs):
+        seen["n_samples"] = n_samples
+        seen["kwargs"] = kwargs
+        return [graph]
+
+    monkeypatch.setattr(generator, "generate", fake_generate)
+
+    assert generator.sample(n_samples=3, n_neighbors=2) == [graph]
+    assert seen == {"n_samples": 3, "kwargs": {"n_neighbors": 2}}
 
 
 def test_generate_pruning_sequences_supports_canonical_interpretation_aliases() -> None:

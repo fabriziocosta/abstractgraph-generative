@@ -59,7 +59,7 @@ from abstractgraph.hashing import GraphHashDeduper
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_generative.rewrite import iterated_rewrite, rewrite
 
-## rewrite is imported from abstractgraph_generative.graph_rewrite
+## rewrite is imported from abstractgraph_generative.rewrite
 
 
 def _precompute_neighbors(distances: np.ndarray, k: int) -> list[list[int]]:
@@ -77,7 +77,7 @@ def _precompute_neighbors(distances: np.ndarray, k: int) -> list[list[int]]:
     return neighbors
 
 
-## iterated_rewrite is imported from abstractgraph_generative.graph_rewrite
+## iterated_rewrite is imported from abstractgraph_generative.rewrite
 
 
 class InterpolationEstimator:

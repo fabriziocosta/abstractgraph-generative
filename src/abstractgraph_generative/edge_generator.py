@@ -4,19 +4,68 @@ import copy
 import math
 import random
 import time
+import warnings
 from itertools import combinations, permutations
 from typing import Callable
 
 import networkx as nx
 import numpy as np
 from joblib import Parallel, delayed
-from abstractgraph.graphs import graph_to_abstract_graph
-from abstractgraph.hashing import hash_graph
+from networkx.algorithms.graph_hashing import weisfeiler_lehman_graph_hash
+from abstractgraph.graphs import graph_to_abstract_graph, is_simple_graph
+from abstractgraph.hashing import canonical_bytes, hash_graph
 from sklearn.metrics import pairwise_distances
 from abstractgraph_generative.interpolate import _build_adjacency
 
 
 DrawGraphsFn = Callable[..., object]
+
+
+class _OnlineGraphRegressorAdapter:
+    """Online adapter for graph regressors with optional replay-backed fitting."""
+
+    def __init__(self, estimator) -> None:
+        self.estimator = estimator
+        self.estimator_ = copy.deepcopy(estimator)
+        self.replay_graphs_ = []
+        self.replay_targets_ = []
+        self.n_training_examples_ = 0
+        self.is_fitted_ = False
+        self.supports_partial_fit_ = hasattr(self.estimator_, "partial_fit")
+        self.last_fit_time_seconds_ = 0.0
+
+    def partial_fit(self, graphs, targets):
+        graph_list = [graph.copy() for graph in graphs]
+        target_array = np.asarray(targets, dtype=float).reshape(-1)
+        if len(graph_list) != len(target_array):
+            raise ValueError("graphs and targets must have the same length")
+        if not graph_list:
+            return self
+
+        self.n_training_examples_ += len(graph_list)
+        fit_start = time.perf_counter()
+        if self.supports_partial_fit_:
+            self.estimator_.partial_fit(graph_list, target_array)
+        else:
+            self.replay_graphs_.extend(graph_list)
+            self.replay_targets_.extend(target_array.tolist())
+            self.estimator_ = copy.deepcopy(self.estimator)
+            self.estimator_.fit(self.replay_graphs_, self.replay_targets_)
+        self.last_fit_time_seconds_ = time.perf_counter() - fit_start
+        self.is_fitted_ = True
+        return self
+
+    def predict(self, graphs):
+        if not self.is_fitted_:
+            return np.zeros(len(graphs), dtype=float)
+        predictions = self.estimator_.predict(graphs)
+        return np.asarray(predictions, dtype=float).reshape(-1)
+
+    def training_set_size(self) -> int:
+        return int(self.n_training_examples_)
+
+    def last_fit_time_seconds(self) -> float:
+        return float(self.last_fit_time_seconds_)
 
 
 def mix_connected_components(
@@ -470,6 +519,7 @@ class EdgeGenerator:
         feasibility_estimator=None,
         graph_estimator=None,
         target_estimator=None,
+        edge_risk_estimator=None,
         target_estimator_mode: str = "classification",
         decomposition_function=None,
         *,
@@ -487,12 +537,19 @@ class EdgeGenerator:
         use_similarity_repulsion: bool = True,
         repulsion_weight: float = 0.2,
         repulsion_growth_factor: float = 1.5,
+        edge_risk_lambda: float = 0.0,
         max_repulsion_memory: int = 256,
         allow_self_loops: bool = False,
         fit_n_jobs: int = -1,
         fit_backend: str = "loky",
         verbose: bool = False,
         seed: int | None = None,
+        early_stop_if_final_feasible: bool = True,
+        require_single_connected_component: bool = True,
+        enforce_repair_label_set_coverage: bool = True,
+        lookahead_rejection_model: str = "lognormal_tail",
+        lookahead_rejection_quantile: float = 0.95,
+        lookahead_rejection_temperature: float = 1.0,
     ):
         """Configure an edge-growing graph generator.
 
@@ -506,6 +563,8 @@ class EdgeGenerator:
             during beam search.
         target_estimator : object, optional
             Optional estimator used to score graphs against a requested target.
+        edge_risk_estimator : object, optional
+            Optional estimator used to learn online edge-materialization risk.
         target_estimator_mode : str, optional
             ``"classification"`` to match a class label or ``"regression"`` to
             prefer predictions close to a numeric target.
@@ -544,6 +603,8 @@ class EdgeGenerator:
             Base weight of the similarity-repulsion penalty.
         repulsion_growth_factor : float, optional
             Multiplicative growth of repulsion during fallback phases.
+        edge_risk_lambda : float, optional
+            Weight of the edge-risk penalty subtracted from selection scores.
         max_repulsion_memory : int, optional
             Maximum number of failed graph embeddings retained for repulsion.
         allow_self_loops : bool, optional
@@ -558,7 +619,29 @@ class EdgeGenerator:
         seed : int | None, optional
             Seed for the internal random number generator controlling sampling,
             fallback randomness, and pair-conditioned generation.
-
+        early_stop_if_final_feasible : bool, optional
+            Whether search may terminate before reaching ``n_edges`` when the
+            current graph already satisfies the final feasibility estimator and
+            every feasible one-edge expansion scores worse.
+        require_single_connected_component : bool, optional
+            Whether final-feasible graphs with more than one connected
+            component should continue growing past ``n_edges`` until a single
+            connected component is reached, within a bounded extra-edge window.
+        enforce_repair_label_set_coverage : bool, optional
+            Whether ``repair(...)`` should fail early when the query graph has
+            node labels that are absent from the selected repair neighborhood.
+            Extra labels in the neighborhood are tolerated.
+        lookahead_rejection_model : str, optional
+            ``"lognormal_tail"`` samples candidate rejection from a per-stage
+            lognormal tail model fitted to final-estimator violation counts on
+            known positive fragments. ``"max_envelope"`` deterministically
+            rejects only counts above the maximum positive count seen at the
+            same remaining-edge distance.
+        lookahead_rejection_quantile : float, optional
+            Tail quantile below which ``"lognormal_tail"`` never rejects.
+        lookahead_rejection_temperature : float, optional
+            Positive exponent temperature applied to the sampled rejection
+            probability in ``"lognormal_tail"`` mode.
         Returns
         -------
         None
@@ -580,6 +663,7 @@ class EdgeGenerator:
         self.feasibility_estimator = self.partial_feasibility_estimator
         self.graph_estimator = graph_estimator
         self.target_estimator = target_estimator
+        self.edge_risk_estimator = edge_risk_estimator
         if target_estimator_mode not in {"classification", "regression"}:
             raise ValueError(
                 "target_estimator_mode must be 'classification' or 'regression'"
@@ -600,12 +684,27 @@ class EdgeGenerator:
         self.use_similarity_repulsion = use_similarity_repulsion
         self.repulsion_weight = repulsion_weight
         self.repulsion_growth_factor = repulsion_growth_factor
+        self.edge_risk_lambda = edge_risk_lambda
         self.max_repulsion_memory = max_repulsion_memory
         self.allow_self_loops = allow_self_loops
         self.fit_n_jobs = fit_n_jobs
         self.fit_backend = fit_backend
         self.verbose = verbose
         self.seed = seed
+        self.early_stop_if_final_feasible = early_stop_if_final_feasible
+        self.require_single_connected_component = require_single_connected_component
+        self.enforce_repair_label_set_coverage = bool(enforce_repair_label_set_coverage)
+        if lookahead_rejection_model not in {"max_envelope", "lognormal_tail"}:
+            raise ValueError(
+                "lookahead_rejection_model must be 'max_envelope' or 'lognormal_tail'"
+            )
+        if not 0.0 <= float(lookahead_rejection_quantile) < 1.0:
+            raise ValueError("lookahead_rejection_quantile must be in [0, 1)")
+        if float(lookahead_rejection_temperature) <= 0.0:
+            raise ValueError("lookahead_rejection_temperature must be > 0")
+        self.lookahead_rejection_model = lookahead_rejection_model
+        self.lookahead_rejection_quantile = float(lookahead_rejection_quantile)
+        self.lookahead_rejection_temperature = float(lookahead_rejection_temperature)
         self.rng = random.Random(seed)
 
         # Learned datasets, search bookkeeping, and retrieval caches are
@@ -626,6 +725,12 @@ class EdgeGenerator:
         self.diversity_memory_hash_set_ = set()
         self.failed_memory_hashes_ = []
         self.failed_memory_hash_set_ = set()
+        self.edge_risk_model_ = (
+            None
+            if self.edge_risk_estimator is None
+            else _OnlineGraphRegressorAdapter(self.edge_risk_estimator)
+        )
+        self.edge_risk_trace_ = None
         self.stored_graphs_ = None
         self.stored_targets_ = None
         self.stored_graph_hash_to_index_ = {}
@@ -634,6 +739,13 @@ class EdgeGenerator:
         self.stored_distance_matrix_ = None
         self.surgical_backtracking_ = True
         self.last_pair_session_ = None
+        self.last_repair_training_graphs_ = None
+        self.last_repair_training_targets_ = None
+        self.last_repair_label_set_mismatch_ = None
+        self.lookahead_violation_thresholds_ = None
+        self.lookahead_lognormal_params_ = None
+        self.lookahead_pruning_active_ = False
+        self.last_lookahead_failsafe_ = None
 
     def _resolve_feasibility_estimators(
         self,
@@ -661,7 +773,14 @@ class EdgeGenerator:
             resolved_final = copy.deepcopy(resolved_final)
         return resolved_partial, resolved_final
 
-    def fit(self, graphs, targets=None):
+    def fit(
+        self,
+        graphs,
+        targets=None,
+        *,
+        deduplicate_feasibility_graphs: bool = True,
+        partial_feasibility_extra_graphs=None,
+    ):
         """Fit the generator from one or more training graphs.
 
         Parameters
@@ -672,6 +791,16 @@ class EdgeGenerator:
         targets : object | iterable[object], optional
             Optional per-graph targets used to fit the target estimator on graph
             fragments.
+        deduplicate_feasibility_graphs : bool, optional
+            Whether to deduplicate graphs before fitting partial and final
+            feasibility estimators. Repair-local fits can disable this because
+            their graph selection is already ID-based and only one neighbor
+            expansion is used.
+        partial_feasibility_extra_graphs : iterable[nx.Graph], optional
+            Extra graphs used only to fit the partial feasibility estimator.
+            This is useful during repair to make node-only bootstrap states
+            admissible without teaching the final feasibility estimator to
+            accept the repaired query graph.
 
         Returns
         -------
@@ -682,18 +811,29 @@ class EdgeGenerator:
         self.seed_graphs_ = [graph.copy() for graph in graph_list]
         dataset_parts = self._build_fragment_datasets(self.seed_graphs_)
         self._store_graph_estimator_training_data(dataset_parts)
+        self._lookahead_failsafe_examples_ = (
+            self._lookahead_failsafe_examples_from_dataset_parts(dataset_parts)
+        )
 
-        partial_fit_graphs = self._unique_graphs(
+        partial_fit_graphs = (
             list(self.seed_graphs_)
             + [graph for graph in self.positives_ if graph.number_of_edges() > 0]
         )
-        final_fit_graphs = self._unique_graphs(list(self.seed_graphs_))
+        final_fit_graphs = list(self.seed_graphs_)
+        if deduplicate_feasibility_graphs:
+            partial_fit_graphs = self._unique_graphs(partial_fit_graphs)
+            final_fit_graphs = self._unique_graphs(final_fit_graphs)
+        if partial_feasibility_extra_graphs is not None:
+            partial_fit_graphs.extend(
+                graph.copy() for graph in partial_feasibility_extra_graphs
+            )
         partial_feasibility_fit_start = time.perf_counter()
         self.partial_feasibility_estimator.fit(partial_fit_graphs)
         partial_feasibility_fit_time = time.perf_counter() - partial_feasibility_fit_start
         final_feasibility_fit_start = time.perf_counter()
         self.final_feasibility_estimator.fit(final_fit_graphs)
         final_feasibility_fit_time = time.perf_counter() - final_feasibility_fit_start
+        self._fit_lookahead_violation_envelope()
         if self.verbose:
             partial_fit_min = int(partial_feasibility_fit_time // 60)
             partial_fit_sec = partial_feasibility_fit_time - 60 * partial_fit_min
@@ -701,12 +841,20 @@ class EdgeGenerator:
             final_fit_sec = final_feasibility_fit_time - 60 * final_fit_min
             print(
                 f"[fit] partial_feasibility_graphs={len(partial_fit_graphs)} "
-                f"final_feasibility_graphs={len(final_fit_graphs)} "
                 f"positives={len(self.positives_)} negatives={len(self.negatives_)} "
                 f"dataset={len(self.dataset_)} "
-                f"partial_time={partial_fit_min}m {partial_fit_sec:.1f}s "
+                f"partial_time={partial_fit_min}m {partial_fit_sec:.1f}s"
+            )
+            print(
+                f"[fit] final_feasibility_graphs={len(final_fit_graphs)} "
                 f"final_time={final_fit_min}m {final_fit_sec:.1f}s"
             )
+            if self.lookahead_pruning_active_:
+                print(
+                    f"[fit] lookahead_envelope_stages={len(self.lookahead_violation_thresholds_)} "
+                    f"lookahead_examples={len(self._lookahead_failsafe_examples_)} "
+                    f"lookahead_rejection_model={self.lookahead_rejection_model}"
+                )
 
         self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
         train_graphs = [graph for graph, label in self.dataset_]
@@ -921,7 +1069,7 @@ class EdgeGenerator:
         graph_a=None,
         graph_b=None,
         *,
-        size_of_edge_removal=0.5,
+        size_of_edge_removal=None,
         n_paths: int = 3,
         path_k: int = 3,
         n_neighbors_per_path_graph: int = 3,
@@ -940,9 +1088,11 @@ class EdgeGenerator:
             omitted, the last cached pair session is reused.
         graph_b : nx.Graph | None, optional
             Second endpoint graph paired with ``graph_a``.
-        size_of_edge_removal : float | int, optional
+        size_of_edge_removal : float | int | None, optional
             Amount of edge pruning applied to each endpoint graph before
-            component mixing starts the generation process.
+            component mixing starts the generation process. When reusing a
+            cached pair session, the cached value is kept unless an explicit
+            override is provided here.
         n_paths : int, optional
             Number of shortest retrieval paths to extract between the endpoint
             graphs in the stored corpus.
@@ -976,6 +1126,10 @@ class EdgeGenerator:
 
         if graph_a is None and graph_b is None:
             session = self._require_cached_pair_session()
+            if size_of_edge_removal is not None:
+                session = dict(session)
+                session["size_of_edge_removal"] = float(size_of_edge_removal)
+                self.last_pair_session_ = session
             if verbose:
                 print("[pair] reusing cached pair session and fitted estimators")
             return self._generate_from_cached_pair_session(
@@ -987,6 +1141,9 @@ class EdgeGenerator:
             )
 
         self._require_stored_dataset()
+        resolved_size_of_edge_removal = (
+            0.5 if size_of_edge_removal is None else float(size_of_edge_removal)
+        )
         pair_context = self._prepare_pair_training_context(
             graph_a,
             graph_b,
@@ -1005,7 +1162,7 @@ class EdgeGenerator:
         self._cache_pair_session(
             graph_a=graph_a,
             graph_b=graph_b,
-            size_of_edge_removal=size_of_edge_removal,
+            size_of_edge_removal=resolved_size_of_edge_removal,
             target=resolved_target,
         )
 
@@ -1016,6 +1173,361 @@ class EdgeGenerator:
             draw_graphs_fn=draw_graphs_fn,
             verbose=verbose,
         )
+
+    def repair(
+        self,
+        graph,
+        *,
+        n_neighbors: int = 1,
+        target=None,
+        target_lambda: float = 0.5,
+        return_path: bool = True,
+        draw_graphs_fn: DrawGraphsFn | None = None,
+        verbose: bool | None = None,
+    ):
+        """Repair one graph by refitting on stored nearest neighbors.
+
+        The method reuses the stored retrieval corpus to select the nearest
+        ``n_neighbors`` training graphs whose node-label sets cover the input
+        graph labels, refits the generator on that local neighborhood, keeps
+        the original graph edge count as the repair target, and, when the input
+        graph is final-infeasible, seeds generation from one or more surgically
+        repaired rollback states derived from the estimator's violating-edge
+        sets.
+
+        Parameters
+        ----------
+        graph : nx.Graph
+            Graph to repair.
+        n_neighbors : int, optional
+            Number of nearest stored graphs used to refit the local generator.
+        target : object, optional
+            Optional target value forwarded to ``generate(...)``.
+        target_lambda : float, optional
+            Weight applied to target steering during repair generation.
+        return_path : bool, optional
+            Whether to return the full repair path or only the final graph.
+        draw_graphs_fn : callable, optional
+            Optional visualization callback used when verbose logging is
+            enabled.
+        verbose : bool | None, optional
+            Overrides the instance-level verbosity for this call.
+
+        Returns
+        -------
+        list[nx.Graph] | nx.Graph | None
+            Repair path or final repaired graph, matching ``return_path``.
+        """
+        verbose = self.verbose if verbose is None else verbose
+        self._require_stored_dataset()
+
+        repair_context = self._prepare_repair_training_context(
+            graph,
+            n_neighbors=n_neighbors,
+        )
+        label_set_mismatch = None
+        if self.enforce_repair_label_set_coverage:
+            label_set_mismatch = self._repair_label_set_mismatch(repair_context)
+        self.last_repair_label_set_mismatch_ = label_set_mismatch
+        if label_set_mismatch is not None:
+            if verbose:
+                print(
+                    "[repair] label-set mismatch between input graph and repair neighborhood; "
+                    f"missing_from_neighbors={label_set_mismatch['missing_from_neighbors']} "
+                    f"extra_in_neighbors={label_set_mismatch['extra_in_neighbors']}"
+                )
+            return [] if return_path else None
+        self.last_repair_training_graphs_ = [
+            fit_graph.copy() for fit_graph in repair_context["fit_graphs"]
+        ]
+        if repair_context["fit_targets"] is None:
+            self.last_repair_training_targets_ = None
+        else:
+            self.last_repair_training_targets_ = list(repair_context["fit_targets"])
+        self._log_repair_training_context(
+            repair_context,
+            draw_graphs_fn=draw_graphs_fn,
+            verbose=verbose,
+        )
+        partial_feasibility_extra_graphs = (
+            self._repair_partial_feasibility_bootstrap_graphs(
+                repair_context["graph"],
+                repair_context["fit_graphs"],
+            )
+        )
+        self._fit_pair_training_graphs(
+            repair_context["fit_graphs"],
+            repair_context["fit_targets"],
+            deduplicate_feasibility_graphs=False,
+            partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
+        )
+        self._validate_repair_lookahead_envelope(verbose=verbose)
+
+        start_graph = graph.copy()
+        target_n_edges = int(start_graph.number_of_edges())
+        resolved_target = self._resolve_repair_target(repair_context, target)
+
+        if bool(self.final_feasibility_estimator.predict([start_graph])[0]):
+            if verbose:
+                print("[repair] input graph is already final-feasible; returning unchanged graph")
+            return [start_graph] if return_path else start_graph
+
+        repaired_states = self._build_repair_start_states(
+            start_graph,
+            target=resolved_target,
+            target_lambda=target_lambda,
+        )
+        if not repaired_states:
+            if verbose:
+                print("[repair] no surgical repair starts could be constructed")
+            return [] if return_path else None
+
+        for repair_index, repaired_state in enumerate(repaired_states, start=1):
+            if verbose:
+                removed_edges = repaired_state.get("repair_removed_edges", ())
+                print(
+                    f"[repair] attempt={repair_index}/{len(repaired_states)} "
+                    f"original_edges={start_graph.number_of_edges()} "
+                    f"feasible_edges={repaired_state['graph'].number_of_edges()} "
+                    f"target_edges={target_n_edges} removed_edges={len(removed_edges)}"
+                )
+                self._draw_graphs(
+                    draw_graphs_fn,
+                    [start_graph, repaired_state["graph"]],
+                    n_graphs_per_line=2,
+                    titles=[
+                        (
+                            "original input\n"
+                            f"edges={start_graph.number_of_edges()} target_edges={target_n_edges}"
+                        ),
+                        (
+                            "feasible input\n"
+                            f"edges={repaired_state['graph'].number_of_edges()} "
+                            f"removed_edges={len(removed_edges)}"
+                        ),
+                    ],
+                )
+            repaired_path = self.generate(
+                repaired_state["graph"],
+                target_n_edges,
+                target=resolved_target,
+                target_lambda=target_lambda,
+                return_path=True,
+                draw_graphs_fn=draw_graphs_fn,
+                verbose=verbose,
+            )
+            if not repaired_path:
+                continue
+            if hash_graph(repaired_path[0]) == hash_graph(start_graph):
+                full_path = repaired_path
+            else:
+                full_path = [start_graph] + repaired_path
+            return full_path if return_path else full_path[-1]
+
+        return [] if return_path else None
+
+    def _graph_unique_node_labels(self, graph) -> set:
+        labels = set()
+        for _, attrs in graph.nodes(data=True):
+            label = attrs.get("label")
+            if label is not None:
+                labels.add(label)
+        return labels
+
+    def _repair_label_set_mismatch(self, repair_context):
+        graph_labels = self._graph_unique_node_labels(repair_context["graph"])
+        neighbor_labels = set()
+        for fit_graph in repair_context["fit_graphs"]:
+            neighbor_labels.update(self._graph_unique_node_labels(fit_graph))
+        missing_from_neighbors = sorted(graph_labels - neighbor_labels)
+        extra_in_neighbors = sorted(neighbor_labels - graph_labels)
+        if not missing_from_neighbors:
+            return None
+        return {
+            "graph_labels": sorted(graph_labels),
+            "neighbor_labels": sorted(neighbor_labels),
+            "missing_from_neighbors": missing_from_neighbors,
+            "extra_in_neighbors": extra_in_neighbors,
+        }
+
+    def _node_only_graph_copy(self, graph):
+        node_only_graph = graph.__class__()
+        node_only_graph.graph.update(graph.graph)
+        for node, attrs in graph.nodes(data=True):
+            node_only_graph.add_node(node, **dict(attrs))
+        return node_only_graph
+
+    def _repair_partial_feasibility_bootstrap_graphs(self, graph, fit_graphs):
+        return [self._node_only_graph_copy(graph)]
+
+    def _lookahead_failsafe_examples_from_dataset_parts(self, dataset_parts):
+        examples = []
+        for seed_graph, (positives, _, _) in zip(self.seed_graphs_, dataset_parts):
+            final_n_edges = int(seed_graph.number_of_edges())
+            for positive_graph in positives:
+                remaining_edges = final_n_edges - int(positive_graph.number_of_edges())
+                if remaining_edges < 0:
+                    continue
+                examples.append((positive_graph.copy(), remaining_edges))
+        return examples
+
+    def _fit_lookahead_violation_envelope(self) -> None:
+        self.lookahead_violation_thresholds_ = None
+        self.lookahead_lognormal_params_ = None
+        self.lookahead_pruning_active_ = False
+        examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
+        if not examples:
+            return
+        if not hasattr(self.final_feasibility_estimator, "number_of_violations"):
+            return
+
+        graphs = [graph for graph, _ in examples]
+        try:
+            violation_counts = np.asarray(
+                self.final_feasibility_estimator.number_of_violations(graphs),
+                dtype=float,
+            ).reshape(-1)
+        except Exception as exc:
+            warnings.warn(
+                "final_feasibility_estimator.number_of_violations failed while "
+                "calibrating lookahead pruning; lookahead pruning is disabled. "
+                f"error={exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        if len(violation_counts) != len(examples):
+            warnings.warn(
+                "final_feasibility_estimator.number_of_violations returned "
+                f"{len(violation_counts)} values for {len(examples)} graphs; "
+                "lookahead pruning is disabled.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+        thresholds = {}
+        buckets = {}
+        for (_, remaining_edges), violation_count in zip(examples, violation_counts):
+            remaining_edges = int(remaining_edges)
+            violation_count = float(violation_count)
+            threshold = thresholds.get(remaining_edges)
+            if threshold is None or violation_count > threshold:
+                thresholds[remaining_edges] = violation_count
+            buckets.setdefault(remaining_edges, []).append(violation_count)
+        if not thresholds:
+            return
+        self.lookahead_violation_thresholds_ = thresholds
+        self.lookahead_lognormal_params_ = self._fit_lookahead_lognormal_params(buckets)
+        self.lookahead_pruning_active_ = True
+
+    def _fit_lookahead_lognormal_params(self, buckets):
+        params = {}
+        for remaining_edges, values in buckets.items():
+            log_values = np.log1p(np.asarray(values, dtype=float))
+            if log_values.size < 1:
+                continue
+            mu = float(np.mean(log_values))
+            sigma = float(np.std(log_values))
+            params[int(remaining_edges)] = {
+                "n": int(log_values.size),
+                "mu": mu,
+                "sigma": max(sigma, 1e-12),
+                "max": float(np.max(values)),
+            }
+        return params
+
+    def _validate_repair_lookahead_envelope(
+        self,
+        *,
+        verbose: bool,
+    ) -> None:
+        self.last_lookahead_failsafe_ = None
+        if not self.lookahead_pruning_active_:
+            return
+        if self.lookahead_rejection_model != "max_envelope":
+            examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
+            self.last_lookahead_failsafe_ = {
+                "checked": len(examples),
+                "false_infeasible": 0,
+                "deactivated": False,
+                "model": self.lookahead_rejection_model,
+            }
+            return
+        examples = list(getattr(self, "_lookahead_failsafe_examples_", []) or [])
+        if not examples:
+            return
+
+        graphs = [graph for graph, _ in examples]
+        try:
+            violation_counts = self._lookahead_violation_counts(graphs)
+        except Exception as exc:
+            self.last_lookahead_failsafe_ = {
+                "checked": len(examples),
+                "false_infeasible": None,
+                "deactivated": True,
+                "error": str(exc),
+            }
+            warnings.warn(
+                "final_feasibility_estimator failed repair lookahead validation "
+                f"on {len(examples)} known repair-positive graphs; deactivating "
+                f"lookahead pruning for this repair. error={exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            if verbose:
+                print(
+                    "[repair] lookahead_failsafe deactivated=True "
+                    f"checked={len(examples)} error={exc}"
+                )
+            self.lookahead_pruning_active_ = False
+            return
+
+        thresholds = self.lookahead_violation_thresholds_ or {}
+        false_infeasible_mask = np.asarray(
+            [
+                float(violation_count) > float(thresholds[int(remaining_edges)])
+                for violation_count, (_, remaining_edges) in zip(
+                    violation_counts,
+                    examples,
+                )
+            ],
+            dtype=bool,
+        )
+        false_infeasible_count = int(np.sum(false_infeasible_mask))
+        self.last_lookahead_failsafe_ = {
+            "checked": len(examples),
+            "false_infeasible": false_infeasible_count,
+            "deactivated": false_infeasible_count > 0,
+        }
+        if false_infeasible_count <= 0:
+            return
+
+        indexed_thresholds = np.asarray(
+            [thresholds[int(remaining_edges)] for _, remaining_edges in examples],
+            dtype=float,
+        )
+        max_excess = float(
+            np.max(
+                violation_counts[false_infeasible_mask]
+                - indexed_thresholds[false_infeasible_mask]
+            )
+        )
+        warnings.warn(
+            "final_feasibility_estimator lookahead envelope marked "
+            f"{false_infeasible_count}/{len(examples)} known repair-positive "
+            "edge-removal graphs infeasible; "
+            "deactivating lookahead pruning for this repair. "
+            f"max_excess_violations={max_excess:.3f}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        if verbose:
+            print(
+                "[repair] lookahead_failsafe deactivated=True "
+                f"false_infeasible={false_infeasible_count}/{len(examples)} "
+                f"max_excess_violations={max_excess:.3f}"
+            )
+        self.lookahead_pruning_active_ = False
 
     def _cache_pair_session(
         self,
@@ -1181,6 +1693,228 @@ class EdgeGenerator:
             "training_set_elapsed": time.perf_counter() - training_set_start,
         }
 
+    def _prepare_repair_training_context(
+        self,
+        graph,
+        *,
+        n_neighbors: int,
+    ):
+        if int(n_neighbors) < 1:
+            raise ValueError("n_neighbors must be >= 1")
+
+        graph_copy = graph.copy()
+        graph_hash = hash_graph(graph_copy)
+        stored_idx = self.stored_graph_hash_to_index_.get(graph_hash)
+        if stored_idx is not None:
+            distances = np.asarray(self.stored_distance_matrix_[stored_idx], dtype=float).copy()
+        else:
+            query_vector = self._vectorize_retrieval_graphs(
+                self.retrieval_transformer_,
+                [graph_copy],
+                fit=False,
+            )[0]
+            distances = pairwise_distances(
+                np.asarray(query_vector, dtype=float).reshape(1, -1),
+                np.asarray(self.stored_retrieval_vectors_, dtype=float),
+            ).ravel()
+
+        sorted_candidate_indices = []
+        for idx in np.argsort(distances, kind="stable"):
+            idx = int(idx)
+            if stored_idx is not None and idx == stored_idx:
+                continue
+            if not np.isfinite(distances[idx]):
+                continue
+            sorted_candidate_indices.append(idx)
+
+        neighbor_indices = []
+        if self.enforce_repair_label_set_coverage:
+            missing_labels = set(self._graph_unique_node_labels(graph_copy))
+            for idx in sorted_candidate_indices:
+                candidate_labels = self._graph_unique_node_labels(self.stored_graphs_[idx])
+                if not missing_labels.intersection(candidate_labels):
+                    continue
+                neighbor_indices.append(idx)
+                missing_labels.difference_update(candidate_labels)
+                if not missing_labels:
+                    break
+
+        for idx in sorted_candidate_indices:
+            if idx in neighbor_indices:
+                continue
+            if len(neighbor_indices) >= int(n_neighbors):
+                break
+            neighbor_indices.append(idx)
+            if len(neighbor_indices) >= int(n_neighbors):
+                break
+
+        if not neighbor_indices and stored_idx is not None:
+            neighbor_indices = [int(stored_idx)]
+        if not neighbor_indices:
+            raise ValueError("Could not resolve any stored neighbors for repair")
+
+        fit_graphs = [self.stored_graphs_[idx].copy() for idx in neighbor_indices]
+        fit_targets = None
+        if self.stored_targets_ is not None:
+            fit_targets = [self.stored_targets_[idx] for idx in neighbor_indices]
+
+        return {
+            "graph": graph_copy,
+            "query_index": None if stored_idx is None else int(stored_idx),
+            "neighbor_indices": neighbor_indices,
+            "neighbor_distances": [float(distances[idx]) for idx in neighbor_indices],
+            "fit_graphs": fit_graphs,
+            "fit_targets": fit_targets,
+        }
+
+    def _resolve_repair_target(self, repair_context, requested_target):
+        if requested_target is not None:
+            return requested_target
+        query_index = repair_context.get("query_index")
+        if query_index is None or self.stored_targets_ is None:
+            return None
+        return self.stored_targets_[query_index]
+
+    def _log_repair_training_context(
+        self,
+        repair_context,
+        *,
+        draw_graphs_fn: DrawGraphsFn | None,
+        verbose: bool,
+    ) -> None:
+        if not verbose:
+            return
+        print(
+            f"[repair] query_index={repair_context['query_index']} "
+            f"n_neighbors={len(repair_context['neighbor_indices'])} "
+            f"neighbor_indices={repair_context['neighbor_indices']} "
+            f"neighbor_distances={[round(d, 4) for d in repair_context['neighbor_distances']]}"
+        )
+        self._draw_graphs(
+            draw_graphs_fn,
+            [repair_context["graph"]],
+            n_graphs_per_line=1,
+            titles=["query"],
+        )
+        self._draw_graphs(
+            draw_graphs_fn,
+            repair_context["fit_graphs"],
+            n_graphs_per_line=min(len(repair_context["fit_graphs"]), 7),
+            titles=[f"nn:{idx}" for idx in repair_context["neighbor_indices"]],
+        )
+
+    def _build_repair_start_states(
+        self,
+        graph,
+        *,
+        target,
+        target_lambda: float,
+    ):
+        start_graph = graph.copy()
+        start_score = float(self._positive_scores([start_graph])[0])
+        start_target_score = float(self._target_scores([start_graph], target=target)[0])
+        start_state = self._make_state(
+            start_graph,
+            parent=None,
+            score=start_score,
+            depth=start_graph.number_of_edges(),
+        )
+        start_state["target_score"] = float(start_target_score)
+        start_state["selection_score"] = float(start_score + target_lambda * start_target_score)
+
+        infeasible_candidate = {
+            "graph": start_graph,
+            "score": float(start_score),
+            "target_score": float(start_target_score),
+            "selection_score": float(start_state["selection_score"]),
+            "feasibility_stage": "final",
+        }
+        self._annotate_infeasible_candidates_with_violating_edge_sets([infeasible_candidate])
+
+        repaired_states = []
+        seen_hashes = set()
+        n_repair_attempts = max(1, int(self.max_restarts))
+        for fallback_index in range(n_repair_attempts):
+            rollback_steps = self._rollback_steps_for_fallback(fallback_index)
+            removed_edges, repair_score = self._select_edges_for_surgical_repair(
+                start_state,
+                [infeasible_candidate],
+                rollback_steps=rollback_steps,
+            )
+            if not removed_edges:
+                removed_edges = self._random_repair_removed_edge(start_state)
+                repair_score = 0.0
+            if not removed_edges:
+                continue
+            repaired_state = self._make_repaired_state(
+                start_state,
+                removed_edges,
+                score=repair_score,
+            )
+            repaired_state = self._repair_state_until_partial_feasible(repaired_state)
+            if repaired_state is None:
+                continue
+            repaired_hash = repaired_state["graph_hash"]
+            if repaired_hash in seen_hashes:
+                continue
+            seen_hashes.add(repaired_hash)
+            repaired_states.append(repaired_state)
+        return repaired_states
+
+    def _repair_state_until_partial_feasible(self, state):
+        current_state = state
+        removed_edges = list(current_state.get("repair_removed_edges", ()))
+        while not bool(self.partial_feasibility_estimator.predict([current_state["graph"]])[0]):
+            if current_state["graph"].number_of_edges() == 0:
+                return current_state
+            candidate = {
+                "graph": current_state["graph"],
+                "score": float(current_state.get("score") or 0.0),
+                "selection_score": float(current_state.get("selection_score") or 0.0),
+                "feasibility_stage": "partial",
+            }
+            self._annotate_infeasible_candidates_with_violating_edge_sets([candidate])
+            next_removed_edges, repair_score = self._select_edges_for_surgical_repair(
+                current_state,
+                [candidate],
+                rollback_steps=1,
+            )
+            if not next_removed_edges:
+                next_removed_edges = self._fallback_repair_removed_edges(
+                    current_state,
+                    rollback_steps=1,
+                )
+                repair_score = 0.0
+            if not next_removed_edges:
+                return None
+            score = float(current_state.get("selection_score") or 0.0) + float(repair_score)
+            current_state = self._make_repaired_state(
+                current_state,
+                next_removed_edges,
+                score=score,
+            )
+            removed_edges.extend(next_removed_edges)
+            current_state["repair_removed_edges"] = tuple(removed_edges)
+        return current_state
+
+    def _fallback_repair_removed_edges(self, state, *, rollback_steps: int = 1):
+        n_remove = max(0, min(int(rollback_steps), state["graph"].number_of_edges()))
+        if n_remove < 1:
+            return []
+        edge_order = tuple(state.get("edge_order", ()))
+        if edge_order:
+            return list(edge_order[-n_remove:])
+        graph_edges = self._canonical_graph_edges(state["graph"])
+        if graph_edges:
+            return list(graph_edges[-n_remove:])
+        return []
+
+    def _random_repair_removed_edge(self, state):
+        graph_edges = list(self._canonical_graph_edges(state["graph"]))
+        if not graph_edges:
+            return []
+        return [self.rng.choice(graph_edges)]
+
     def _select_pair_targets(self, query, selected_indices):
         if query["targets"] is None:
             return None
@@ -1250,12 +1984,28 @@ class EdgeGenerator:
             titles.append(label)
         return titles
 
-    def _fit_pair_training_graphs(self, fit_graphs, fit_targets) -> None:
+    def _fit_pair_training_graphs(
+        self,
+        fit_graphs,
+        fit_targets,
+        *,
+        deduplicate_feasibility_graphs: bool = True,
+        partial_feasibility_extra_graphs=None,
+    ) -> None:
         if fit_targets is not None and all(target_value is not None for target_value in fit_targets):
-            self.fit(fit_graphs, targets=fit_targets)
+            self.fit(
+                fit_graphs,
+                targets=fit_targets,
+                deduplicate_feasibility_graphs=deduplicate_feasibility_graphs,
+                partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
+            )
             return
 
-        self.fit(fit_graphs)
+        self.fit(
+            fit_graphs,
+            deduplicate_feasibility_graphs=deduplicate_feasibility_graphs,
+            partial_feasibility_extra_graphs=partial_feasibility_extra_graphs,
+        )
         if self.target_estimator is None or fit_targets is None:
             return
         labeled_pairs = [
@@ -1288,6 +2038,7 @@ class EdgeGenerator:
         graph_index: int = 0,
     ):
         start_graph = graph.copy()
+        self._reset_edge_risk_attempt_trace()
         if start_graph.number_of_edges() > n_edges:
             raise ValueError("Input graph already has more edges than n_edges")
 
@@ -1295,6 +2046,7 @@ class EdgeGenerator:
         self.max_depth_ = 0
         n_fallbacks = max(0, self.max_restarts)
         total_phases = n_fallbacks + 1
+        max_total_edges = self._max_total_edges_for_generation(start_graph, n_edges)
         start_time = time.perf_counter()
         if verbose:
             remaining_edges = n_edges - start_graph.number_of_edges()
@@ -1310,7 +2062,10 @@ class EdgeGenerator:
             print(" ".join(start_parts))
             self._draw_graphs(draw_graphs_fn, [start_graph])
 
-        if start_graph.number_of_edges() == n_edges:
+        if (
+            start_graph.number_of_edges() == n_edges
+            and self._is_terminal_solution_graph(start_graph, n_edges=n_edges)
+        ):
             return self._finish_if_start_graph_is_solution(
                 start_graph,
                 verbose=verbose,
@@ -1331,17 +2086,63 @@ class EdgeGenerator:
 
         # Main search loop: expand, score, retain, then optionally repair/backtrack.
         while search["beam"]:
-            if search["depth"] >= n_edges:
+            expandable_beam = [
+                state
+                for state in search["beam"]
+                if state["graph"].number_of_edges() < max_total_edges
+            ]
+            if not expandable_beam:
+                solved_path = self._find_solution_in_beam(
+                    search["beam"],
+                    n_edges=n_edges,
+                    graph_index=graph_index,
+                    total_phases=total_phases,
+                    fallback_index=search["fallback_index"],
+                    start_time=start_time,
+                    verbose=verbose,
+                )
+                if solved_path is not None:
+                    return solved_path
+                early_stop_path = self._find_early_stop_in_beam(
+                    search["beam"],
+                    scored={"feasible_candidates": []},
+                    n_edges=n_edges,
+                    target=target,
+                    target_lambda=target_lambda,
+                    fallback_index=search["fallback_index"],
+                    graph_index=graph_index,
+                    total_phases=total_phases,
+                    start_time=start_time,
+                    verbose=verbose,
+                )
+                if early_stop_path is not None:
+                    return early_stop_path
+                self._mark_unexpandable_beam_as_completion_infeasible(search)
                 break
 
-            generated = self._expand_beam(search["beam"])
+            generated = self._expand_beam(expandable_beam)
             scored = self._score_generated_candidates(
                 generated,
                 n_edges=n_edges,
+                max_total_edges=max_total_edges,
                 target=target,
                 target_lambda=target_lambda,
                 fallback_index=search["fallback_index"],
             )
+            early_stop_path = self._find_early_stop_in_beam(
+                search["beam"],
+                scored=scored,
+                n_edges=n_edges,
+                target=target,
+                target_lambda=target_lambda,
+                fallback_index=search["fallback_index"],
+                graph_index=graph_index,
+                total_phases=total_phases,
+                start_time=start_time,
+                verbose=verbose,
+            )
+            if early_stop_path is not None:
+                return early_stop_path
             retained = self._retain_unseen_candidates(
                 scored["feasible_candidates"],
                 search=search,
@@ -1391,6 +2192,7 @@ class EdgeGenerator:
             if beam_limit is None:
                 break
 
+        self._close_edge_risk_training_states(open_state_ids=set())
         raise ValueError("Could not generate a feasible graph with the requested number of edges")
 
     def _finish_if_start_graph_is_solution(self, start_graph, *, verbose: bool, graph_index: int):
@@ -1403,6 +2205,33 @@ class EdgeGenerator:
                 f"tried=0 elapsed=0m 0.0s eta=0m 0.0s"
             )
         return [start_graph]
+
+    def _graph_component_count(self, graph: nx.Graph) -> int:
+        if graph.number_of_nodes() <= 0:
+            return 0
+        if nx.is_directed(graph):
+            return int(nx.number_weakly_connected_components(graph))
+        return int(nx.number_connected_components(graph))
+
+    def _is_connectivity_satisfied(self, graph: nx.Graph) -> bool:
+        if not self.require_single_connected_component:
+            return True
+        return self._graph_component_count(graph) <= 1
+
+    def _is_terminal_solution_graph(self, graph: nx.Graph, *, n_edges: int) -> bool:
+        if graph.number_of_edges() < int(n_edges):
+            return False
+        return self._is_connectivity_satisfied(graph)
+
+    def _max_total_edges_for_generation(self, start_graph: nx.Graph, n_edges: int) -> int:
+        base_edges = int(n_edges)
+        if not self.require_single_connected_component:
+            return base_edges
+        start_components = self._graph_component_count(start_graph)
+        if start_components <= 1:
+            return base_edges
+        extra_edges = max(0, start_components - 1)
+        return base_edges + extra_edges
 
     def _initialize_search_state(self, start_graph):
         beam = [self._make_state(start_graph, parent=None, score=1.0, depth=0)]
@@ -1432,6 +2261,7 @@ class EdgeGenerator:
         generated,
         *,
         n_edges: int,
+        max_total_edges: int,
         target,
         target_lambda: float,
         fallback_index: int,
@@ -1443,6 +2273,7 @@ class EdgeGenerator:
             self._partition_candidates_by_feasibility(
                 generated,
                 n_edges=n_edges,
+                max_total_edges=max_total_edges,
                 target=target,
                 target_lambda=target_lambda,
                 feasible_candidates=feasible_candidates,
@@ -1465,6 +2296,7 @@ class EdgeGenerator:
         generated,
         *,
         n_edges: int,
+        max_total_edges: int,
         target,
         target_lambda: float,
         feasible_candidates,
@@ -1477,31 +2309,131 @@ class EdgeGenerator:
         )
         positive_scores = self._positive_scores(generated_graphs)
         target_scores = self._target_scores(generated_graphs, target=target)
+        risk_scores = self._edge_risk_scores(generated)
+        lookahead_violation_counts = [None for _ in generated]
+        lookahead_indices = [
+            idx
+            for idx, (cand, is_partial_feasible) in enumerate(
+                zip(generated, partial_feasibility_mask)
+            )
+            if is_partial_feasible and cand["graph"].number_of_edges() < int(n_edges)
+        ]
+        if self.lookahead_pruning_active_ and lookahead_indices:
+            lookahead_graphs = [generated_graphs[idx] for idx in lookahead_indices]
+            for idx, violation_count in zip(
+                lookahead_indices,
+                self._lookahead_violation_counts(lookahead_graphs),
+            ):
+                lookahead_violation_counts[idx] = violation_count
         partial_terminal_candidates = []
-        for cand, is_partial_feasible, score, target_score in zip(
+        for cand, is_partial_feasible, score, target_score, risk_score, lookahead_violation_count in zip(
             generated,
             partial_feasibility_mask,
             positive_scores,
             target_scores,
+            risk_scores,
+            lookahead_violation_counts,
         ):
             cand["score"] = float(score)
             cand["target_score"] = float(target_score)
+            cand["risk_score"] = float(risk_score)
             cand["selection_score"] = float(
-                cand["score"] + target_lambda * cand["target_score"]
+                cand["score"]
+                + target_lambda * cand["target_score"]
+                - self.edge_risk_lambda * cand["risk_score"]
             )
-            if is_partial_feasible:
-                if cand["graph"].number_of_edges() == n_edges:
-                    partial_terminal_candidates.append(cand)
-                else:
-                    feasible_candidates.append(cand)
-            else:
+            if not is_partial_feasible:
                 cand["feasibility_stage"] = "partial"
+                self._mark_trace_state_status(cand, "partial_infeasible")
                 infeasible_candidates.append(cand)
+            elif cand["graph"].number_of_edges() >= n_edges:
+                partial_terminal_candidates.append(cand)
+            elif self._is_lookahead_infeasible(
+                cand,
+                violation_count=lookahead_violation_count,
+                n_edges=n_edges,
+            ):
+                cand["feasibility_stage"] = "lookahead"
+                self._mark_trace_state_status(cand, "lookahead_infeasible")
+                infeasible_candidates.append(cand)
+            else:
+                feasible_candidates.append(cand)
         self._promote_final_feasible_candidates(
             partial_terminal_candidates,
             feasible_candidates=feasible_candidates,
             infeasible_candidates=infeasible_candidates,
         )
+
+    def _lookahead_violation_counts(self, graphs):
+        if not self.lookahead_pruning_active_:
+            return np.zeros(len(graphs), dtype=float)
+        if not hasattr(self.final_feasibility_estimator, "number_of_violations"):
+            raise ValueError(
+                "final_feasibility_estimator must provide "
+                "number_of_violations(graphs)"
+            )
+        return np.asarray(
+            self.final_feasibility_estimator.number_of_violations(graphs),
+            dtype=float,
+        ).reshape(-1)
+
+    def _is_lookahead_infeasible(
+        self,
+        cand,
+        *,
+        violation_count,
+        n_edges: int,
+    ) -> bool:
+        if not self.lookahead_pruning_active_:
+            return False
+        remaining_moves = int(n_edges) - cand["graph"].number_of_edges()
+        if self.lookahead_rejection_model == "max_envelope":
+            threshold = self._lookahead_violation_threshold(remaining_moves)
+            if threshold is None:
+                return False
+            cand["lookahead_violation_count"] = float(violation_count)
+            cand["remaining_moves"] = int(remaining_moves)
+            cand["lookahead_violation_threshold"] = float(threshold)
+            return float(violation_count) > float(threshold)
+
+        reject_prob = self._lookahead_lognormal_reject_probability(
+            float(violation_count),
+            remaining_moves,
+        )
+        if reject_prob is None:
+            return False
+        cand["lookahead_violation_count"] = float(violation_count)
+        cand["remaining_moves"] = int(remaining_moves)
+        cand["lookahead_reject_prob"] = float(reject_prob)
+        return self.rng.random() < float(reject_prob)
+
+    def _lookahead_violation_threshold(self, remaining_moves: int):
+        thresholds = self.lookahead_violation_thresholds_ or {}
+        return thresholds.get(int(remaining_moves))
+
+    def _lookahead_lognormal_reject_probability(
+        self,
+        violation_count: float,
+        remaining_moves: int,
+    ):
+        params_by_stage = self.lookahead_lognormal_params_ or {}
+        params = params_by_stage.get(int(remaining_moves))
+        if params is None:
+            return None
+        sigma = float(params["sigma"])
+        if sigma <= 0.0:
+            return None
+        z = (math.log1p(max(0.0, float(violation_count))) - float(params["mu"])) / sigma
+        tail_prob = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        quantile = self.lookahead_rejection_quantile
+        if tail_prob <= quantile:
+            reject_prob = 0.0
+        else:
+            reject_prob = (tail_prob - quantile) / (1.0 - quantile)
+        reject_prob = min(1.0, max(0.0, reject_prob))
+        if reject_prob <= 0.0:
+            return 0.0
+        return reject_prob ** (1.0 / self.lookahead_rejection_temperature)
 
     def _promote_final_feasible_candidates(
         self,
@@ -1520,9 +2452,11 @@ class EdgeGenerator:
         )
         for cand, is_final_feasible in zip(partial_terminal_candidates, final_mask):
             if is_final_feasible:
+                cand["connected_components"] = self._graph_component_count(cand["graph"])
                 feasible_candidates.append(cand)
             else:
                 cand["feasibility_stage"] = "final"
+                self._mark_trace_state_status(cand, "final_infeasible")
                 infeasible_candidates.append(cand)
 
     def _rank_feasible_candidates(self, feasible_candidates, *, fallback_index: int):
@@ -1537,7 +2471,12 @@ class EdgeGenerator:
             cand["selection_score"] = float(
                 cand["selection_score"] - repulsion_lambda * cand["repulsion"]
             )
-        feasible_candidates.sort(key=lambda cand: cand["selection_score"], reverse=True)
+        feasible_candidates.sort(
+            key=lambda cand: (
+                cand["selection_score"],
+            ),
+            reverse=True,
+        )
         return repulsion_lambda
 
     def _rank_infeasible_candidates(self, infeasible_candidates) -> None:
@@ -1564,7 +2503,14 @@ class EdgeGenerator:
             if self.enforce_diversity and cand["graph_hash"] in self.diversity_memory_hash_set_:
                 continue
             unseen_candidates.append(cand)
-        return self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
+        retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
+        retained_ids = {cand.get("state_id") for cand in retained}
+        for cand in unseen_candidates:
+            if cand.get("state_id") in retained_ids:
+                self._mark_trace_state_status(cand, "retained")
+            else:
+                self._mark_trace_state_status(cand, "pruned")
+        return retained
 
     # Search progress logging.
 
@@ -1599,6 +2545,7 @@ class EdgeGenerator:
             retained[0].get("target_score") if retained and target_active else None
         )
         best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
+        best_risk = retained[0].get("risk_score", 0.0) if retained else 0.0
         step_elapsed = time.perf_counter() - step_start_time
         current_edges = (
             retained[0]["graph"].number_of_edges()
@@ -1607,33 +2554,81 @@ class EdgeGenerator:
         )
         remaining_edges = max(0, n_edges - current_edges)
         eta_str = self._format_minutes_seconds(remaining_edges * step_elapsed)
-        line1 = (
-            f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-            f"depth={next_depth} remaining_edges={remaining_edges} "
+        line1 = f"[graph {graph_index}] remaining_edges={remaining_edges}"
+        line2 = (
+            f"search_phase={fallback_index + 2}/{total_phases} "
+            f"depth={next_depth} "
             f"step_time={self._format_minutes_seconds(step_elapsed)} eta={eta_str}"
         )
-        line2 = (
-            f"generated={len(scored['generated'])} feasible={len(scored['feasible_candidates'])} "
-            f"retained={len(retained)} tried={self.n_tried_}"
+        partial_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "partial"
         )
-        line3_parts = [f"best_score={self._format_optional_score(best_score)}"]
+        final_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "final"
+        )
+        lookahead_infeasible = sum(
+            1
+            for cand in scored.get("infeasible_candidates", [])
+            if cand.get("feasibility_stage") == "lookahead"
+        )
+        partial_feasible = max(0, len(scored["generated"]) - partial_infeasible)
+        line3_parts = [
+            f"tried={self.n_tried_}",
+            f"generated={len(scored['generated'])}",
+        ]
+        if partial_infeasible:
+            line3_parts.append(f"partial_infeasible={partial_infeasible}")
+        line3_parts.append(f"partial_feasible={partial_feasible}")
+        if lookahead_infeasible:
+            line3_parts.append(f"lookahead_infeasible={lookahead_infeasible}")
+        if final_infeasible:
+            line3_parts.append(f"final_infeasible={final_infeasible}")
+        line3_parts.extend(
+            [
+                f"viable={len(scored['feasible_candidates'])}",
+                f"retained={len(retained)}",
+            ]
+        )
+        line3 = " ".join(line3_parts)
+        line4_parts = [f"best_score={self._format_optional_score(best_score)}"]
         if target_active:
-            line3_parts.append(
+            line4_parts.append(
                 f"best_target_score={self._format_optional_score(best_target_score)}"
             )
         if target_active or repulsion_active:
-            line3_parts.append(
+            line4_parts.append(
                 f"best_selection_score={self._format_optional_score(best_selection_score)}"
             )
         if repulsion_active:
-            line3_parts.append(f"best_repulsion={best_repulsion:.3f}")
-        line4_parts = []
+            line4_parts.append(f"best_repulsion={best_repulsion:.3f}")
+        if self.edge_risk_lambda > 0.0:
+            line4_parts.append(f"best_risk={best_risk:.3f}")
+        line5_parts = []
         if target_active:
-            line4_parts.append(f"target_lambda={target_lambda:.3f}")
+            line5_parts.append(f"target_lambda={target_lambda:.3f}")
         if repulsion_active:
-            line4_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
-        line4_parts.append(f"beam_limit={beam_limit}")
-        print("\n".join([line1, line2, " ".join(line3_parts), " ".join(line4_parts)]))
+            line5_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
+        if self.edge_risk_lambda > 0.0 and self.edge_risk_estimator is not None:
+            line5_parts.append(f"edge_risk_lambda={self.edge_risk_lambda:.3f}")
+        line5_parts.append(f"beam_limit={beam_limit}")
+        log_lines = [line1, line2, line3, " ".join(line4_parts), " ".join(line5_parts)]
+        if len(scored["feasible_candidates"]) == 0:
+            remaining_fallbacks = max(0, total_phases - (fallback_index + 2))
+            if remaining_fallbacks > 0:
+                log_lines.append(
+                    f"[graph {graph_index}] BACKTRACK no feasible candidates remain; "
+                    f"{remaining_fallbacks} search phase(s) left"
+                )
+            else:
+                log_lines.append(
+                    f"[graph {graph_index}] FAILED no feasible candidates remain; "
+                    "no search phases left"
+                )
+        print("\n".join(log_lines))
         self._draw_retained_candidates(
             retained,
             target_active=target_active,
@@ -1665,6 +2660,8 @@ class EdgeGenerator:
                 )
             if repulsion_active:
                 title_line1_parts.append(f"rep={cand.get('repulsion', 0.0):.3f}")
+            if self.edge_risk_lambda > 0.0:
+                title_line1_parts.append(f"risk={cand.get('risk_score', 0.0):.3f}")
             if target_active:
                 title_line2_parts.append(f"tgt={cand.get('target_score', 0.0):.3f}")
             if title_line1_parts:
@@ -1726,19 +2723,138 @@ class EdgeGenerator:
         verbose: bool,
     ):
         for state in beam:
-            if state["graph"].number_of_edges() != n_edges:
+            if not self._is_terminal_solution_graph(state["graph"], n_edges=n_edges):
                 continue
+            self._mark_trace_state_status(state, "solved")
             path = self._reconstruct_path(state)
             if verbose:
                 elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
+                current_edges = state["graph"].number_of_edges()
+                edge_shortfall = max(0, n_edges - current_edges)
                 print(
-                    f"[graph {graph_index}] solved phase={fallback_index + 2}/{total_phases} "
+                    f"[graph {graph_index}] solved search_phase={fallback_index + 2}/{total_phases} "
                     f"depth={state['depth']} max_depth={self.max_depth_} "
-                    f'edges={state["graph"].number_of_edges()} remaining_edges=0 '
+                    f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
                     f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
                 )
             return path
         return None
+
+    def _find_early_stop_in_beam(
+        self,
+        beam,
+        *,
+        scored,
+        n_edges: int,
+        target,
+        target_lambda: float,
+        fallback_index: int,
+        graph_index: int,
+        total_phases: int,
+        start_time: float,
+        verbose: bool,
+    ):
+        if not self.early_stop_if_final_feasible or not beam:
+            return None
+
+        current_states = self._score_current_beam_states_for_early_stop(
+            beam,
+            target=target,
+            target_lambda=target_lambda,
+            fallback_index=fallback_index,
+        )
+        if not current_states:
+            return None
+
+        best_current = current_states[0]
+        best_expansion_score = None
+        if scored["feasible_candidates"]:
+            best_expansion_score = scored["feasible_candidates"][0].get(
+                "selection_score",
+                scored["feasible_candidates"][0]["score"],
+            )
+
+        current_score = best_current.get("selection_score", best_current["score"])
+        if best_expansion_score is not None and current_score < best_expansion_score:
+            return None
+
+        self._mark_trace_state_status(best_current, "solved")
+        path = self._reconstruct_path(best_current)
+        if verbose:
+            elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
+            current_edges = best_current["graph"].number_of_edges()
+            edge_shortfall = max(0, n_edges - current_edges)
+            print(
+                f"[graph {graph_index}] early_stop search_phase={fallback_index + 2}/{total_phases} "
+                f"depth={best_current['depth']} max_depth={self.max_depth_} "
+                f"edges={current_edges} edge_shortfall={edge_shortfall} remaining_edges=0 "
+                f"tried={self.n_tried_} elapsed={elapsed_str} eta=0m 0.0s"
+            )
+            print(
+                f"[graph {graph_index}] early_stop_selection_score="
+                f"{current_score:.3f} best_expansion_selection_score="
+                f"{self._format_optional_score(best_expansion_score)}"
+            )
+        return path
+
+    def _score_current_beam_states_for_early_stop(
+        self,
+        beam,
+        *,
+        target,
+        target_lambda: float,
+        fallback_index: int,
+    ):
+        beam_graphs = [state["graph"] for state in beam]
+        final_mask = np.asarray(
+            self.final_feasibility_estimator.predict(beam_graphs),
+            dtype=bool,
+        )
+        if not np.any(final_mask):
+            return []
+
+        positive_scores = self._positive_scores(beam_graphs)
+        target_scores = self._target_scores(beam_graphs, target=target)
+        risk_scores = self._edge_risk_scores(beam)
+        final_states = []
+        for state, is_final_feasible, score, target_score, risk_score in zip(
+            beam,
+            final_mask,
+            positive_scores,
+            target_scores,
+            risk_scores,
+        ):
+            if not is_final_feasible:
+                continue
+            if not self._is_connectivity_satisfied(state["graph"]):
+                continue
+            state["score"] = float(score)
+            state["target_score"] = float(target_score)
+            state["risk_score"] = float(risk_score)
+            state["selection_score"] = float(
+                state["score"]
+                + target_lambda * state["target_score"]
+                - self.edge_risk_lambda * state["risk_score"]
+            )
+            final_states.append(state)
+
+        if not final_states:
+            return []
+
+        repulsions, repulsion_lambda = self._repulsion_values(
+            [state["graph"] for state in final_states],
+            fallback_index=fallback_index,
+        )
+        for state, repulsion in zip(final_states, repulsions):
+            state["repulsion"] = float(repulsion)
+            state["selection_score"] = float(
+                state["selection_score"] - repulsion_lambda * state["repulsion"]
+            )
+        final_states.sort(
+            key=lambda state: state.get("selection_score", state["score"]),
+            reverse=True,
+        )
+        return final_states
 
     def _apply_search_fallback(
         self,
@@ -1752,6 +2868,7 @@ class EdgeGenerator:
     ):
         self._mark_blocked_beam(search)
         if search["fallback_index"] + 1 >= n_fallbacks:
+            self._close_edge_risk_training_states(open_state_ids=set())
             return None
         search["fallback_index"] += 1
         rollback_steps = self._rollback_steps_for_fallback(search["fallback_index"])
@@ -1793,6 +2910,16 @@ class EdgeGenerator:
         search["tabu_path_signatures"].update(
             state["path_signature"] for state in search["beam"]
         )
+        for state in search["beam"]:
+            self._mark_trace_state_status(state, "blocked")
+        self._remember_failed_graphs([state["graph"] for state in search["beam"]])
+
+    def _mark_unexpandable_beam_as_completion_infeasible(self, search) -> None:
+        for state in search["beam"]:
+            if self._is_connectivity_satisfied(state["graph"]):
+                self._mark_trace_state_status(state, "blocked")
+            else:
+                self._mark_trace_state_status(state, "completion_infeasible")
         self._remember_failed_graphs([state["graph"] for state in search["beam"]])
 
     def _restore_repaired_beam(
@@ -1814,16 +2941,32 @@ class EdgeGenerator:
         search["depth"] = repaired_depth
         search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
         search["step_start_time"] = time.perf_counter()
+        self._close_edge_risk_training_states(
+            open_state_ids=self._trace_open_state_ids(search["beam"])
+        )
         if verbose:
+            edge_risk_training_size = self._edge_risk_training_set_size()
+            edge_risk_fit_time = self._edge_risk_last_fit_time_seconds()
             removed_descriptions = [
                 ",".join(str(edge) for edge in state.get("repair_removed_edges", ()))
                 for state in repaired_beam
             ]
-            print(
-                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks} "
-                f"rollback_steps={rollback_steps} surgical_repairs={len(repaired_beam)} "
-                f"to_depth={repaired_depth} beam_limit={beam_limit}"
-            )
+            fallback_parts = [
+                f"[graph {graph_index}] repair_fallback={search['fallback_index'] + 1}/{n_fallbacks}",
+                f"rollback_steps={rollback_steps}",
+                f"surgical_repairs={len(repaired_beam)}",
+                f"to_depth={repaired_depth}",
+                f"beam_limit={beam_limit}",
+            ]
+            if edge_risk_training_size is not None:
+                fallback_parts.append(
+                    f"edge_risk_training_set_size={edge_risk_training_size}"
+                )
+            if edge_risk_fit_time is not None:
+                fallback_parts.append(
+                    f"edge_risk_fit_time={self._format_minutes_seconds(edge_risk_fit_time)}"
+                )
+            print(" ".join(fallback_parts))
             print(f"[graph {graph_index}] surgical_removed_edges={removed_descriptions}")
         if verbose and total_phases > 1:
             self._print_phase_banner(
@@ -1851,12 +2994,27 @@ class EdgeGenerator:
         search["depth"] = fallback_depth
         search["visited"] = self._rebuild_visited_from_history(search["beam_history"])
         search["step_start_time"] = time.perf_counter()
+        self._close_edge_risk_training_states(
+            open_state_ids=self._trace_open_state_ids(search["beam"])
+        )
         if verbose:
-            print(
-                f"[graph {graph_index}] fallback={search['fallback_index'] + 1}/{n_fallbacks} "
-                f"rollback_steps={rollback_steps} to_depth={fallback_depth} "
-                f"beam_limit={beam_limit}"
-            )
+            fallback_parts = [
+                f"[graph {graph_index}] repair_fallback={search['fallback_index'] + 1}/{n_fallbacks}",
+                f"rollback_steps={rollback_steps}",
+                f"to_depth={fallback_depth}",
+                f"beam_limit={beam_limit}",
+            ]
+            edge_risk_training_size = self._edge_risk_training_set_size()
+            edge_risk_fit_time = self._edge_risk_last_fit_time_seconds()
+            if edge_risk_training_size is not None:
+                fallback_parts.append(
+                    f"edge_risk_training_set_size={edge_risk_training_size}"
+                )
+            if edge_risk_fit_time is not None:
+                fallback_parts.append(
+                    f"edge_risk_fit_time={self._format_minutes_seconds(edge_risk_fit_time)}"
+                )
+            print(" ".join(fallback_parts))
         if verbose and total_phases > 1:
             self._print_phase_banner(
                 graph_index=graph_index,
@@ -1876,9 +3034,19 @@ class EdgeGenerator:
         n_fallbacks: int,
     ) -> None:
         print(
-            f"[graph {graph_index}] phase={fallback_index + 2}/{total_phases} "
-            f"beam_limit={beam_limit} fallback={fallback_index + 1}/{n_fallbacks}"
+            f"[graph {graph_index}] search_phase={fallback_index + 2}/{total_phases} "
+            f"beam_limit={beam_limit}"
         )
+
+    def _edge_risk_training_set_size(self) -> int | None:
+        if self.edge_risk_model_ is None or self.edge_risk_estimator is None:
+            return None
+        return self.edge_risk_model_.training_set_size()
+
+    def _edge_risk_last_fit_time_seconds(self) -> float | None:
+        if self.edge_risk_model_ is None or self.edge_risk_estimator is None:
+            return None
+        return self.edge_risk_model_.last_fit_time_seconds()
 
     def _expand_state(self, state):
         candidates = []
@@ -1917,7 +3085,7 @@ class EdgeGenerator:
             depth = 0 if parent is None else parent.get("depth", 0)
             if added_edge is not None:
                 depth += 1
-        return {
+        state = {
             "graph": graph,
             "graph_hash": graph_hash,
             "parent": parent,
@@ -1930,6 +3098,8 @@ class EdgeGenerator:
             "edge_order": tuple(edge_order),
             "depth": int(depth),
         }
+        self._register_trace_state(state)
+        return state
 
     def _repair_beam_from_infeasible_candidates(
         self,
@@ -2015,6 +3185,8 @@ class EdgeGenerator:
 
     def _feasibility_estimator_for_stage(self, stage: str):
         if stage == "final":
+            return self.final_feasibility_estimator
+        if stage == "lookahead":
             return self.final_feasibility_estimator
         return self.partial_feasibility_estimator
 
@@ -2376,10 +3548,9 @@ class EdgeGenerator:
             return None
         if not isinstance(target_b, (int, float, np.integer, np.floating)):
             return None
-        mean_target = 0.5 * (float(target_a) + float(target_b))
         if self.target_estimator_mode == "regression":
-            return mean_target
-        return int(round(mean_target))
+            return 0.5 * (float(target_a) + float(target_b))
+        return self.rng.choice([target_a, target_b])
 
     def _build_fragment_datasets(self, graphs):
         dataset_seeds = [self.rng.randrange(10**9) for _ in graphs]
@@ -2554,14 +3725,40 @@ class EdgeGenerator:
 
     def _unique_graphs(self, graphs):
         unique_graphs = []
-        seen_hashes = set()
+        seen_keys = set()
         for graph in graphs:
-            graph_hash = hash_graph(graph)
-            if graph_hash in seen_hashes:
+            graph_key = self._wl_graph_key(graph)
+            if graph_key in seen_keys:
                 continue
-            seen_hashes.add(graph_hash)
+            seen_keys.add(graph_key)
             unique_graphs.append(graph)
         return unique_graphs
+
+    def _wl_graph_key(self, graph: nx.Graph):
+        node_attr = "_abstractgraph_wl_node_label"
+        edge_attr = "_abstractgraph_wl_edge_label"
+        wl_graph = graph.__class__()
+        for node, attrs in graph.nodes(data=True):
+            wl_graph.add_node(
+                node,
+                **{node_attr: canonical_bytes(dict(attrs)).decode("utf-8")},
+            )
+        for u, v, attrs in graph.edges(data=True):
+            wl_graph.add_edge(
+                u,
+                v,
+                **{edge_attr: canonical_bytes(dict(attrs)).decode("utf-8")},
+            )
+        return (
+            "directed" if nx.is_directed(graph) else "undirected",
+            graph.number_of_nodes(),
+            graph.number_of_edges(),
+            weisfeiler_lehman_graph_hash(
+                wl_graph,
+                node_attr=node_attr,
+                edge_attr=edge_attr,
+            ),
+        )
 
     def _graph_embeddings(self, graphs):
         graph_hashes = self._graph_hashes(graphs)
@@ -2655,6 +3852,152 @@ class EdgeGenerator:
             estimator_name="target_estimator",
         )
 
+    def _edge_risk_scores(self, candidates):
+        if (
+            self.edge_risk_model_ is None
+            or self.edge_risk_lambda == 0.0
+            or not candidates
+        ):
+            return np.zeros(len(candidates), dtype=float)
+        pair_graphs = []
+        for cand in candidates:
+            parent = cand.get("parent")
+            if parent is None:
+                pair_graphs.append(cand["graph"].copy())
+            else:
+                pair_graphs.append(
+                    self._make_edge_risk_graph_pair(parent["graph"], cand["graph"])
+                )
+        return self.edge_risk_model_.predict(pair_graphs)
+
+    def _make_edge_risk_graph_pair(self, parent_graph: nx.Graph, child_graph: nx.Graph):
+        return nx.disjoint_union(parent_graph.copy(), child_graph.copy())
+
+    def _reset_edge_risk_attempt_trace(self) -> None:
+        if self.edge_risk_model_ is None:
+            self.edge_risk_trace_ = None
+            return
+        self.edge_risk_trace_ = {
+            "next_state_id": 0,
+            "states": {},
+            "trained_state_ids": set(),
+        }
+
+    def _register_trace_state(self, state) -> None:
+        trace = self.edge_risk_trace_
+        if trace is None:
+            state["state_id"] = None
+            state["parent_state_id"] = None if state.get("parent") is None else state["parent"].get("state_id")
+            state["root_decision_id"] = None
+            return
+
+        state_id = int(trace["next_state_id"])
+        trace["next_state_id"] += 1
+        parent = state.get("parent")
+        parent_state_id = None if parent is None else parent.get("state_id")
+        state["state_id"] = state_id
+        state["parent_state_id"] = parent_state_id
+        state["root_decision_id"] = state_id if parent_state_id is not None else None
+        trace["states"][state_id] = {
+            "state": state,
+            "parent_state_id": parent_state_id,
+            "child_state_ids": [],
+            "status": "created",
+        }
+        if parent_state_id is not None and parent_state_id in trace["states"]:
+            trace["states"][parent_state_id]["child_state_ids"].append(state_id)
+
+    def _mark_trace_state_status(self, state, status: str) -> None:
+        trace = self.edge_risk_trace_
+        if trace is None:
+            return
+        state_id = state.get("state_id")
+        if state_id is None or state_id not in trace["states"]:
+            return
+        trace["states"][state_id]["status"] = status
+
+    def _trace_open_state_ids(self, beam):
+        trace = self.edge_risk_trace_
+        if trace is None:
+            return set()
+        open_state_ids = set()
+        for state in beam:
+            current = state
+            while current is not None:
+                state_id = current.get("state_id")
+                if state_id is None or state_id in open_state_ids:
+                    break
+                open_state_ids.add(state_id)
+                current = current.get("parent")
+        return open_state_ids
+
+    def _collect_trace_descendant_ids(self, state_id: int):
+        trace = self.edge_risk_trace_
+        if trace is None or state_id not in trace["states"]:
+            return []
+        descendants = []
+        stack = list(trace["states"][state_id]["child_state_ids"])
+        while stack:
+            child_id = stack.pop()
+            descendants.append(child_id)
+            stack.extend(trace["states"][child_id]["child_state_ids"])
+        return descendants
+
+    def _trace_failure_ratio_for_state(self, state_id: int) -> float:
+        trace = self.edge_risk_trace_
+        if trace is None or state_id not in trace["states"]:
+            return 0.0
+        descendant_ids = [state_id] + self._collect_trace_descendant_ids(state_id)
+        total_descendants = len(descendant_ids)
+        if total_descendants == 0:
+            return 0.0
+        failure_statuses = {
+            "partial_infeasible",
+            "lookahead_infeasible",
+            "final_infeasible",
+            "completion_infeasible",
+            "blocked",
+        }
+        infeasible_descendants = sum(
+            1
+            for descendant_id in descendant_ids
+            if trace["states"][descendant_id]["status"] in failure_statuses
+        )
+        return infeasible_descendants / float(total_descendants)
+
+    def _close_edge_risk_training_states(self, *, open_state_ids) -> None:
+        trace = self.edge_risk_trace_
+        if trace is None or self.edge_risk_model_ is None:
+            return
+
+        training_graphs = []
+        training_targets = []
+        for state_id, trace_state in trace["states"].items():
+            if state_id in open_state_ids or state_id in trace["trained_state_ids"]:
+                continue
+            state = trace_state["state"]
+            parent = state.get("parent")
+            if parent is None:
+                trace["trained_state_ids"].add(state_id)
+                continue
+            training_graphs.append(
+                self._make_edge_risk_graph_pair(parent["graph"], state["graph"])
+            )
+            training_targets.append(self._trace_failure_ratio_for_state(state_id))
+            trace["trained_state_ids"].add(state_id)
+
+        if training_graphs:
+            self.edge_risk_model_.partial_fit(training_graphs, training_targets)
+            if self.verbose:
+                fit_time = self.edge_risk_model_.last_fit_time_seconds()
+                fit_min = int(fit_time // 60)
+                fit_sec = fit_time - 60 * fit_min
+                print(
+                    f"[edge_risk_fit] graphs={len(training_graphs)} "
+                    f"training_set_size={self.edge_risk_model_.training_set_size()} "
+                    f"time={fit_min}m {fit_sec:.1f}s"
+                )
+
     def _class_probability(self, estimator, graphs, *, target, estimator_name: str):
         probs = estimator.predict_proba(graphs)
         classes = getattr(estimator, "classes_", None)
@@ -2732,7 +4075,7 @@ class EdgeGenerator:
         return value_list
 
     def _is_single_graph_input(self, graphs):
-        return isinstance(graphs, nx.Graph)
+        return is_simple_graph(graphs)
 
     def _state_key(self, graph: nx.Graph):
         if nx.is_directed(graph):
@@ -2771,4 +4114,10 @@ class EdgeGenerator:
                     kwargs["titles"] = titles
                 draw_graphs_fn(graphs, **kwargs)
             except TypeError:
+                if titles is not None:
+                    try:
+                        draw_graphs_fn(graphs, titles=titles)
+                        return
+                    except TypeError:
+                        pass
                 draw_graphs_fn(graphs)

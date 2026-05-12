@@ -1,68 +1,81 @@
-# abstractgraph-generative docs
+# Documentation
 
-`abstractgraph-generative` contains graph generation and rewrite workflows
-built on top of `abstractgraph` and `abstractgraph-ml`.
+This directory is the documentation root for `abstractgraph-generative`.
+
+## Start Here
+
+- [Overview](overview.md)
+- [Repository Organization](ORGANIZATION.md)
+- [Notebook Guide](notebooks.md)
+
+## Guides
+
+- [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md)
+- [Conditional Autoregressive Generation](conditional-autoregressive-generation.md)
+- [Edge Generator](edge-generator.md)
 
 ## Scope
 
-This repo owns:
-- autoregressive generators
-- conditional autoregressive generators
+This repo owns the graph-only generation layer built on top of
+`abstractgraph` and `abstractgraph-ml`, including:
+
+- autoregressive generation
+- conditional autoregressive generation
 - interpolation and path-construction workflows
 - graph rewrite and repair utilities
 - graph optimization helpers
-- backend-specific generators such as VGAE, GRAN, and DiGress wrappers
-- graph-only generative workflows
+- edge-based generation workflows
 
-## Module map
 
-- `abstractgraph_generative.rewrite`
-  rewrite primitives and boundary-compatible replacements
+## Module Map
+
 - `abstractgraph_generative.autoregressive`
-  autoregressive generator
+  Autoregressive generator over mapped-subgraph rewrites.
+- `abstractgraph_generative.rewrite`
+  Rewrite primitives and boundary-compatible replacements.
 - `abstractgraph_generative.conditional`
-  conditional autoregressive generator
+  Conditional autoregressive generator.
 - `abstractgraph_generative.conditional_batch`
-  dataset-level conditional generation wrapper
+  Dataset-level conditional generation wrapper.
+- `abstractgraph_generative.conditional_attributed`
+  Context-aware conditional variant.
+- `abstractgraph_generative.edge_generator`
+  Edge-by-edge generator with feasibility, ranking, pair retrieval, and
+  nearest-neighbor repair workflows.
 - `abstractgraph_generative.interpolate`
-  interpolation estimator
+  Interpolation estimator helpers.
 - `abstractgraph_generative.interpolation`
-  interpolation generator
+  Interpolation generator.
 - `abstractgraph_generative.optimize`
-  optimization helpers
+  Optimization helpers.
 - `abstractgraph_generative.repair`
-  repair-style generation
-- `abstractgraph_generative.legacy.conditional_v0_1`
-  preserved legacy conditional pipeline
+  Repair-style generation utilities.
 
-Text and story-graph workflows now live in the sibling repo
-`/home/fabrizio/code/abstractgraph-text`.
+## Common Workflows
 
-## Related docs
+- `generate(...)`
+  Grow a graph to a requested edge count under feasibility constraints.
+- `generate_from_pair(...)`
+  Build a local fitting subset from a stored retrieval corpus and generate from
+  a mixed pair start graph.
+- `repair(...)`
+  Fit on nearest stored neighbors whose combined node-label set covers one
+  query graph, then regrow from a surgically repaired infeasible start back to
+  the original edge count. Edge search uses completion-budget and bounded
+  terminal-completion diagnostics to avoid retaining candidates that cannot
+  finish inside the remaining edge budget.
 
-- [AUTOREGRESSIVE_GENERATOR_AND_REWRITE.md](AUTOREGRESSIVE_GENERATOR_AND_REWRITE.md)
+## Conventions
 
-Compatibility note:
-- active code is migrating to `base_graph`, `interpretation_graph`, and
-  `mapped_subgraph`
-- `abstractgraph_generative.legacy.*` intentionally preserves the older
-  terminology for backward compatibility
+- Active narrative documentation lives in `docs/`.
+- Long-form guides live directly in `docs/`.
+- Guide filenames use kebab-case.
+- `README.md` files outside `docs/` act as short pointers to canonical docs.
+- `README.md` files inside `docs/` act as landing pages for directories.
 
-## Dependencies
+## Notes
 
-- `abstractgraph`
-- `abstractgraph-ml`
-
-## Ecosystem
-
-Sibling repositories:
-
-- `abstractgraph`
-  Path: `/home/fabrizio/work/abstractgraph`
-- `abstractgraph-ml`
-  Path: `/home/fabrizio/work/abstractgraph-ml`
-- `abstractgraph-generative`
-  Path: `/home/fabrizio/work/abstractgraph-generative`
-
-See [../ECOSYSTEM.md](../ECOSYSTEM.md) for install order and dependency
-direction.
+- Active code is migrating to `base_graph`, `interpretation_graph`, and
+  `mapped_subgraph`.
+- For repo-level dependency context, see the
+  [AbstractGraph ecosystem README](../../../README.md).

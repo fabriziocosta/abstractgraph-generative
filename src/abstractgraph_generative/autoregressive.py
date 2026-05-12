@@ -45,7 +45,6 @@ from typing import Callable, Optional, Sequence
 from collections import defaultdict
 import random
 import weakref
-import warnings
 import numpy as np
 import networkx as nx
 from abstractgraph_generative.rewrite import (
@@ -55,27 +54,10 @@ from abstractgraph_generative.rewrite import (
     virtual_rewrite_candidates_at_cut_nodes,
     deduplicate_cut_index,
 )
-from abstractgraph.graphs import graph_to_abstract_graph
+from abstractgraph.graphs import graph_to_abstract_graph, is_simple_graph, make_simple_graph_like
 from abstractgraph.hashing import GraphHashDeduper, hash_graph
 from abstractgraph.vectorize import AbstractGraphTransformer
 from joblib import Parallel, delayed
-
-
-def _warn_deprecated_name(old_name: str, new_name: str) -> None:
-    warnings.warn(
-        f"`{old_name}` is deprecated and will be removed in a future release; use `{new_name}` instead.",
-        DeprecationWarning,
-        stacklevel=3,
-    )
-
-
-def _resolve_alias(canonical, deprecated, deprecated_name: str, canonical_name: str):
-    if deprecated is None:
-        return canonical
-    _warn_deprecated_name(deprecated_name, canonical_name)
-    if canonical is not None:
-        raise ValueError(f"Pass only one of `{canonical_name}` or `{deprecated_name}`.")
-    return deprecated
 
 
 def _top_k_indices(scores: Sequence[float], k: int) -> list[int]:
@@ -133,9 +115,7 @@ def generate_pruning_sequences(
     use_context_embedding: bool = True,
     association_aware: bool = False,
     fixed_interpretation_graph: Optional[nx.Graph] = None,
-    fixed_image_graph: Optional[nx.Graph] = None,
     return_interpretation_steps: bool = False,
-    return_image_steps: Optional[bool] = None,
     cut_index: Optional[dict] = None,
     return_cut_index: bool = False,
     seed: Optional[int] = None,
@@ -170,11 +150,9 @@ def generate_pruning_sequences(
         fixed_interpretation_graph: Optional fixed interpretation graph to use
             when association_aware=True. If None, it is built from the initial
             graph using the decomposition_function and nbits.
-        fixed_image_graph: Deprecated alias for `fixed_interpretation_graph`.
         return_interpretation_steps: If True and association_aware, also
             return a list of interpretation graphs per pruning step reflecting
             removed mapped subgraphs.
-        return_image_steps: Deprecated alias for `return_interpretation_steps`.
         cut_index: Optional dictionary to append cut signatures to.
         return_cut_index: If True, return a tuple (sequence, cut_index).
         seed: Optional random seed for reproducibility.
@@ -195,20 +173,8 @@ def generate_pruning_sequences(
         - Node and edge attributes are preserved for retained parts.
         - Recorded cut signatures use outer subgraph hashes with edge labels omitted.
     """
-    fixed_interpretation_graph = _resolve_alias(
-        fixed_interpretation_graph,
-        fixed_image_graph,
-        "fixed_image_graph",
-        "fixed_interpretation_graph",
-    )
-    return_interpretation_steps = _resolve_alias(
-        return_interpretation_steps,
-        return_image_steps,
-        "return_image_steps",
-        "return_interpretation_steps",
-    )
     if decomposition_function is None:
-        raise ValueError("decomposition_function is required for image-node pruning.")
+        raise ValueError("decomposition_function is required for interpretation-node pruning.")
     g = graph.copy()
     out: list[nx.Graph] = []
     interpretation_steps: list[nx.Graph] = []
@@ -288,57 +254,58 @@ def generate_pruning_sequences(
                 nbits=nbits,
             )
             fixed_interpretation_graph = ag0.interpretation_graph.copy()
-        assoc_nodes_by_image = {}
+        assoc_nodes_by_interpretation = {}
         assoc_count = defaultdict(int)
-        for img_node, data in fixed_interpretation_graph.nodes(data=True):
+        for interpretation_node, data in fixed_interpretation_graph.nodes(data=True):
             mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
-            nodes = set(mapped_subgraph.nodes()) if isinstance(mapped_subgraph, nx.Graph) else set()
-            assoc_nodes_by_image[img_node] = nodes
+            nodes = set(mapped_subgraph.nodes()) if is_simple_graph(mapped_subgraph) else set()
+            assoc_nodes_by_interpretation[interpretation_node] = nodes
             for node in nodes:
                 assoc_count[node] += 1
-        removed_images = set()
+        removed_interpretations = set()
         if include_start and return_interpretation_steps:
             interpretation_steps.append(fixed_interpretation_graph.copy())
         while g.number_of_nodes() > 0:
             candidates = [
-                img_node
-                for img_node, nodes in assoc_nodes_by_image.items()
-                if img_node not in removed_images and nodes
+                interpretation_node
+                for interpretation_node, nodes in assoc_nodes_by_interpretation.items()
+                if interpretation_node not in removed_interpretations and nodes
             ]
             if not candidates:
                 break
             rng.shuffle(candidates)
-            img_node = candidates[0]
-            removed_images.add(img_node)
-            inner_nodes = set(assoc_nodes_by_image.get(img_node, set()))
+            interpretation_node = candidates[0]
+            removed_interpretations.add(interpretation_node)
+            inner_nodes = set(assoc_nodes_by_interpretation.get(interpretation_node, set()))
             inner_nodes &= set(g.nodes())
             if not inner_nodes:
                 continue
             for node in inner_nodes:
                 assoc_count[node] = max(0, assoc_count.get(node, 0) - 1)
             remaining_nodes = {n for n, c in assoc_count.items() if c > 0}
-            # Auto-remove image nodes whose associations are now empty.
-            for inode, nodes in assoc_nodes_by_image.items():
-                if inode in removed_images:
+            # Auto-remove interpretation nodes whose associations are now empty.
+            for inode, nodes in assoc_nodes_by_interpretation.items():
+                if inode in removed_interpretations:
                     continue
                 if not (nodes & remaining_nodes):
-                    removed_images.add(inode)
+                    removed_interpretations.add(inode)
             g2 = g.subgraph(remaining_nodes).copy()
             if return_interpretation_steps:
-                img_step = fixed_interpretation_graph.copy()
-                for inode, data in img_step.nodes(data=True):
+                interpretation_step = fixed_interpretation_graph.copy()
+                for inode, data in interpretation_step.nodes(data=True):
                     mapped_subgraph = data.get("mapped_subgraph", data.get("association"))
-                    if not isinstance(mapped_subgraph, nx.Graph):
+                    if not is_simple_graph(mapped_subgraph):
                         continue
-                    if inode in removed_images:
-                        data["mapped_subgraph"] = nx.Graph()
-                        data["association"] = nx.Graph()
+                    if inode in removed_interpretations:
+                        empty_graph = make_simple_graph_like(g)
+                        data["mapped_subgraph"] = empty_graph
+                        data["association"] = empty_graph.copy()
                     else:
                         next_subgraph = mapped_subgraph.subgraph(remaining_nodes).copy()
                         data["mapped_subgraph"] = next_subgraph
                         data["association"] = next_subgraph
-                img_step.graph["removed_images"] = set(removed_images)
-                interpretation_steps.append(img_step)
+                interpretation_step.graph["removed_interpretations"] = set(removed_interpretations)
+                interpretation_steps.append(interpretation_step)
             if local_cut_index is not None:
                 entry = virtual_cut_entry(
                     g,
@@ -350,11 +317,13 @@ def generate_pruning_sequences(
                 )
                 if entry is not None:
                     cut_key, donor_edge_map, donor_cut, outer_ctx, inner_ctx = entry
-                    mapped_subgraph = fixed_interpretation_graph.nodes[img_node].get("mapped_subgraph")
+                    mapped_subgraph = fixed_interpretation_graph.nodes[interpretation_node].get("mapped_subgraph")
                     if mapped_subgraph is None:
-                        mapped_subgraph = fixed_interpretation_graph.nodes[img_node].get("association")
+                        mapped_subgraph = fixed_interpretation_graph.nodes[interpretation_node].get("association")
                     mapped_subgraph = (
-                        mapped_subgraph.subgraph(inner_nodes).copy() if isinstance(mapped_subgraph, nx.Graph) else nx.Graph()
+                        mapped_subgraph.subgraph(inner_nodes).copy()
+                        if is_simple_graph(mapped_subgraph)
+                        else make_simple_graph_like(g)
                     )
                     assoc_hash = hash_graph(mapped_subgraph)
                     if use_context_embedding and context_vectorizer is not None:
@@ -382,7 +351,7 @@ class AutoregressiveGraphGenerator(object):
 
     Summary
         Uses a donor pool constructed from prunings of input graphs by removing
-        image-node associations. Starting from a small seed subgraph (with
+        interpretation-node associations. Starting from a small seed subgraph (with
         `min_nodes_for_pruning`), it grows a graph by repeatedly proposing virtual-cut
         insertions from the pruning-derived cut index and selecting among
         feasible candidates. Optional dataset storage supports sampling a seed
@@ -398,9 +367,9 @@ class AutoregressiveGraphGenerator(object):
         feasibility_estimator: Object with `fit(graphs)` and `filter(graphs)`
             methods used to retain only feasible candidate graphs at each step.
         nbits: Hash bit width used by AbstractGraph operators when building
-            image-node associations.
+            interpretation-node associations.
         decomposition_function: AbstractGraph decomposition function used to
-            build image-node associations for pruning and virtual-cut indexing.
+            build interpretation-node associations for pruning and virtual-cut indexing.
         cut_radius: Boundary signature radius used for virtual-cut signatures
             when building the pruning index (None/0/positive).
         cut_context_radius: Neighborhood radius for context embeddings attached

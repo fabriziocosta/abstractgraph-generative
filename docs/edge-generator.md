@@ -4,8 +4,12 @@
 
 - a partial-stage feasibility model to reject invalid intermediate graphs
 - a final-graph feasibility model to validate completed graphs
+- calibrated lookahead pruning from the final model's violation counts, using a
+  stochastic lognormal tail model by default
 - a graph classifier to rank feasible candidates
 - an optional target model to bias generation toward a requested class or value
+- an optional online edge-risk model to penalize edge decisions that tend to
+  lead to infeasible descendants
 - an optional decomposition-aware training trajectory to bias reconstruction toward complete subgraphs
 - an optional stored retrieval corpus to select path-based fitting subsets from graph pairs
 - a beam search over partial constructions
@@ -26,6 +30,7 @@ Typical usage:
 
 ```python
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import SGDRegressor
 
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_ml.estimators import GraphEstimator
@@ -57,6 +62,17 @@ target_estimator = GraphEstimator(
     ),
 )
 
+edge_risk_estimator = GraphEstimator(
+    transformer=transformer,
+    estimator=SGDRegressor(
+        loss="epsilon_insensitive",
+        alpha=1e-4,
+        max_iter=1000,
+        tol=1e-3,
+        random_state=0,
+    ),
+)
+
 # Example target: regress graph max degree.
 fit_targets = [max(dict(graph.degree()).values(), default=0) for graph in fit_graphs]
 
@@ -64,6 +80,7 @@ generator = EdgeGenerator(
     feasibility_estimator=feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
+    edge_risk_estimator=edge_risk_estimator,
     target_estimator_mode="regression",
     decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
     n_negative_per_positive=5,
@@ -74,6 +91,8 @@ generator = EdgeGenerator(
     fallback_growth_factor=2.0,
     beam_growth_factor=1.5,
     max_beam_size=8,
+    edge_risk_lambda=0.25,
+    require_single_connected_component=True,
     verbose=True,
     seed=0,
 ).fit(fit_graphs, fit_targets)
@@ -96,7 +115,9 @@ generator = EdgeGenerator(
     final_feasibility_estimator=final_feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
+    edge_risk_estimator=edge_risk_estimator,
     target_estimator_mode="regression",
+    edge_risk_lambda=0.25,
     decomposition_function=EDGE_DECOMPOSITION_FUNCTION,
     verbose=True,
     seed=0,
@@ -118,6 +139,57 @@ generation_path = generator.generate_from_pair(
 )
 ```
 
+Stored-corpus repair workflow:
+
+```python
+repair_path = generator.repair(
+    graph,
+    n_neighbors=3,
+    target=None,
+    target_lambda=0.5,
+    return_path=True,
+    draw_graphs_fn=lambda graphs, **kwargs: display_graphs(
+        graphs,
+        n_graphs_per_line=7,
+        **kwargs,
+    ),
+)
+```
+
+Use `repair(...)` when you already have a candidate graph and want to repair it
+relative to a stored corpus, rather than mixing two endpoints.
+
+Typical pattern:
+
+1. call `generator.store(all_graphs, targets=all_targets)` once
+2. pass the query graph to `generator.repair(...)`
+3. choose `n_neighbors` to control how local the repair fit should be
+4. optionally pass `target` and `target_lambda` to bias the repaired result
+
+Behavior:
+
+- the target edge count is always `graph.number_of_edges()`
+- if the graph is already final-feasible, repair returns it unchanged
+- when selecting the local repair fitting set, `repair()` scans stored graphs in
+  nearest-neighbor order and prioritizes candidates that add missing input
+  labels until the selected neighborhood's union of unique node labels covers
+  the input graph; extra labels in stored graphs are allowed
+- after compatible neighbors are selected, `repair()` still checks the union of
+  retrieved labels as a guard; if any input label is missing, repair fails fast
+  and returns no repair instead of fitting incompatible feasibility models
+- if the graph is final-infeasible, repair asks the final-feasibility estimator
+  for violating edge sets, removes the most implicated edges according to the
+  fallback rollback schedule, and regrows from those repaired starts
+- with `return_path=True`, the returned path begins with the original graph,
+  then the repaired start, then the regrowth sequence
+
+Diagnostics:
+
+- when the label-set compatibility check fails, the generator stores the
+  details in `last_repair_label_set_mismatch_`
+- in verbose mode, repair logs `missing_from_neighbors` and
+  `extra_in_neighbors` so you can inspect neighborhood coverage
+
 Component-mixing helper:
 
 ```python
@@ -132,28 +204,72 @@ whose total node count is closest to the average node count of the two inputs.
 
 ## Feasibility Stages
 
-`EdgeGenerator` supports two feasibility models:
+`EdgeGenerator` supports two feasibility estimators and one calibrated
+lookahead rule:
 
 - `partial_feasibility_estimator`: trained on partial reconstruction stages and
   used while edges are being added
 - `final_feasibility_estimator`: trained on full graphs and used only when a
   candidate has reached the requested final edge count
+- lookahead pruning: if the final estimator implements
+  `number_of_violations(graphs)`, the generator calibrates violation-count
+  behavior from positive edge-removal examples at each remaining-edge distance
+  from the final graph
 
-This is useful when some constraints should apply only to completed graphs. For
-example, an intermediate graph may temporarily contain aromatic bonds that do
-not yet form a full aromatic cycle, while the final graph must satisfy that
+This is useful when some constraints should apply only to completed graphs, but
+still expose a direct count of unresolved final violations during construction.
+For example, an intermediate graph may temporarily contain aromatic bonds that
+do not yet form a full aromatic cycle, while the final graph must satisfy that
 constraint.
 
 Backward compatibility:
 
 - if you pass only `feasibility_estimator=...`, the generator uses it as the
   partial estimator and deep-copies it for the final estimator
+- lookahead pruning is disabled automatically if the final estimator does not
+  implement `number_of_violations(graphs)`
 
 Training behavior:
 
 - the partial estimator is fit on the fragment set used during edge-regression
   training
 - the final estimator is fit only on the full seed graphs
+- lookahead calibration is fit from positive edge-removal fragments after the
+  final estimator has been fit
+
+Lookahead pruning modes:
+
+- `lookahead_rejection_model="lognormal_tail"` (default): fit a per-distance
+  lognormal model to `log1p(number_of_violations)` on positive fragments, then
+  sample rejection from the upper tail.
+- `lookahead_rejection_model="max_envelope"`: deterministically reject only
+  candidates whose violation count exceeds the maximum positive count seen at
+  the same remaining-edge distance.
+
+Default stochastic rejection:
+
+```text
+tail_prob = lognormal_cdf(number_of_violations(candidate))
+if tail_prob <= lookahead_rejection_quantile:
+    reject_prob = 0.0
+else:
+    reject_prob = (tail_prob - lookahead_rejection_quantile) / (1.0 - lookahead_rejection_quantile)
+reject_prob = reject_prob ** (1.0 / lookahead_rejection_temperature)
+reject = rng.random() < reject_prob
+```
+
+Deterministic envelope rejection:
+
+```text
+remaining_moves = target_edges - candidate_edges
+threshold = max_positive_number_of_violations_seen_at[remaining_moves]
+keep_candidate = number_of_violations(candidate) <= threshold
+```
+
+If no positive examples were observed for a candidate's `remaining_moves`,
+lookahead pruning is skipped for that candidate. Lookahead applies only to
+non-terminal candidates; terminal candidates are still validated by
+`final_feasibility_estimator`.
 
 ## Generate Semantics
 
@@ -178,6 +294,20 @@ With `verbose=True`, failed graphs emit a log line instead of aborting the full
 batch.
 
 `return_path=True` is still the default for compatibility.
+
+When `require_single_connected_component=True` (the default), a graph is not
+accepted as a terminal result unless it is both final-feasible and reduced to a
+single connected component. If search reaches `n_edges` with a disconnected
+final-feasible graph, it can continue for a bounded number of extra edges to
+try to connect the remaining components.
+
+Verbose feasibility counts:
+
+- `partial_infeasible`: rejected by the partial estimator
+- `lookahead_infeasible`: rejected because final-estimator violation counts
+  exceed the learned positive envelope for that remaining-edge distance
+- `final_infeasible`: reached a terminal edge count but failed the final
+  estimator
 
 ## Stored Retrieval Corpus
 
@@ -242,11 +372,43 @@ In that mode the generator:
 - performs a fresh stochastic edge removal and component mix
 - starts a new generation immediately
 
+You can also override the cached edge-removal amount without rebuilding the
+pair-retrieval context:
+
+```python
+generator.generate_from_pair(
+    None,
+    None,
+    size_of_edge_removal=0.8,
+    target_lambda=1.0,
+    return_path=True,
+)
+```
+
+If `size_of_edge_removal` is omitted in cached-session mode, the previously
+cached value is reused.
+
 If stored targets exist and no explicit `target=` is passed, `generate_from_pair()`
 infers a pair target from the endpoint targets:
 
 - regression mode: mean target
-- classification mode: rounded mean target
+- classification mode: uniformly sample one of the two endpoint targets
+
+`repair()` also reuses the stored corpus, but for a single graph query:
+
+1. vectorize the query graph against the stored retrieval transformer
+2. select the `n_neighbors` nearest stored graphs
+3. fit the generator on that local neighborhood
+4. keep the original graph edge count as the repair target
+5. if the input graph is already final-feasible, return it directly
+6. otherwise ask the final-feasibility estimator for violating edge sets
+7. construct one or more surgically reduced start graphs by removing the most
+   implicated edges according to the fallback rollback schedule
+8. regrow from those repaired starts back to the original edge count
+
+If the queried graph exactly matches a stored graph hash and stored targets are
+available, `repair()` reuses that stored target when no explicit `target=` is
+provided.
 
 ## Search Strategy
 
@@ -256,8 +418,9 @@ At each depth, the generator:
 2. filters expanded graphs with the feasibility estimator
 3. scores feasible survivors with the graph classifier
 4. optionally adds a target-model score from `target_estimator`
-5. subtracts fallback repulsion when that mechanism is active
-4. retains a beam made of:
+5. optionally subtracts an online edge-risk penalty from `edge_risk_estimator`
+6. subtracts fallback repulsion when that mechanism is active
+7. retains a beam made of:
    - the top-scoring candidates
    - a random sample from the remaining positive candidates
 
@@ -271,14 +434,24 @@ For classification mode:
 
 ```text
 target_score = P(target_class | graph)
-selection_score = classifier_score + target_lambda * target_score - repulsion_lambda * repulsion
+selection_score = (
+    classifier_score
+    + target_lambda * target_score
+    - edge_risk_lambda * risk_score
+    - repulsion_lambda * repulsion
+)
 ```
 
 For regression mode:
 
 ```text
 target_score = 1 / (1 + abs(predicted_target - requested_target))
-selection_score = classifier_score + target_lambda * target_score - repulsion_lambda * repulsion
+selection_score = (
+    classifier_score
+    + target_lambda * target_score
+    - edge_risk_lambda * risk_score
+    - repulsion_lambda * repulsion
+)
 ```
 
 where:
@@ -286,8 +459,59 @@ where:
 - `classifier_score` is the downstream graph classifier probability for class 1
 - `target_score` is either the requested class probability or a regression closeness score
 - `target_lambda` is the user-controlled weight of the target objective
+- `risk_score` is the predicted future infeasible-descendant ratio for the
+  edge decision that produced the candidate
+- `edge_risk_lambda` is the user-controlled weight of the risk penalty
 - `repulsion` is the maximum cosine similarity to the failed-memory bank
 - `repulsion_lambda` grows with the number of fallback stages already used
+
+## Online Edge Risk Learning
+
+When `edge_risk_estimator` is provided, the generator learns online from its
+own search history.
+
+For every closed parent-to-child transition produced by materializing one edge,
+the estimator input is a disjoint graph made from:
+
+- the parent graph before adding the edge
+- the child graph after adding the edge
+
+The target is computed when that transition closes, either because the search
+solves, fails, or enters fallback and replaces the current beam:
+
+```text
+risk = infeasible_descendants / total_descendants
+```
+
+where `total_descendants` includes the child state itself plus all realized
+search descendants observed below it in the current search policy. This means:
+
+- an immediately infeasible leaf contributes one example with target `1.0`
+- an immediately non-infeasible leaf contributes one example with target `0.0`
+- an internal transition contributes one example with a fractional target that
+  summarizes how much of its realized downstream subtree became infeasible
+
+Failures include partial-feasibility rejections, final-feasibility rejections,
+and blocked states where the beam cannot produce a solution. These cases are
+important when the problem is missing future edges rather than an explicitly
+invalid existing edge: there may be no `violating_edge_sets(...)` evidence for
+surgical removal, but the transition can still train edge risk because its
+descendants ended in a dead end.
+
+This model is updated online through an adapter with `partial_fit(...)`
+semantics:
+
+- if the wrapped estimator already supports `partial_fit`, that is used directly
+- otherwise the adapter stores all past training examples in memory and refits
+  the estimator on the full replay buffer each time it is updated
+
+`GraphEstimator` also exposes `partial_fit(...)` natively: it uses the wrapped
+estimator's own `partial_fit(...)` when available, otherwise it caches the
+already-vectorized batches and refits on their concatenation. This means an
+online SVM-style regressor such as
+`GraphEstimator(..., estimator=SGDRegressor(loss="epsilon_insensitive", ...))`
+can be trained incrementally for edge risk, while non-incremental estimators
+still work through replayed refits on cached feature matrices.
 
 ## Target-Conditioned Fitting
 
@@ -374,6 +598,10 @@ This makes the fallback logic answer two separate questions:
 
 The first still comes from the rollback schedule. The second now comes from
 feasibility evidence whenever the estimator can expose structural violations.
+When a dead end is caused by missing edges rather than bad existing edges,
+surgical repair may have no edge set to remove. Those dead ends are still
+recorded as blocked or completion-infeasible trace states so the online edge-risk
+model can penalize earlier edge additions that repeatedly lead into them.
 
 ### Rollback Schedule
 
@@ -407,6 +635,8 @@ uses that distance, but applies it surgically:
   continuations
 - repeated evidence across several infeasible candidates increases the priority
   of removing that edge
+- missing-edge dead ends still contribute online edge-risk targets, even when no
+  violating edge set can be localized
 
 This is especially effective with feasibility estimators such as
 `FeasibilityEstimatorFeatureCannotExist`, because they can map forbidden motifs
@@ -510,6 +740,9 @@ regions.
 - `target_estimator`
   Optional classifier or regressor trained on positive fragments when
   `fit(..., targets=...)` is used.
+- `edge_risk_estimator`
+  Optional online regressor trained from realized search descendants during
+  generation.
 - `target_estimator_mode`
   Either `"classification"` or `"regression"` for target scoring.
 - `decomposition_function`
@@ -530,6 +763,14 @@ regions.
   Exponential growth factor for beam widening after each fallback.
 - `max_beam_size`
   Optional cap on widened beam size.
+- `edge_risk_lambda`
+  Coefficient applied to the predicted edge-risk penalty in candidate ranking.
+- `require_single_connected_component`
+  When true, disconnected final-feasible graphs are not accepted at
+  `n_edges`; search may spend a bounded number of extra edges trying to merge
+  the remaining connected components. Candidates whose remaining edge budget
+  cannot merge their current components or cover final-estimator node violation
+  sets are pruned as completion-infeasible.
 - `use_similarity_repulsion`
   Whether to activate cosine-similarity repulsion after fallback begins.
 - `repulsion_weight`
@@ -575,12 +816,17 @@ Search logs report:
 - active beam limit
 - fallback count when a rollback happens
 
+If early stopping is enabled, it is evaluated only in the final search phase.
+Earlier phases still have to exhaust their normal beam expansion and fallback
+logic before a final-feasible shorter graph can terminate the run.
+
 Fallback transitions are logged explicitly, including:
 
 - fallback index
 - rollback distance
 - target depth
 - widened beam limit
+- current `edge_risk_training_set_size` when an edge-risk estimator is active
 
 ## Tradeoffs
 

@@ -4,7 +4,7 @@ This module extends the simplified conditional autoregressive generator with a
 base-graph context scorer. Each fitted component caches an embedding computed
 by vectorizing either the union of radius-limited neighborhoods around its
 anchor nodes in the original training base graph, or the full graph when
-``preimage_context_radius=None``. During generation, a bounded set of legal
+``base_context_radius=None``. During generation, a bounded set of legal
 rewiring branches is materialized on the current partial graph, embedded
 through the same context vectorizer, and sampled with probability proportional
 to their cosine similarity to the stored component context. When
@@ -31,7 +31,7 @@ from abstractgraph_generative.rewrite import (
     _cosine_similarity,
     _transform_context_graphs,
 )
-from abstractgraph.graphs import get_mapped_subgraph, graph_to_abstract_graph
+from abstractgraph.graphs import get_mapped_subgraph, graph_to_abstract_graph, is_simple_graph
 from abstractgraph.hashing import hash_graph
 
 
@@ -66,10 +66,8 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         feasibility_estimator=None,
         base_cut_radius: Optional[int] = None,
         interpretation_cut_radius: Optional[int] = None,
-        preimage_cut_radius: Optional[int] = None,
-        image_cut_radius: Optional[int] = None,
         context_vectorizer=None,
-        preimage_context_radius: Optional[int] = None,
+        base_context_radius: Optional[int] = None,
         num_context_rewirings: int = 16,
         n_jobs: int = -1,
         debug: bool = False,
@@ -81,12 +79,10 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             decomposition_function: Decomposition function for AbstractGraph conversion.
             nbits: Hash bit width for hashing base and interpretation neighborhoods.
             feasibility_estimator: Optional final-graph feasibility estimator.
-            base_cut_radius: Canonical radius for anchor neighborhood hashes.
-            interpretation_cut_radius: Canonical radius for interpretation-node neighborhood hashes.
-            preimage_cut_radius: Deprecated alias for ``base_cut_radius``.
-            image_cut_radius: Deprecated alias for ``interpretation_cut_radius``.
+            base_cut_radius: Radius for anchor neighborhood hashes.
+            interpretation_cut_radius: Radius for interpretation-node neighborhood hashes.
             context_vectorizer: Graph vectorizer used for context embeddings.
-            preimage_context_radius: Radius of the anchor-context neighborhood union.
+            base_context_radius: Radius of the anchor-context neighborhood union.
                 If None, embed the whole graph directly instead of extracting a
                 union of anchor-centered neighborhoods.
             num_context_rewirings: Number of legal rewiring branches to score
@@ -104,15 +100,11 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             feasibility_estimator=feasibility_estimator,
             base_cut_radius=base_cut_radius,
             interpretation_cut_radius=interpretation_cut_radius,
-            preimage_cut_radius=preimage_cut_radius,
-            image_cut_radius=image_cut_radius,
+            context_vectorizer=context_vectorizer,
+            base_context_radius=base_context_radius,
             n_jobs=n_jobs,
             debug=debug,
             debug_level=debug_level,
-        )
-        self.context_vectorizer = context_vectorizer
-        self.preimage_context_radius = (
-            None if preimage_context_radius is None else int(preimage_context_radius)
         )
         self.num_context_rewirings = max(1, int(num_context_rewirings))
         self._component_context_embeddings: dict[int, object] = {}
@@ -147,7 +139,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         ]
 
         full_graph_embeddings = {}
-        if self.preimage_context_radius is None:
+        if self.base_context_radius is None:
             for graph in graph_list:
                 cache_key = hash_graph(graph)
                 full_graph_embeddings[cache_key] = self._embed_context_graph(graph)
@@ -155,14 +147,14 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         comp_id = 0
         for ag in abstract_graphs:
             graph_embedding = None
-            if self.preimage_context_radius is None:
+            if self.base_context_radius is None:
                 graph_embedding = full_graph_embeddings.get(hash_graph(ag.base_graph))
-            for image_node in ag.interpretation_graph.nodes():
+            for interpretation_node in ag.interpretation_graph.nodes():
                 if comp_id in self._components:
-                    if self.preimage_context_radius is None:
+                    if self.base_context_radius is None:
                         self._component_context_embeddings[comp_id] = graph_embedding
                     else:
-                        anchor_nodes = self._training_anchor_nodes(ag.interpretation_graph, image_node)
+                        anchor_nodes = self._training_anchor_nodes(ag.interpretation_graph, interpretation_node)
                         self._component_context_embeddings[comp_id] = self._embed_anchor_context(
                             ag.base_graph,
                             anchor_nodes,
@@ -195,27 +187,27 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             return None
         return max(0.0, (float(similarity) + 1.0) * 0.5)
 
-    def _training_anchor_nodes(self, interpretation_graph: nx.Graph, image_node) -> list:
+    def _training_anchor_nodes(self, interpretation_graph: nx.Graph, interpretation_node) -> list:
         """Collect training-time anchor nodes for one interpretation-node mapping.
 
         Args:
             interpretation_graph: Training interpretation graph.
-            image_node: Interpretation node whose anchors are requested.
+            interpretation_node: Interpretation node whose anchors are requested.
 
         Returns:
             list: Sorted anchor nodes in the original base graph.
         """
-        mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[image_node])
-        if not isinstance(mapped_subgraph, nx.Graph):
+        mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[interpretation_node])
+        if not is_simple_graph(mapped_subgraph):
             return []
         anchor_nodes = set()
         mapped_nodes = set(mapped_subgraph.nodes())
-        for neighbor in interpretation_graph.neighbors(image_node):
+        for neighbor in interpretation_graph.neighbors(interpretation_node):
             neighbor_mapped_subgraph = get_mapped_subgraph(interpretation_graph.nodes[neighbor])
-            if not isinstance(neighbor_mapped_subgraph, nx.Graph):
+            if not is_simple_graph(neighbor_mapped_subgraph):
                 continue
             anchor_nodes.update(mapped_nodes & set(neighbor_mapped_subgraph.nodes()))
-        return sorted(anchor_nodes, key=lambda node: self._preimage_node_order_key(mapped_subgraph, node))
+        return sorted(anchor_nodes, key=lambda node: self._base_node_order_key(mapped_subgraph, node))
 
     def _materialized_anchor_nodes(
         self,
@@ -258,7 +250,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         Returns:
             Optional[nx.Graph]: Context subgraph, or None when anchors are unavailable.
         """
-        if self.preimage_context_radius is None:
+        if self.base_context_radius is None:
             return graph
         centers = [node for node in anchor_nodes if node in graph]
         if not centers:
@@ -269,7 +261,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
             lengths = nx.single_source_shortest_path_length(
                 graph,
                 center,
-                cutoff=int(self.preimage_context_radius),
+                cutoff=int(self.base_context_radius),
             )
             included_nodes.update(lengths.keys())
         if not included_nodes:
@@ -288,7 +280,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         if graph is None or self.context_vectorizer is None:
             return None
         cache_key = None
-        if self.preimage_context_radius is None:
+        if self.base_context_radius is None:
             cache_key = hash_graph(graph)
             if cache_key in self._full_graph_context_embeddings:
                 return self._full_graph_context_embeddings[cache_key]

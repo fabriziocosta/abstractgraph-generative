@@ -1,5 +1,5 @@
 """
-Repair utilities that reuse graph_rewrite and transformer embeddings.
+Repair utilities that reuse rewrite helpers and transformer embeddings.
 
 Summary
 - Caches donor graphs and their embeddings.
@@ -21,7 +21,12 @@ import random
 import numpy as np
 import networkx as nx
 
-from abstractgraph.graphs import AbstractGraph, graph_to_abstract_graph, graphs_to_abstract_graphs
+from abstractgraph.graphs import (
+    AbstractGraph,
+    graph_to_abstract_graph,
+    graphs_to_abstract_graphs,
+    is_simple_graph,
+)
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_generative.rewrite import rewrite
 
@@ -36,7 +41,7 @@ class RepairGenerator:
         graph_transformer: Transformer used to embed graphs for neighbor search
             and candidate selection. Typically `AbstractGraphTransformer`.
         rng: Optional random generator for rewrite sampling.
-        **rewrite_kwargs: Any keyword parameters accepted by `graph_rewrite.rewrite`.
+        **rewrite_kwargs: Any keyword parameters accepted by `rewrite.rewrite`.
 
     Returns:
         None.
@@ -213,7 +218,7 @@ class RepairGenerator:
 
         Process per graph
         - Find k nearest donors by cosine similarity (using transformer embeddings).
-        - Rewrite the graph using those donors via `graph_rewrite.rewrite`.
+        - Rewrite the graph using those donors via `rewrite.rewrite`.
         - Select the candidate most similar on average to the k donors.
         - Repeat for `n_iterations`.
 
@@ -227,7 +232,7 @@ class RepairGenerator:
             - If input is a list/sequence: a list of repaired graphs (one per input).
         """
         # Single-graph path
-        if isinstance(graphs, nx.Graph):
+        if is_simple_graph(graphs):
             return self._repair_one(graphs, k_neighbors=k_neighbors, n_iterations=n_iterations)
 
         # Sequence path

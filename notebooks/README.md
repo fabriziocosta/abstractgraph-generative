@@ -1,17 +1,8 @@
 # Generative notebooks
 
-This folder contains notebooks centered on autoregressive, interpolation, and
-optimization workflows built on top of `abstractgraph` and
-`abstractgraph-ml`.
+Notebook documentation is maintained in [../docs/notebooks.md](../docs/notebooks.md).
 
-Layout:
-- `examples/` for supported generator workflows
-- `research/` for exploratory generation notebooks
+Generator guides are maintained in `docs/`:
 
-Text-oriented notebooks were extracted to `/home/fabrizio/code/abstractgraph-text`.
-
-Bootstrap behavior:
-- Notebooks use `notebooks/_bootstrap.py` to locate the repo root.
-- They prepend available sibling `src/` directories to `sys.path`.
-- They normalize the working directory to the repo root so relative paths are
-  consistent across Jupyter launch locations.
+- [Edge generator](../docs/edge-generator.md)
+- [Conditional generator](../docs/conditional-autoregressive-generation.md)
