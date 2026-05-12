@@ -2585,14 +2585,14 @@ class EdgeGenerator:
         line3_parts.append(f"partial_feasible={partial_feasible}")
         if lookahead_infeasible:
             line3_parts.append(f"lookahead_infeasible={lookahead_infeasible}")
+        if final_infeasible:
+            line3_parts.append(f"final_infeasible={final_infeasible}")
         line3_parts.extend(
             [
                 f"viable={len(scored['feasible_candidates'])}",
                 f"retained={len(retained)}",
             ]
         )
-        if final_infeasible:
-            line3_parts.append(f"final_infeasible={final_infeasible}")
         line3 = " ".join(line3_parts)
         line4_parts = [f"best_score={self._format_optional_score(best_score)}"]
         if target_active:

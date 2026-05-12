@@ -1172,8 +1172,8 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     )
     assert (
         "tried=594 generated=594 partial_infeasible=414 "
-        "partial_feasible=180 lookahead_infeasible=5 viable=82 retained=1 "
-        "final_infeasible=7"
+        "partial_feasible=180 lookahead_infeasible=5 final_infeasible=7 "
+        "viable=82 retained=1"
     ) in out
 
 
