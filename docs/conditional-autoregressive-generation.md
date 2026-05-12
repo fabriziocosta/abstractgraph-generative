@@ -60,7 +60,7 @@ The result is a library of `ComponentInstance` objects.
 Each component stores:
 
 - `comp_id`: unique component id,
-- `img_type`: hash representing the local interpretation-node context,
+- `interpretation_type`: hash representing the local interpretation-node context,
 - `deg`: interpretation-node degree,
 - `subgraph`: the reusable base-graph fragment,
 - `ports`: the exposed interfaces used to connect this component to neighbors.
@@ -68,7 +68,7 @@ Each component stores:
 When `context_vectorizer` is provided, fitting also stores one context
 embedding per component. The embedding is computed either from the full base
 graph or from the union of anchor-centered neighborhoods controlled by
-`preimage_context_radius`.
+`base_context_radius`.
 
 ## Retrieval Indexes
 
@@ -78,7 +78,7 @@ The fitted generator builds two indexes.
 
 The coarse retrieval structure is a bucket keyed by:
 
-- `(img_type, degree)`
+- `(interpretation_type, degree)`
 
 This says: for a target interpretation node with a given abstract type and
 degree, these are the candidate components that could fit.
@@ -87,7 +87,7 @@ degree, these are the candidate components that could fit.
 
 The second index is more selective. It is keyed by:
 
-- `(img_type, degree, anchor_type, multiplicity)`
+- `(interpretation_type, degree, anchor_type, multiplicity)`
 
 This index supports pruning. If a partially built graph already requires a
 boundary with specific anchor types, the solver intersects the relevant posting
@@ -143,15 +143,14 @@ The attributed variant adds:
   A graph vectorizer with a `transform(graphs)` method that maps graphs to
   embedding vectors.
 
-- `preimage_context_radius`
+- `base_context_radius`
   The radius used to extract local base-graph context around anchor nodes.
 
 - `num_context_rewirings`
   A cap on how many legal rewiring branches are materialized and scored before
   one is sampled.
 
-There is intentionally no `image_context_radius` in this variant. The added
-signal comes only from the base-graph-side attributed context.
+The attributed context signal comes only from the base-graph side.
 
 ### Training-Time Context Embeddings
 
@@ -159,7 +158,7 @@ During `fit(graphs)`, after the usual component library has been extracted, the
 generator computes one extra embedding for each component:
 
 1. collect the anchor nodes of that component in the training base graph,
-2. extract the union of radius-`preimage_context_radius` neighborhoods centered
+2. extract the union of radius-`base_context_radius` neighborhoods centered
    on those anchors,
 3. vectorize that union subgraph with `context_vectorizer`,
 4. store the resulting embedding alongside the component id.
@@ -182,7 +181,7 @@ does the following:
 1. materialize a bounded number of legal candidate rewiring branches,
 2. for each branch, look at the anchors that are currently instantiated in the
    partial graph,
-3. extract the union of radius-`preimage_context_radius` neighborhoods around
+3. extract the union of radius-`base_context_radius` neighborhoods around
    those anchors in the current partially built graph,
 4. vectorize that partial context,
 5. compute cosine similarity against the stored training-time embedding of the
@@ -226,7 +225,7 @@ and comparing each component context against the fitted training components.
 For each interpretation node in the query graph, the scorer:
 
 1. rebuilds the local component with the same decomposition used in training,
-2. restricts retrieval to fitted components in the same `(img_type, degree)`
+2. restricts retrieval to fitted components in the same `(interpretation_type, degree)`
    bucket,
 3. embeds the query context with the configured `context_vectorizer`,
 4. finds the top-`k` nearest fitted component contexts by cosine similarity,
@@ -409,7 +408,7 @@ port.
 
 Why:
 
-- each port represents one interface corresponding to one incident image edge,
+- each port represents one interface corresponding to one incident interpretation edge,
 - using the same port twice would collapse two distinct image-graph adjacencies
   into one interface,
 - that would break the intended decomposition semantics.
@@ -515,7 +514,7 @@ Important heuristics:
   Prefer nodes with more assigned neighbors and stronger constraints.
 
 - `rare bucket seeding`
-  If nothing is assigned yet, prefer a node whose `(img_type, degree)` bucket is
+  If nothing is assigned yet, prefer a node whose `(interpretation_type, degree)` bucket is
   rare, because that reduces branching earlier.
 
 - `forward checking`
@@ -608,7 +607,7 @@ interfaces seen in training.
 So even if a target interpretation graph is valid in principle, it may be unrealizable
 in practice when:
 
-- the needed `(img_type, degree)` bucket is sparse,
+- the needed `(interpretation_type, degree)` bucket is sparse,
 - the required anchor-type multiplicities are rare,
 - the training set never exposed enough compatible ports for a particular
   assembly pattern.
@@ -703,7 +702,7 @@ A good mental model is:
   types and global nodes a new component must connect to.
 
 - `bucket`
-  A coarse candidate set keyed by `(img_type, degree)`. Buckets group reusable
+  A coarse candidate set keyed by `(interpretation_type, degree)`. Buckets group reusable
   components by target interpretation-node signature.
 
 - `component`
@@ -734,7 +733,7 @@ A good mental model is:
   The structural graph produced by decomposition. Its nodes represent mapped
   base subgraphs.
 
-- `img_type`
+- `interpretation_type`
   Hash summarizing the local interpretation-node context. It is part of the
   coarse retrieval key.
 

@@ -1,5 +1,5 @@
 """
-Repair utilities that reuse graph_rewrite and transformer embeddings.
+Repair utilities that reuse rewrite helpers and transformer embeddings.
 
 Summary
 - Caches donor graphs and their embeddings.
@@ -41,7 +41,7 @@ class RepairGenerator:
         graph_transformer: Transformer used to embed graphs for neighbor search
             and candidate selection. Typically `AbstractGraphTransformer`.
         rng: Optional random generator for rewrite sampling.
-        **rewrite_kwargs: Any keyword parameters accepted by `graph_rewrite.rewrite`.
+        **rewrite_kwargs: Any keyword parameters accepted by `rewrite.rewrite`.
 
     Returns:
         None.
@@ -218,7 +218,7 @@ class RepairGenerator:
 
         Process per graph
         - Find k nearest donors by cosine similarity (using transformer embeddings).
-        - Rewrite the graph using those donors via `graph_rewrite.rewrite`.
+        - Rewrite the graph using those donors via `rewrite.rewrite`.
         - Select the candidate most similar on average to the k donors.
         - Repeat for `n_iterations`.
 
