@@ -1477,6 +1477,52 @@ def test_trace_failure_ratio_counts_completion_and_blocked_failures() -> None:
     assert generator._trace_failure_ratio_for_state(decision["state_id"]) == pytest.approx(0.5)
 
 
+def test_generate_accepts_final_feasible_unexpandable_beam(monkeypatch) -> None:
+    class _AlwaysFeasibleEstimator:
+        def fit(self, graphs):
+            return self
+
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    graph = nx.path_graph(3)
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        graph_estimator=_RecordingGraphEstimator(),
+        require_single_connected_component=True,
+    )
+    generator.edge_attribute_templates_ = [{}]
+    generator._positive_scores = lambda graphs: np.asarray([0.9] * len(graphs), dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.zeros(len(graphs))
+    generator._edge_risk_scores = lambda candidates: np.zeros(len(candidates))
+    monkeypatch.setattr(
+        generator,
+        "_max_total_edges_for_generation",
+        lambda start_graph, n_edges: start_graph.number_of_edges(),
+    )
+
+    def fail_mark_completion_infeasible(search):
+        raise AssertionError("final-feasible unexpandable beam should be accepted")
+
+    monkeypatch.setattr(
+        generator,
+        "_mark_unexpandable_beam_as_completion_infeasible",
+        fail_mark_completion_infeasible,
+    )
+
+    path = generator._generate_one(
+        graph,
+        graph.number_of_edges() + 1,
+        target=None,
+        target_lambda=1.0,
+        verbose=False,
+    )
+
+    assert len(path) == 1
+    assert sorted(path[0].edges()) == sorted(graph.edges())
+
+
 def test_partition_candidates_keeps_partial_feasible_non_terminal_candidates() -> None:
     class _AlwaysFeasibleEstimator:
         def predict(self, graphs):

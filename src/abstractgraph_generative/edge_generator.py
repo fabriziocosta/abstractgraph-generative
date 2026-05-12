@@ -2092,6 +2092,31 @@ class EdgeGenerator:
                 if state["graph"].number_of_edges() < max_total_edges
             ]
             if not expandable_beam:
+                solved_path = self._find_solution_in_beam(
+                    search["beam"],
+                    n_edges=n_edges,
+                    graph_index=graph_index,
+                    total_phases=total_phases,
+                    fallback_index=search["fallback_index"],
+                    start_time=start_time,
+                    verbose=verbose,
+                )
+                if solved_path is not None:
+                    return solved_path
+                early_stop_path = self._find_early_stop_in_beam(
+                    search["beam"],
+                    scored={"feasible_candidates": []},
+                    n_edges=n_edges,
+                    target=target,
+                    target_lambda=target_lambda,
+                    fallback_index=search["fallback_index"],
+                    graph_index=graph_index,
+                    total_phases=total_phases,
+                    start_time=start_time,
+                    verbose=verbose,
+                )
+                if early_stop_path is not None:
+                    return early_stop_path
                 self._mark_unexpandable_beam_as_completion_infeasible(search)
                 break
 
