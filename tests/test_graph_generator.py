@@ -26,8 +26,9 @@ class SizeVectorizer:
 
 
 class FakeEdgeGenerator:
-    def __init__(self, generated_graph=None):
+    def __init__(self, generated_graph=None, *, fit_exception=None):
         self.generated_graph = generated_graph
+        self.fit_exception = fit_exception
         self.store_calls = []
         self.fit_calls = []
         self.generate_calls = []
@@ -38,6 +39,8 @@ class FakeEdgeGenerator:
 
     def fit(self, graphs, targets=None):
         self.fit_calls.append((list(graphs), targets))
+        if self.fit_exception is not None:
+            raise self.fit_exception
         return self
 
     def generate(self, graph, n_edges, **kwargs):
@@ -174,6 +177,32 @@ def test_edge_stage_failure_skips_seed_without_success_histories() -> None:
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="Edge stage failed"):
+        outputs = generator.sample(n_samples=1, random_state=0)
+
+    assert outputs == []
+    assert len(generator.last_sampled_indices_) == 1
+    assert len(generator.last_interpretation_neighbor_indices_history_) == 1
+    assert generator.last_conditional_neighbor_indices_history_ == []
+    assert generator.last_generated_interpretation_graphs_ == []
+    assert generator.last_edge_generation_paths_ == []
+    assert generator.last_conditional_training_graphs_history_ == []
+
+
+def test_edge_fit_failure_skips_seed_without_success_histories() -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3)]
+    base_graphs = [_labeled_path(2), _labeled_path(3)]
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(
+            generated_graph=nx.path_graph(3),
+            fit_exception=ValueError("bad fit"),
+        ),
+        conditional_generator=FakeConditionalGenerator(),
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    with pytest.warns(RuntimeWarning, match="failed while fitting"):
         outputs = generator.sample(n_samples=1, random_state=0)
 
     assert outputs == []

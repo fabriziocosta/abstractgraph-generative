@@ -166,19 +166,37 @@ class GraphGenerator:
                 for idx in interpretation_neighbor_indices
             ]
             edge_targets = self._select_targets(interpretation_neighbor_indices)
-            self._fit_edge_generator(edge_training_graphs, edge_targets)
+            try:
+                self._fit_edge_generator(edge_training_graphs, edge_targets)
+            except Exception as exc:
+                warnings.warn(
+                    "Edge stage failed while fitting on interpretation neighbors; "
+                    f"skipping seed. Error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
 
             start_graph, original_edge_count = remove_edges(
                 seed_interpretation_graph,
                 size=interpretation_edge_removal_size,
                 rng=rng,
             )
-            generated_interpretation_graph = self.edge_generator.generate(
-                start_graph,
-                original_edge_count,
-                return_path=False,
-                **edge_generate_kwargs,
-            )
+            try:
+                generated_interpretation_graph = self.edge_generator.generate(
+                    start_graph,
+                    original_edge_count,
+                    return_path=False,
+                    **edge_generate_kwargs,
+                )
+            except Exception as exc:
+                warnings.warn(
+                    "Edge stage failed while generating an interpretation graph; "
+                    f"skipping seed. Error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             if isinstance(generated_interpretation_graph, list):
                 generated_interpretation_graph = (
                     generated_interpretation_graph[-1]
