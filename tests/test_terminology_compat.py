@@ -3,6 +3,7 @@ from __future__ import annotations
 import random
 
 import networkx as nx
+import pytest
 
 from abstractgraph import node as node_operator
 from abstractgraph.graphs import AbstractGraph
@@ -110,6 +111,109 @@ def test_conditional_generator_store_prepares_local_neighbor_context() -> None:
     assert len(generator.last_neighbor_indices_) == 1
     assert len(generator.last_generation_training_graphs_) == 1
     assert generator._is_fitted
+
+
+def test_conditional_generator_expands_neighbors_for_signature_coverage(monkeypatch) -> None:
+    graphs = []
+    for n_nodes in (3, 4, 5):
+        graph = nx.path_graph(n_nodes)
+        for node in graph.nodes:
+            graph.nodes[node]["label"] = str(node % 2)
+        graphs.append(graph)
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=node_operator(),
+        nbits=6,
+        base_cut_radius=0,
+        interpretation_cut_radius=0,
+        n_jobs=1,
+        debug=False,
+        debug_level=0,
+    )
+    generator.store(graphs)
+
+    target = nx.Graph()
+    target.add_node(0, signature=("a", 1))
+    target.add_node(1, signature=("b", 1))
+    target.add_edge(0, 1)
+
+    monkeypatch.setattr(
+        generator,
+        "_stored_neighbor_indices",
+        lambda _index, *, n_neighbors: [1, 2][:n_neighbors],
+    )
+    monkeypatch.setattr(generator, "_stored_interpretation_graph", lambda _index: target.copy())
+    monkeypatch.setattr(
+        generator,
+        "_compute_target_signatures",
+        lambda graph: {node: graph.nodes[node]["signature"] for node in graph.nodes},
+    )
+    monkeypatch.setattr(
+        generator,
+        "_stored_signature_set",
+        lambda index: {("a", 1)} if index == 1 else {("b", 1)},
+    )
+
+    pool = generator._prepare_stored_generation_context(
+        rng=random.Random(0),
+        n_neighbors=1,
+        neighbor_coverage_factor=3,
+        max_seed_retries=1,
+    )
+
+    assert len(pool) == 1
+    assert generator.last_neighbor_indices_ == [1, 2]
+    assert len(generator.last_generation_training_graphs_) == 2
+    assert generator._is_fitted
+
+
+def test_conditional_generator_skips_uncovered_stored_seeds(monkeypatch) -> None:
+    graphs = []
+    for n_nodes in (3, 4, 5):
+        graph = nx.path_graph(n_nodes)
+        for node in graph.nodes:
+            graph.nodes[node]["label"] = str(node % 2)
+        graphs.append(graph)
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=node_operator(),
+        nbits=6,
+        base_cut_radius=0,
+        interpretation_cut_radius=0,
+        n_jobs=1,
+        debug=False,
+        debug_level=0,
+    )
+    generator.store(graphs)
+
+    target = nx.Graph()
+    target.add_node(0, signature=("missing", 1))
+
+    monkeypatch.setattr(
+        generator,
+        "_stored_neighbor_indices",
+        lambda _index, *, n_neighbors: [1, 2][:n_neighbors],
+    )
+    monkeypatch.setattr(generator, "_stored_interpretation_graph", lambda _index: target.copy())
+    monkeypatch.setattr(
+        generator,
+        "_compute_target_signatures",
+        lambda graph: {node: graph.nodes[node]["signature"] for node in graph.nodes},
+    )
+    monkeypatch.setattr(generator, "_stored_signature_set", lambda _index: {("covered", 1)})
+
+    with pytest.warns(RuntimeWarning, match="Could not find a stored seed graph"):
+        pool = generator._prepare_stored_generation_context(
+            rng=random.Random(0),
+            n_neighbors=1,
+            neighbor_coverage_factor=2,
+            max_seed_retries=2,
+        )
+
+    assert pool == []
+    assert generator.last_sampled_index_ is None
+    assert generator.last_neighbor_indices_ == []
+    assert generator.last_generation_training_graphs_ == []
 
 
 def test_conditional_generator_sample_alias_uses_generate(monkeypatch) -> None:

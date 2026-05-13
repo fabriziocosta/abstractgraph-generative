@@ -95,6 +95,7 @@ import os
 from pprint import pformat
 import random
 import time
+import warnings
 from typing import Optional, Sequence
 
 import networkx as nx
@@ -321,6 +322,7 @@ class ConditionalAutoregressiveGenerator:
         self.stored_graphs_: Optional[list[nx.Graph]] = None
         self.stored_neighbor_vectorizer_ = None
         self.stored_neighbor_features_: Optional[np.ndarray] = None
+        self.stored_signature_sets_: Optional[list[Optional[set[tuple[int, int]]]]] = None
         self.last_sampled_index_: Optional[int] = None
         self.last_neighbor_indices_: list[int] = []
         self.last_generation_training_graphs_: list[nx.Graph] = []
@@ -883,6 +885,7 @@ class ConditionalAutoregressiveGenerator:
         if features.shape[0] != len(graph_list):
             raise ValueError("neighbor vectorizer must return one row per stored graph.")
         self.stored_neighbor_features_ = features
+        self.stored_signature_sets_ = [None for _ in graph_list]
         self.last_sampled_index_ = None
         self.last_neighbor_indices_ = []
         self.last_generation_training_graphs_ = []
@@ -910,35 +913,178 @@ class ConditionalAutoregressiveGenerator:
         neighbors = [int(i) for i in order if int(i) != int(index)]
         return neighbors[: min(n_neighbors, len(neighbors))]
 
+    def _stored_interpretation_graph(self, index: int) -> nx.Graph:
+        """Return the stored graph's interpretation graph."""
+        graphs, _features = self._require_stored_graphs()
+        if index < 0 or index >= len(graphs):
+            raise IndexError("stored graph index is out of range.")
+        ag = graph_to_abstract_graph(
+            graphs[int(index)],
+            decomposition_function=self.decomposition_function,
+            nbits=self.nbits,
+            label_mode=self.label_mode,
+        )
+        return ag.interpretation_graph.copy()
+
+    def _stored_signature_set(self, index: int) -> set[tuple[int, int]]:
+        """Return cached fitted-component retrieval signatures for one stored graph."""
+        graphs, _features = self._require_stored_graphs()
+        if index < 0 or index >= len(graphs):
+            raise IndexError("stored graph index is out of range.")
+        if self.stored_signature_sets_ is None or len(self.stored_signature_sets_) != len(graphs):
+            self.stored_signature_sets_ = [None for _ in graphs]
+        cached = self.stored_signature_sets_[int(index)]
+        if cached is not None:
+            return set(cached)
+        ag = graph_to_abstract_graph(
+            graphs[int(index)],
+            decomposition_function=self.decomposition_function,
+            nbits=self.nbits,
+            label_mode=self.label_mode,
+        )
+        signatures: set[tuple[int, int]] = set()
+        for interpretation_node in ag.interpretation_graph.nodes():
+            comp = self._build_component_instance(ag, interpretation_node, comp_id=-1)
+            if comp.deg > 0 and any(len(port.anchor_types) == 0 for port in comp.ports):
+                continue
+            signatures.add((int(comp.interpretation_type), int(comp.deg)))
+        self.stored_signature_sets_[int(index)] = signatures
+        return set(signatures)
+
+    @staticmethod
+    def _neighbor_coverage_schedule(
+        requested_neighbors: int,
+        *,
+        max_neighbors: int,
+    ) -> list[int]:
+        """Build an exponential neighbor-count schedule ending at ``max_neighbors``."""
+        max_neighbors = max(0, int(max_neighbors))
+        if max_neighbors <= 0:
+            return [0]
+        current = min(max_neighbors, max(1, int(requested_neighbors)))
+        schedule = [current]
+        while current < max_neighbors:
+            current = min(max_neighbors, max(current + 1, current * 2))
+            if current != schedule[-1]:
+                schedule.append(current)
+        return schedule
+
     def _prepare_stored_generation_context(
         self,
         rng: random.Random,
         *,
         n_neighbors: int,
+        neighbor_coverage_factor: int = 10,
+        max_seed_retries: int = 16,
+        require_signature_coverage: bool = True,
     ) -> list[nx.Graph]:
-        """Sample a stored graph, fit on its local neighborhood, and return its target."""
+        """Sample a covered stored graph, fit on its local neighborhood, and return its target."""
         graphs, _features = self._require_stored_graphs()
-        sampled_index = int(rng.randrange(len(graphs)))
-        neighbor_indices = self._stored_neighbor_indices(
-            sampled_index,
-            n_neighbors=int(n_neighbors),
-        )
-        training_indices = neighbor_indices if neighbor_indices else [sampled_index]
-        training_graphs = [graphs[i] for i in training_indices]
-        self.fit(training_graphs)
+        requested_neighbors = max(0, int(n_neighbors))
+        max_seed_retries = max(1, int(max_seed_retries))
+        coverage_factor = max(1, int(neighbor_coverage_factor))
+        if len(graphs) <= 1:
+            sampled_index = 0
+            target_interpretation_graph = self._stored_interpretation_graph(sampled_index)
+            self.fit([graphs[sampled_index]])
+            self.last_sampled_index_ = sampled_index
+            self.last_neighbor_indices_ = []
+            self.last_generation_training_graphs_ = [graphs[sampled_index]]
+            self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
+            return [target_interpretation_graph]
 
-        target_ag = graph_to_abstract_graph(
-            graphs[sampled_index],
-            decomposition_function=self.decomposition_function,
-            nbits=self.nbits,
-            label_mode=self.label_mode,
+        sampled_order = list(range(len(graphs)))
+        rng.shuffle(sampled_order)
+        sampled_order = sampled_order[: min(max_seed_retries, len(sampled_order))]
+        rejected: list[dict] = []
+
+        for sampled_index in sampled_order:
+            target_interpretation_graph = self._stored_interpretation_graph(sampled_index)
+            target_signatures = set(
+                self._compute_target_signatures(target_interpretation_graph).values()
+            )
+            max_neighbors = min(
+                len(graphs) - 1,
+                max(requested_neighbors, requested_neighbors * coverage_factor),
+            )
+            all_neighbor_indices = self._stored_neighbor_indices(
+                sampled_index,
+                n_neighbors=max_neighbors,
+            )
+            if not require_signature_coverage or requested_neighbors == 0:
+                neighbor_indices = self._stored_neighbor_indices(
+                    sampled_index,
+                    n_neighbors=requested_neighbors,
+                )
+                training_indices = neighbor_indices if neighbor_indices else [sampled_index]
+                training_graphs = [graphs[i] for i in training_indices]
+                self.fit(training_graphs)
+                self.last_sampled_index_ = sampled_index
+                self.last_neighbor_indices_ = neighbor_indices
+                self.last_generation_training_graphs_ = training_graphs
+                self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
+                return [target_interpretation_graph]
+
+            selected_neighbors: list[int] = []
+            missing_signatures = set(target_signatures)
+            for tested_neighbors in self._neighbor_coverage_schedule(
+                requested_neighbors,
+                max_neighbors=len(all_neighbor_indices),
+            ):
+                selected_neighbors = all_neighbor_indices[:tested_neighbors]
+                covered_signatures: set[tuple[int, int]] = set()
+                for neighbor_index in selected_neighbors:
+                    covered_signatures.update(self._stored_signature_set(neighbor_index))
+                missing_signatures = target_signatures - covered_signatures
+                self._dbg(
+                    1,
+                    "coverage_probe",
+                    sampled_index=sampled_index,
+                    requested_neighbors=requested_neighbors,
+                    tested_neighbors=len(selected_neighbors),
+                    max_neighbors=len(all_neighbor_indices),
+                    target_signatures=len(target_signatures),
+                    covered_signatures=len(target_signatures - missing_signatures),
+                    missing=list(sorted(missing_signatures)),
+                )
+                if not missing_signatures:
+                    training_graphs = [graphs[i] for i in selected_neighbors]
+                    self.fit(training_graphs)
+                    self.last_sampled_index_ = sampled_index
+                    self.last_neighbor_indices_ = selected_neighbors
+                    self.last_generation_training_graphs_ = training_graphs
+                    self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
+                    return [target_interpretation_graph]
+
+            rejected.append(
+                {
+                    "sampled_index": int(sampled_index),
+                    "tested_neighbors": len(selected_neighbors),
+                    "missing": list(sorted(missing_signatures)),
+                }
+            )
+            self._dbg(
+                1,
+                "coverage_seed_rejected",
+                sampled_index=sampled_index,
+                requested_neighbors=requested_neighbors,
+                tested_neighbors=len(selected_neighbors),
+                missing=list(sorted(missing_signatures)),
+            )
+
+        self.last_sampled_index_ = None
+        self.last_neighbor_indices_ = []
+        self.last_generation_training_graphs_ = []
+        self.last_generation_interpretation_graph_ = None
+        warnings.warn(
+            "Could not find a stored seed graph whose target interpretation signatures "
+            f"are covered after {len(sampled_order)} seed attempts "
+            f"(n_neighbors={requested_neighbors}, "
+            f"neighbor_coverage_factor={coverage_factor}).",
+            RuntimeWarning,
         )
-        target_interpretation_graph = target_ag.interpretation_graph.copy()
-        self.last_sampled_index_ = sampled_index
-        self.last_neighbor_indices_ = neighbor_indices
-        self.last_generation_training_graphs_ = training_graphs
-        self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
-        return [target_interpretation_graph]
+        self._dbg(1, "coverage_failed", rejected=rejected)
+        return []
 
     def fit(self, graphs: Sequence[nx.Graph], **_) -> "ConditionalAutoregressiveGenerator":
         """Fit components and retrieval indexes from training graphs.
@@ -2132,6 +2278,9 @@ class ConditionalAutoregressiveGenerator:
         progress_every_attempts: int = 100,
         progress_every_seconds: float = 10.0,
         parallel_queue_factor: int = 4,
+        neighbor_coverage_factor: int = 10,
+        max_seed_retries: int = 16,
+        require_signature_coverage: bool = True,
     ) -> list[nx.Graph]:
         """Generate new base graphs by component assembly and backtracking.
 
@@ -2153,6 +2302,15 @@ class ConditionalAutoregressiveGenerator:
             parallel_queue_factor: Number of in-flight futures per worker in
                 parallel mode. Higher values improve CPU utilization when task
                 durations are imbalanced.
+            neighbor_coverage_factor: In input-free stored generation, expand
+                the neighbor count up to this multiple of ``n_neighbors`` while
+                searching for local coverage of all target interpretation
+                signatures.
+            max_seed_retries: In input-free stored generation, maximum number
+                of sampled seed graphs to try before returning no target pool.
+            require_signature_coverage: If True, skip stored seed graphs whose
+                target interpretation signatures are not covered by the expanded
+                nearest-neighbor context.
 
         Returns:
             list[nx.Graph]: Generated graphs.
@@ -2167,6 +2325,9 @@ class ConditionalAutoregressiveGenerator:
             pool = self._prepare_stored_generation_context(
                 rng,
                 n_neighbors=(8 if n_neighbors is None else int(n_neighbors)),
+                neighbor_coverage_factor=neighbor_coverage_factor,
+                max_seed_retries=max_seed_retries,
+                require_signature_coverage=require_signature_coverage,
             )
         else:
             if not self._is_fitted:

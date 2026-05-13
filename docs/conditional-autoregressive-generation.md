@@ -113,6 +113,55 @@ At a high level, the solver repeats:
 This is an autoregressive process because each decision is conditioned on the
 partial graph built so far.
 
+## Stored Local Sampling
+
+For input-free local generation, call `store(graphs)` once and then use
+`sample(...)` or `generate(...)` without explicit `interpretation_graphs`.
+
+In this mode the generator:
+
+1. samples one stored graph as the seed,
+2. uses the seed's interpretation graph as the target structure,
+3. retrieves nearest stored graphs as the local component library,
+4. fits on that local library,
+5. runs the usual conditional assembly search.
+
+The `n_neighbors` argument controls the requested size of the local library.
+Before search starts, the generator now performs a coverage preflight over
+target interpretation signatures. A target signature is the same coarse
+retrieval key used by the component bucket index:
+
+- `(interpretation_type, degree)`
+
+If the initial nearest-neighbor set does not cover every target signature, the
+generator expands the neighbor count exponentially until it reaches:
+
+- `neighbor_coverage_factor * n_neighbors`
+
+The default `neighbor_coverage_factor` is `10`. For example, with
+`n_neighbors=7`, the preflight may test 7, 14, 28, 56, and up to 70 neighbors,
+bounded by the stored corpus size.
+
+If coverage still fails, the seed graph is skipped and another stored seed is
+sampled, up to `max_seed_retries` attempts. If no covered seed is found, the
+generator returns an empty target pool, emits a `RuntimeWarning`, and no
+backtracking attempts are spent on a structurally impossible target.
+
+```python
+samples = generator.sample(
+    n_samples=7,
+    n_neighbors=7,
+    neighbor_coverage_factor=10,
+    max_seed_retries=16,
+    require_signature_coverage=True,
+    random_state=0,
+)
+```
+
+This preflight prevents deterministic empty-bucket failures. It is still only a
+necessary condition: generation can later fail because of anchor incompatibility,
+commit failures, backtracking limits, or feasibility filtering.
+
 ## Why "Conditional"
 
 The process is conditional in two senses:
