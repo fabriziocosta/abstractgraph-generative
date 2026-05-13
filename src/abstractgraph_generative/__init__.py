@@ -22,6 +22,7 @@ from abstractgraph_generative.edge_generator import (  # noqa: F401
     mix_connected_components,
     remove_edges,
 )
+from abstractgraph_generative.graph_generator import GraphGenerator  # noqa: F401
 from abstractgraph_generative.dataset_selection import (  # noqa: F401
     select_graphs_via_shortest_paths,
 )
@@ -105,6 +106,7 @@ __all__ = [
     "GraphOptimizationResult",
     "GraphOptimizer",
     "EdgeGenerator",
+    "GraphGenerator",
     "edge_neighbors",
     "make_edge_regression_dataset",
     "mix_connected_components",

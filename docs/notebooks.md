@@ -18,6 +18,9 @@ optimization, and edge-generation workflows built on top of `abstractgraph` and
 - `notebooks/examples/example_edge_generator_repair.ipynb`
   Retrieval-based graph repair by perturbing one stored graph and regrowing
   from surgically repaired infeasible starts.
+- `notebooks/examples/example_graph_generator_zinc.ipynb`
+  Two-stage ZINC generation: edge generation over cycle/tree interpretation
+  graphs followed by conditional molecule instantiation.
 
 ## Bootstrap Behavior
 

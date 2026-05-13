@@ -13,6 +13,7 @@ This directory is the documentation root for `abstractgraph-generative`.
 - [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md)
 - [Conditional Autoregressive Generation](conditional-autoregressive-generation.md)
 - [Edge Generator](edge-generator.md)
+- [Graph Generator](graph-generator.md)
 
 ## Scope
 
@@ -42,6 +43,9 @@ This repo owns the graph-only generation layer built on top of
 - `abstractgraph_generative.edge_generator`
   Edge-by-edge generator with feasibility, ranking, pair retrieval, and
   nearest-neighbor repair workflows.
+- `abstractgraph_generative.graph_generator`
+  Two-stage generator that uses edge generation over interpretation graphs and
+  conditional autoregressive generation over aligned base graphs.
 - `abstractgraph_generative.interpolate`
   Interpolation estimator helpers.
 - `abstractgraph_generative.interpolation`
@@ -64,6 +68,10 @@ This repo owns the graph-only generation layer built on top of
   the original edge count. Edge search uses completion-budget and bounded
   terminal-completion diagnostics to avoid retaining candidates that cannot
   finish inside the remaining edge budget.
+- `GraphGenerator.sample(...)`
+  Sample a seed interpretation graph, generate a nearby target interpretation
+  graph, retrieve aligned base-graph neighbors, then instantiate base graphs
+  with the conditional generator.
 
 ## Conventions
 
