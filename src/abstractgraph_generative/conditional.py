@@ -1293,6 +1293,74 @@ class ConditionalAutoregressiveGenerator:
             )
         return out
 
+    @staticmethod
+    def _attribute_values_equal(left, right) -> bool:
+        """Compare scalar or array-like graph attributes."""
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+            try:
+                return bool(np.array_equal(left, right))
+            except Exception:
+                return False
+        try:
+            return bool(left == right)
+        except Exception:
+            return False
+
+    def _interpretation_node_match(self, left_attrs: dict, right_attrs: dict) -> bool:
+        """Compare interpretation nodes using the active label mode's computed label."""
+        return self._attribute_values_equal(
+            left_attrs.get("label"),
+            right_attrs.get("label"),
+        )
+
+    def _interpretation_edge_match(self, left_attrs: dict, right_attrs: dict) -> bool:
+        """Compare interpretation-edge labels when present."""
+        return self._attribute_values_equal(
+            left_attrs.get("label"),
+            right_attrs.get("label"),
+        )
+
+    def _interpretation_graphs_match(
+        self,
+        left: nx.Graph,
+        right: nx.Graph,
+    ) -> bool:
+        """Return whether two interpretation graphs have the same labeled structure."""
+        if left.number_of_nodes() != right.number_of_nodes():
+            return False
+        if left.number_of_edges() != right.number_of_edges():
+            return False
+        return bool(
+            nx.is_isomorphic(
+                left,
+                right,
+                node_match=self._interpretation_node_match,
+                edge_match=self._interpretation_edge_match,
+            )
+        )
+
+    def _matches_target_interpretation(
+        self,
+        graph: nx.Graph,
+        target_interpretation_graph: nx.Graph,
+    ) -> bool:
+        """Check that a generated base graph re-decomposes to the target interpretation graph."""
+        if self.decomposition_function is None:
+            return True
+        try:
+            generated_ag = graph_to_abstract_graph(
+                graph,
+                decomposition_function=self.decomposition_function,
+                nbits=self.nbits,
+                label_mode=self.label_mode,
+            )
+        except Exception:
+            return False
+        return self._interpretation_graphs_match(
+            generated_ag.interpretation_graph,
+            target_interpretation_graph,
+        )
+
     def _select_next_node(self, state: _GenerationState, rng: random.Random):
         """Pick next interpretation node by fail-first frontier heuristic.
 
@@ -2263,6 +2331,16 @@ class ConditionalAutoregressiveGenerator:
         output = solved.graph.copy()
         output.graph["assigned_images"] = dict(solved.assigned)
         output.graph["comp_of"] = dict(solved.comp_of)
+        if not self._matches_target_interpretation(output, target_interpretation_graph):
+            if attempt_trace is not None:
+                attempt_trace.update(
+                    {
+                        "success": False,
+                        "failure_stage": "interpretation_mismatch",
+                        "branches": int(counters.get("branches", 0)),
+                    }
+                )
+            return None
         if not self._is_feasible(output):
             if attempt_trace is not None:
                 attempt_trace.update(
@@ -2571,14 +2649,14 @@ class ConditionalAutoregressiveGenerator:
                         for _ in range(batch_size):
                             target = rng.choice(pool).copy()
                             seed = rng.randrange(2**63)
-                            futures.append(
-                                executor.submit(
-                                    _generate_one_worker,
-                                    target,
-                                    int(seed),
-                                    int(max_backtracks),
-                                )
+                            future = executor.submit(
+                                _generate_one_worker,
+                                target,
+                                int(seed),
+                                int(max_backtracks),
                             )
+                            future.target_interpretation_graph = target
+                            futures.append(future)
                         attempts += len(futures)
                         generated_batch: list[nx.Graph] = []
                         for fut in as_completed(futures):
@@ -2591,6 +2669,13 @@ class ConditionalAutoregressiveGenerator:
                                     Counter(attempt_trace.get("commit_fail_reasons", {}))
                                 )
                             if generated is None:
+                                continue
+                            target = getattr(fut, "target_interpretation_graph", None)
+                            if target is not None and not self._matches_target_interpretation(
+                                generated,
+                                target,
+                            ):
+                                attempt_outcomes["interpretation_mismatch"] += 1
                                 continue
                             constructed_candidates += 1
                             generated_batch.append(generated)

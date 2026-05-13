@@ -6,7 +6,7 @@ import networkx as nx
 import pytest
 
 from abstractgraph import node as node_operator
-from abstractgraph.graphs import AbstractGraph
+from abstractgraph.graphs import AbstractGraph, graph_to_abstract_graph
 from abstractgraph_generative.autoregressive import generate_pruning_sequences
 from abstractgraph_generative.conditional import ConditionalAutoregressiveGenerator
 
@@ -94,6 +94,55 @@ def test_generate_accepts_interpretation_graphs_alias() -> None:
         max_total_attempts=1,
     )
     assert isinstance(outputs, list)
+
+
+@pytest.mark.parametrize("label_mode", ["operator_hash", "graph_hash", "histogram"])
+def test_conditional_generator_checks_generated_interpretation_postcondition(label_mode: str) -> None:
+    def decomposition(ag: AbstractGraph) -> AbstractGraph:
+        ag.interpretation_graph = nx.Graph()
+        if ag.base_graph.graph.get("kind") == "cycle_tree":
+            ag.create_interpretation_node_with_subgraph_from_nodes(
+                ag.base_graph.nodes,
+                meta={"user_name": "cyc"},
+            )
+            ag.create_interpretation_node_with_subgraph_from_nodes(
+                ag.base_graph.nodes,
+                meta={"user_name": "tree"},
+            )
+            ag.interpretation_graph.add_edge(0, 1)
+        else:
+            ag.create_interpretation_node_with_subgraph_from_nodes(
+                ag.base_graph.nodes,
+                meta={"user_name": "tree"},
+            )
+        return ag
+
+    target_graph = nx.path_graph(3)
+    target_graph.graph["kind"] = "cycle_tree"
+    generated_graph = nx.path_graph(3)
+    generated_graph.graph["kind"] = "tree_only"
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=decomposition,
+        nbits=6,
+        label_mode=label_mode,
+    )
+
+    target_ag = graph_to_abstract_graph(
+        target_graph,
+        decomposition_function=decomposition,
+        nbits=6,
+        label_mode=label_mode,
+    )
+
+    assert not generator._matches_target_interpretation(
+        generated_graph,
+        target_ag.interpretation_graph,
+    )
+    assert generator._matches_target_interpretation(
+        target_graph,
+        target_ag.interpretation_graph,
+    )
 
 
 def test_conditional_generator_store_prepares_local_neighbor_context() -> None:
