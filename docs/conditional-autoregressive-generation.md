@@ -116,15 +116,21 @@ partial graph built so far.
 ## Stored Local Sampling
 
 For input-free local generation, call `store(graphs)` once and then use
-`sample(...)` or `generate(...)` without explicit `interpretation_graphs`.
+`sample(...)` without explicit `interpretation_graphs`.
 
-In this mode the generator:
+In this mode, `sample(n_samples=n)` treats `n_samples` as the number of stored
+seed graphs to sample. For each seed, `n_instances_per_sample` controls how
+many generated variants are requested from that seed's interpretation graph.
+The default is `n_instances_per_sample=1`.
+
+For each seed, the generator:
 
 1. samples one stored graph as the seed,
 2. uses the seed's interpretation graph as the target structure,
 3. retrieves nearest stored graphs as the local component library,
 4. fits on that local library,
-5. runs the usual conditional assembly search.
+5. runs the usual conditional assembly search for `n_instances_per_sample`
+   variants.
 
 The `n_neighbors` argument controls the requested size of the local library.
 Before search starts, the generator now performs a coverage preflight over
@@ -149,7 +155,8 @@ backtracking attempts are spent on a structurally impossible target.
 
 ```python
 samples = generator.sample(
-    n_samples=7,
+    n_samples=7,                 # number of stored seed graphs
+    n_instances_per_sample=3,    # variants requested per seed
     n_neighbors=7,
     neighbor_coverage_factor=10,
     max_seed_retries=16,
@@ -157,6 +164,9 @@ samples = generator.sample(
     random_state=0,
 )
 ```
+
+`generate(...)` remains the lower-level API where `n_samples` means total
+generated instances from the provided or internally prepared target pool.
 
 This preflight prevents deterministic empty-bucket failures. It is still only a
 necessary condition: generation can later fail because of anchor incompatibility,

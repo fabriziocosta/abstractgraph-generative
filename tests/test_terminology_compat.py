@@ -60,6 +60,18 @@ def test_conditional_generator_supports_canonical_radius_names() -> None:
     assert generator.interpretation_cut_radius == 3
 
 
+def test_conditional_generator_debug_false_disables_positive_debug_level() -> None:
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=lambda ag: ag,
+        nbits=6,
+        debug=False,
+        debug_level=1,
+    )
+
+    assert generator.debug is False
+    assert generator.debug_level == 0
+
+
 def test_generate_accepts_interpretation_graphs_alias() -> None:
     graph = nx.path_graph(3)
     for node in graph.nodes:
@@ -216,7 +228,7 @@ def test_conditional_generator_skips_uncovered_stored_seeds(monkeypatch) -> None
     assert generator.last_generation_training_graphs_ == []
 
 
-def test_conditional_generator_sample_alias_uses_generate(monkeypatch) -> None:
+def test_conditional_generator_sample_forwards_without_stored_graphs(monkeypatch) -> None:
     graph = nx.path_graph(3)
     for node in graph.nodes:
         graph.nodes[node]["label"] = str(node)
@@ -239,6 +251,74 @@ def test_conditional_generator_sample_alias_uses_generate(monkeypatch) -> None:
 
     assert generator.sample(n_samples=3, n_neighbors=2) == [graph]
     assert seen == {"n_samples": 3, "kwargs": {"n_neighbors": 2}}
+
+
+def test_conditional_generator_sample_uses_n_samples_as_stored_seed_count(monkeypatch) -> None:
+    graph = nx.path_graph(3)
+    for node in graph.nodes:
+        graph.nodes[node]["label"] = str(node)
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=node_operator(),
+        nbits=6,
+        base_cut_radius=0,
+        interpretation_cut_radius=0,
+    )
+    generator.stored_graphs_ = [graph]
+
+    calls = []
+
+    def fake_generate(*, n_samples=1, **kwargs):
+        calls.append({"n_samples": n_samples, "kwargs": kwargs})
+        return [graph.copy() for _ in range(n_samples)]
+
+    monkeypatch.setattr(generator, "generate", fake_generate)
+
+    outputs = generator.sample(
+        n_samples=3,
+        n_instances_per_sample=2,
+        n_neighbors=2,
+        random_state=0,
+    )
+
+    assert len(outputs) == 6
+    assert [call["n_samples"] for call in calls] == [2, 2, 2]
+    assert [call["kwargs"]["n_neighbors"] for call in calls] == [2, 2, 2]
+    assert all(isinstance(call["kwargs"]["random_state"], int) for call in calls)
+    assert len({call["kwargs"]["random_state"] for call in calls}) == 3
+    assert generator.last_sampled_indices_ == []
+
+
+def test_conditional_generator_sample_records_stored_seed_history(monkeypatch) -> None:
+    graph = nx.path_graph(3)
+    for node in graph.nodes:
+        graph.nodes[node]["label"] = str(node)
+
+    generator = ConditionalAutoregressiveGenerator(
+        decomposition_function=node_operator(),
+        nbits=6,
+        base_cut_radius=0,
+        interpretation_cut_radius=0,
+    )
+    generator.stored_graphs_ = [graph, graph.copy(), graph.copy()]
+
+    sampled_indices = iter([2, 0])
+
+    def fake_generate(*, n_samples=1, **_kwargs):
+        sampled_index = next(sampled_indices)
+        generator.last_sampled_index_ = sampled_index
+        generator.last_neighbor_indices_ = [1]
+        generator.last_generation_training_graphs_ = [graph]
+        return [graph.copy() for _ in range(n_samples)]
+
+    monkeypatch.setattr(generator, "generate", fake_generate)
+
+    outputs = generator.sample(n_samples=2, n_instances_per_sample=1, random_state=0)
+
+    assert len(outputs) == 2
+    assert generator.last_sampled_indices_ == [2, 0]
+    assert generator.last_neighbor_indices_history_ == [[1], [1]]
+    assert [len(graphs) for graphs in generator.last_generation_training_graphs_history_] == [1, 1]
 
 
 def test_generate_pruning_sequences_supports_canonical_interpretation_aliases() -> None:

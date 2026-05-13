@@ -302,7 +302,7 @@ class ConditionalAutoregressiveGenerator:
             None if base_context_radius is None else int(base_context_radius)
         )
         requested_debug_level = max(0, int(debug_level))
-        self.debug = bool(debug) or requested_debug_level > 0
+        self.debug = bool(debug)
         if self.debug:
             self.debug_level = max(1, requested_debug_level)
         else:
@@ -324,8 +324,11 @@ class ConditionalAutoregressiveGenerator:
         self.stored_neighbor_features_: Optional[np.ndarray] = None
         self.stored_signature_sets_: Optional[list[Optional[set[tuple[int, int]]]]] = None
         self.last_sampled_index_: Optional[int] = None
+        self.last_sampled_indices_: list[int] = []
         self.last_neighbor_indices_: list[int] = []
+        self.last_neighbor_indices_history_: list[list[int]] = []
         self.last_generation_training_graphs_: list[nx.Graph] = []
+        self.last_generation_training_graphs_history_: list[list[nx.Graph]] = []
         self.last_generation_interpretation_graph_: Optional[nx.Graph] = None
         self._zero_generation_streak: int = 0
         self._missing_anchor_sentinel = -1
@@ -887,8 +890,11 @@ class ConditionalAutoregressiveGenerator:
         self.stored_neighbor_features_ = features
         self.stored_signature_sets_ = [None for _ in graph_list]
         self.last_sampled_index_ = None
+        self.last_sampled_indices_ = []
         self.last_neighbor_indices_ = []
+        self.last_neighbor_indices_history_ = []
         self.last_generation_training_graphs_ = []
+        self.last_generation_training_graphs_history_ = []
         self.last_generation_interpretation_graph_ = None
         return self
 
@@ -988,8 +994,11 @@ class ConditionalAutoregressiveGenerator:
             target_interpretation_graph = self._stored_interpretation_graph(sampled_index)
             self.fit([graphs[sampled_index]])
             self.last_sampled_index_ = sampled_index
+            self.last_sampled_indices_ = [sampled_index]
             self.last_neighbor_indices_ = []
+            self.last_neighbor_indices_history_ = [[]]
             self.last_generation_training_graphs_ = [graphs[sampled_index]]
+            self.last_generation_training_graphs_history_ = [[graphs[sampled_index]]]
             self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
             return [target_interpretation_graph]
 
@@ -1020,8 +1029,11 @@ class ConditionalAutoregressiveGenerator:
                 training_graphs = [graphs[i] for i in training_indices]
                 self.fit(training_graphs)
                 self.last_sampled_index_ = sampled_index
+                self.last_sampled_indices_ = [sampled_index]
                 self.last_neighbor_indices_ = neighbor_indices
+                self.last_neighbor_indices_history_ = [list(neighbor_indices)]
                 self.last_generation_training_graphs_ = training_graphs
+                self.last_generation_training_graphs_history_ = [list(training_graphs)]
                 self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
                 return [target_interpretation_graph]
 
@@ -1051,8 +1063,11 @@ class ConditionalAutoregressiveGenerator:
                     training_graphs = [graphs[i] for i in selected_neighbors]
                     self.fit(training_graphs)
                     self.last_sampled_index_ = sampled_index
+                    self.last_sampled_indices_ = [sampled_index]
                     self.last_neighbor_indices_ = selected_neighbors
+                    self.last_neighbor_indices_history_ = [list(selected_neighbors)]
                     self.last_generation_training_graphs_ = training_graphs
+                    self.last_generation_training_graphs_history_ = [list(training_graphs)]
                     self.last_generation_interpretation_graph_ = target_interpretation_graph.copy()
                     return [target_interpretation_graph]
 
@@ -1073,8 +1088,11 @@ class ConditionalAutoregressiveGenerator:
             )
 
         self.last_sampled_index_ = None
+        self.last_sampled_indices_ = []
         self.last_neighbor_indices_ = []
+        self.last_neighbor_indices_history_ = []
         self.last_generation_training_graphs_ = []
+        self.last_generation_training_graphs_history_ = []
         self.last_generation_interpretation_graph_ = None
         warnings.warn(
             "Could not find a stored seed graph whose target interpretation signatures "
@@ -2674,15 +2692,57 @@ class ConditionalAutoregressiveGenerator:
                 )
         return outputs
 
-    def sample(self, n_samples: int = 1, **kwargs) -> list[nx.Graph]:
-        """Alias for ``generate``.
+    def sample(
+        self,
+        n_samples: int = 1,
+        *,
+        n_instances_per_sample: int = 1,
+        **kwargs,
+    ) -> list[nx.Graph]:
+        """Sample stored seed graphs and generate variants from each seed.
 
         This is useful with ``store(graphs)`` for input-free local generation:
-        ``sample(n_samples=..., n_neighbors=...)`` samples one stored graph,
-        fits on its nearest-neighbor context, and generates from that graph's
-        interpretation graph.
+        ``sample(n_samples=..., n_instances_per_sample=..., n_neighbors=...)``
+        samples ``n_samples`` stored seed graphs, fits on each seed's covered
+        nearest-neighbor context, and generates ``n_instances_per_sample``
+        variants from each seed interpretation graph.
+
+        Without stored graphs, or when explicit ``interpretation_graphs`` are
+        provided, this method forwards to ``generate`` and keeps the historical
+        meaning of ``n_samples`` as the number of generated graphs.
         """
-        return self.generate(n_samples=n_samples, **kwargs)
+        n_seeds = int(n_samples)
+        if n_seeds <= 0:
+            return []
+        n_instances = int(n_instances_per_sample)
+        if n_instances <= 0:
+            return []
+        if self.stored_graphs_ is None or kwargs.get("interpretation_graphs") is not None:
+            return self.generate(n_samples=n_seeds, **kwargs)
+
+        random_state = kwargs.pop("random_state", None)
+        rng = random.Random(random_state)
+        outputs: list[nx.Graph] = []
+        sampled_indices: list[int] = []
+        neighbor_indices_history: list[list[int]] = []
+        training_graphs_history: list[list[nx.Graph]] = []
+        for _seed_index in range(n_seeds):
+            seed_random_state = rng.randrange(2**63)
+            outputs.extend(
+                self.generate(
+                    n_samples=n_instances,
+                    random_state=seed_random_state,
+                    **kwargs,
+                )
+            )
+            if self.last_sampled_index_ is not None:
+                sampled_indices.append(int(self.last_sampled_index_))
+                neighbor_indices_history.append(list(self.last_neighbor_indices_))
+                training_graphs_history.append(list(self.last_generation_training_graphs_))
+        self.last_sampled_indices_ = sampled_indices
+        self.last_neighbor_indices_history_ = neighbor_indices_history
+        self.last_generation_training_graphs_history_ = training_graphs_history
+        return outputs
 
 from abstractgraph_generative.conditional_batch import (  # noqa: E402,F401
     ConditionalAutoregressiveGraphsGenerator,
