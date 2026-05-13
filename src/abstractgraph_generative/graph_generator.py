@@ -165,6 +165,18 @@ class GraphGenerator:
                 stored_interpretation_graphs[idx].copy()
                 for idx in interpretation_neighbor_indices
             ]
+            if (
+                seed_interpretation_graph.number_of_edges() > 0
+                and all(graph.number_of_edges() == 0 for graph in edge_training_graphs)
+                and seed_idx not in interpretation_neighbor_indices
+            ):
+                edge_training_graphs.append(seed_interpretation_graph.copy())
+                interpretation_neighbor_indices = list(interpretation_neighbor_indices) + [
+                    seed_idx
+                ]
+                self.last_interpretation_neighbor_indices_history_[-1] = list(
+                    interpretation_neighbor_indices
+                )
             edge_targets = self._select_targets(interpretation_neighbor_indices)
             try:
                 self._fit_edge_generator(edge_training_graphs, edge_targets)

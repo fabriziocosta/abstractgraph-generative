@@ -214,6 +214,37 @@ def test_edge_fit_failure_skips_seed_without_success_histories() -> None:
     assert generator.last_conditional_training_graphs_history_ == []
 
 
+def test_sample_adds_seed_to_edge_training_when_neighbors_have_no_edges() -> None:
+    seed_interpretation = nx.Graph()
+    seed_interpretation.add_edge(0, 1)
+    empty_neighbor = nx.Graph()
+    empty_neighbor.add_nodes_from([0, 1])
+    interpretation_graphs = [empty_neighbor, seed_interpretation]
+    base_graphs = [_labeled_path(2), _labeled_path(3)]
+    edge_generator = FakeEdgeGenerator(nx.path_graph(2))
+    generator = GraphGenerator(
+        edge_generator=edge_generator,
+        conditional_generator=FakeConditionalGenerator(),
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=1,
+        n_conditional_neighbors=1,
+        random_state=0,
+    )
+
+    assert generator.last_sampled_indices_ == [1]
+    assert generator.last_interpretation_neighbor_indices_history_ == [[0, 1]]
+    assert [graph.number_of_edges() for graph in edge_generator.fit_calls[0][0]] == [
+        0,
+        1,
+    ]
+
+
 def test_store_requires_at_least_two_graphs() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(2)),

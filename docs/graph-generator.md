@@ -1,6 +1,6 @@
 # GraphGenerator
 
-`GraphGenerator` combines two existing generators into one local two-stage
+`GraphGenerator` combines two existing generators into one two-stage
 workflow:
 
 1. generate a target interpretation graph with `EdgeGenerator`,
