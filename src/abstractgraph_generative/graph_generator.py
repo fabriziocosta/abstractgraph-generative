@@ -55,6 +55,7 @@ class GraphGenerator:
         self.stored_interpretation_distance_matrix_: np.ndarray | None = None
 
         self.last_sampled_indices_: list[int] = []
+        self.last_successful_sampled_indices_: list[int] = []
         self.last_interpretation_neighbor_indices_history_: list[list[int]] = []
         self.last_conditional_neighbor_indices_history_: list[list[int]] = []
         self.last_generated_interpretation_graphs_: list[nx.Graph] = []
@@ -121,6 +122,7 @@ class GraphGenerator:
         n_instances_per_sample: int = 1,
         interpretation_edge_removal_size: float = 0.5,
         random_state: int | None = None,
+        max_seed_attempts: int | None = None,
         edge_generate_kwargs: dict | None = None,
         conditional_generate_kwargs: dict | None = None,
     ) -> list[nx.Graph]:
@@ -133,6 +135,14 @@ class GraphGenerator:
             return []
         if n_conditional_neighbors < 1:
             raise ValueError("n_conditional_neighbors must be >= 1")
+        if max_seed_attempts is None:
+            max_seed_attempts = min(
+                len(stored_interpretation_graphs),
+                max(n_samples, n_samples * 10),
+            )
+        max_seed_attempts = int(max_seed_attempts)
+        if max_seed_attempts < 1:
+            raise ValueError("max_seed_attempts must be >= 1")
 
         rng = random.Random(self.seed if random_state is None else random_state)
         edge_generate_kwargs = dict(edge_generate_kwargs or {})
@@ -143,20 +153,41 @@ class GraphGenerator:
 
         self._reset_histories()
         generated_base_graphs: list[nx.Graph] = []
+        successful_samples = 0
+        seed_order: list[int] = []
 
-        for _ in range(n_samples):
-            seed_idx = rng.randrange(len(stored_interpretation_graphs))
+        for _ in range(max_seed_attempts):
+            if successful_samples >= n_samples:
+                break
+            if not seed_order:
+                seed_order = list(range(len(stored_interpretation_graphs)))
+                rng.shuffle(seed_order)
+            seed_idx = seed_order.pop()
             seed_interpretation_graph = stored_interpretation_graphs[seed_idx].copy()
             self.last_sampled_indices_.append(seed_idx)
 
-            interpretation_neighbor_indices = self._nearest_interpretation_indices(
+            interpretation_candidate_indices = self._nearest_interpretation_indices(
                 seed_interpretation_graph,
-                n_neighbors=n_interpretation_neighbors,
+                n_neighbors=len(stored_interpretation_graphs),
                 query_index=seed_idx,
                 exclude_query=True,
             )
-            if not interpretation_neighbor_indices:
-                interpretation_neighbor_indices = [seed_idx]
+            (
+                interpretation_neighbor_indices,
+                interpretation_labels_covered,
+            ) = self._augment_interpretation_indices_for_label_coverage(
+                seed_interpretation_graph,
+                interpretation_candidate_indices,
+                n_neighbors=n_interpretation_neighbors,
+            )
+            if not interpretation_labels_covered:
+                warnings.warn(
+                    "No interpretation-neighbor context covers the sampled seed's "
+                    "interpretation node labels; skipping seed.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             self.last_interpretation_neighbor_indices_history_.append(
                 list(interpretation_neighbor_indices)
             )
@@ -251,6 +282,7 @@ class GraphGenerator:
             self.last_conditional_neighbor_indices_history_.append(
                 list(conditional_neighbor_indices)
             )
+            self.last_successful_sampled_indices_.append(seed_idx)
             self.last_generated_interpretation_graphs_.append(
                 generated_interpretation_graph.copy()
             )
@@ -261,11 +293,13 @@ class GraphGenerator:
                 [graph.copy() for graph in conditional_training_graphs]
             )
             generated_base_graphs.extend(graph.copy() for graph in generated_batch)
+            successful_samples += 1
 
         return generated_base_graphs
 
     def _reset_histories(self) -> None:
         self.last_sampled_indices_ = []
+        self.last_successful_sampled_indices_ = []
         self.last_interpretation_neighbor_indices_history_ = []
         self.last_conditional_neighbor_indices_history_ = []
         self.last_generated_interpretation_graphs_ = []
@@ -363,6 +397,55 @@ class GraphGenerator:
             if len(indices) >= n_neighbors:
                 break
         return indices
+
+    def _augment_interpretation_indices_for_label_coverage(
+        self,
+        graph: nx.Graph,
+        candidate_indices: Sequence[int],
+        *,
+        n_neighbors: int,
+    ) -> tuple[list[int], bool]:
+        """Select nearest interpretation neighbors using repair-style label coverage."""
+        _stored_graphs, stored_interpretation_graphs = self._require_stored()
+        candidate_indices = list(dict.fromkeys(int(idx) for idx in candidate_indices))
+        requested_neighbors = max(0, int(n_neighbors))
+        required_labels = self._graph_unique_node_labels(graph)
+        selected_indices = []
+        selected_set = set()
+
+        if required_labels:
+            missing_labels = set(required_labels)
+            for idx in candidate_indices:
+                candidate_labels = self._graph_unique_node_labels(
+                    stored_interpretation_graphs[idx]
+                )
+                if not missing_labels.intersection(candidate_labels):
+                    continue
+                selected_indices.append(idx)
+                selected_set.add(idx)
+                missing_labels.difference_update(candidate_labels)
+                if not missing_labels:
+                    break
+            if missing_labels:
+                return selected_indices, False
+
+        for idx in candidate_indices:
+            if len(selected_indices) >= requested_neighbors:
+                break
+            if idx in selected_set:
+                continue
+            selected_indices.append(idx)
+            selected_set.add(idx)
+
+        return selected_indices, True
+
+    @staticmethod
+    def _graph_unique_node_labels(graph: nx.Graph) -> set:
+        return {
+            data.get("label")
+            for _, data in graph.nodes(data=True)
+            if data.get("label") is not None
+        }
 
     def _fit_edge_generator(
         self,

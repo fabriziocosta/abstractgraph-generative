@@ -77,6 +77,12 @@ def _labeled_path(n_nodes: int) -> nx.Graph:
     return graph
 
 
+def _single_label_graph(label: str) -> nx.Graph:
+    graph = nx.Graph()
+    graph.add_node(0, label=label)
+    return graph
+
+
 def test_store_computes_and_aligns_interpretation_graphs() -> None:
     graphs = [_labeled_path(3), _labeled_path(4)]
     generator = GraphGenerator(
@@ -158,6 +164,8 @@ def test_sample_records_histories_for_successful_generation() -> None:
 
     assert len(outputs) == 2
     assert len(generator.last_sampled_indices_) == 1
+    assert len(generator.last_successful_sampled_indices_) == 1
+    assert generator.last_successful_sampled_indices_ == generator.last_sampled_indices_
     assert len(generator.last_interpretation_neighbor_indices_history_) == 1
     assert len(generator.last_conditional_neighbor_indices_history_) == 1
     assert len(generator.last_generated_interpretation_graphs_) == 1
@@ -177,10 +185,11 @@ def test_edge_stage_failure_skips_seed_without_success_histories() -> None:
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="Edge stage failed"):
-        outputs = generator.sample(n_samples=1, random_state=0)
+        outputs = generator.sample(n_samples=1, random_state=0, max_seed_attempts=1)
 
     assert outputs == []
     assert len(generator.last_sampled_indices_) == 1
+    assert generator.last_successful_sampled_indices_ == []
     assert len(generator.last_interpretation_neighbor_indices_history_) == 1
     assert generator.last_conditional_neighbor_indices_history_ == []
     assert generator.last_generated_interpretation_graphs_ == []
@@ -203,10 +212,11 @@ def test_edge_fit_failure_skips_seed_without_success_histories() -> None:
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="failed while fitting"):
-        outputs = generator.sample(n_samples=1, random_state=0)
+        outputs = generator.sample(n_samples=1, random_state=0, max_seed_attempts=1)
 
     assert outputs == []
     assert len(generator.last_sampled_indices_) == 1
+    assert generator.last_successful_sampled_indices_ == []
     assert len(generator.last_interpretation_neighbor_indices_history_) == 1
     assert generator.last_conditional_neighbor_indices_history_ == []
     assert generator.last_generated_interpretation_graphs_ == []
@@ -243,6 +253,93 @@ def test_sample_adds_seed_to_edge_training_when_neighbors_have_no_edges() -> Non
         0,
         1,
     ]
+
+
+def test_sample_extends_interpretation_neighbors_for_label_coverage() -> None:
+    seed_interpretation = _single_label_graph("rare")
+    near_neighbor = _single_label_graph("common")
+    covering_neighbor = _single_label_graph("rare")
+    interpretation_graphs = [near_neighbor, seed_interpretation, covering_neighbor]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    edge_generator = FakeEdgeGenerator(nx.path_graph(1))
+    generator = GraphGenerator(
+        edge_generator=edge_generator,
+        conditional_generator=FakeConditionalGenerator(),
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=1,
+        n_conditional_neighbors=1,
+        random_state=0,
+    )
+
+    assert generator.last_sampled_indices_ == [1]
+    assert generator.last_interpretation_neighbor_indices_history_ == [[2]]
+
+
+def test_sample_skips_seed_when_interpretation_labels_are_not_covered() -> None:
+    seed_interpretation = _single_label_graph("rare")
+    neighbor = _single_label_graph("common")
+    interpretation_graphs = [neighbor, seed_interpretation]
+    base_graphs = [_labeled_path(2), _labeled_path(3)]
+    edge_generator = FakeEdgeGenerator(nx.path_graph(1))
+    generator = GraphGenerator(
+        edge_generator=edge_generator,
+        conditional_generator=FakeConditionalGenerator(),
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    with pytest.warns(RuntimeWarning, match="covers the sampled seed"):
+        outputs = generator.sample(
+            n_samples=1,
+            n_interpretation_neighbors=1,
+            n_conditional_neighbors=1,
+            random_state=0,
+            max_seed_attempts=1,
+        )
+
+    assert outputs == []
+    assert generator.last_sampled_indices_ == [1]
+    assert generator.last_successful_sampled_indices_ == []
+    assert generator.last_interpretation_neighbor_indices_history_ == []
+    assert edge_generator.fit_calls == []
+
+
+def test_sample_retries_distinct_seeds_until_success() -> None:
+    unsupported = _single_label_graph("rare")
+    neighbor = _single_label_graph("common")
+    supported = _single_label_graph("common")
+    interpretation_graphs = [neighbor, unsupported, supported]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    edge_generator = FakeEdgeGenerator(nx.path_graph(1))
+    generator = GraphGenerator(
+        edge_generator=edge_generator,
+        conditional_generator=FakeConditionalGenerator(),
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    with pytest.warns(RuntimeWarning, match="covers the sampled seed"):
+        outputs = generator.sample(
+            n_samples=1,
+            n_interpretation_neighbors=1,
+            n_conditional_neighbors=1,
+            random_state=0,
+            max_seed_attempts=3,
+        )
+
+    assert len(outputs) == 1
+    assert len(generator.last_sampled_indices_) > 1
+    assert generator.last_sampled_indices_[0] == 1
+    assert generator.last_successful_sampled_indices_ == [2]
+    assert len(edge_generator.fit_calls) == 1
 
 
 def test_store_requires_at_least_two_graphs() -> None:

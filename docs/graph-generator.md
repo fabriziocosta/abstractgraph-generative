@@ -20,9 +20,17 @@ The implementation lives in `abstractgraph_generative.graph_generator`.
   directly by the caller.
 
 Sampling happens in interpretation-graph space first. For each sampled seed, the
-generator retrieves nearby stored interpretation graphs, fits `EdgeGenerator` on
-that local interpretation neighborhood, prunes edges from the seed
-interpretation graph, and regrows a new interpretation graph.
+generator retrieves a local stored-interpretation neighborhood, fits
+`EdgeGenerator` on that neighborhood, prunes edges from the seed interpretation
+graph, and regrows a new interpretation graph.
+
+The edge-stage neighborhood uses the same label-coverage principle as
+`EdgeGenerator.repair(...)`: candidates are scanned in nearest-neighbor order,
+neighbors that cover missing seed interpretation-node labels are selected first,
+and remaining slots are filled with nearest unused candidates. The seed
+interpretation graph is not used as evidence for its own feasibility. If no
+stored interpretation-neighbor context covers the sampled seed's labels, that
+seed is rejected and sampling continues with another seed.
 
 The generated interpretation graph is then used as a query against the same
 stored interpretation corpus. The nearest matches identify the corresponding
@@ -53,6 +61,7 @@ samples = generator.sample(
     n_instances_per_sample=2,
     interpretation_edge_removal_size=0.5,
     random_state=0,
+    max_seed_attempts=None,
 )
 ```
 
@@ -109,10 +118,22 @@ calls when present.
 
 ## Sample Phase
 
-For each requested seed, `sample(...)` does the following:
+`sample(...)` treats `n_samples` as the number of successful interpretation
+targets requested. Since seeds can be skipped, the generator may try more seed
+indices than `n_samples`. By default, `max_seed_attempts=None` allows up to
+`10 * n_samples` distinct seed attempts, capped by the stored corpus size. Set
+`max_seed_attempts` explicitly to make this stricter or more exhaustive.
+
+For each attempted seed, `sample(...)` does the following:
 
 1. sample one stored interpretation graph index,
-2. retrieve `n_interpretation_neighbors` nearby stored interpretation graphs,
+2. retrieve an interpretation-neighbor context using repair-style label
+   coverage:
+   - scan candidates in nearest-neighbor order,
+   - select neighbors that cover missing seed interpretation-node labels,
+   - fill any remaining slots up to `n_interpretation_neighbors`,
+   - reject the seed if its labels cannot be covered by other stored
+     interpretation graphs,
 3. fit `EdgeGenerator` on those interpretation graphs,
 4. prune the seed interpretation graph with `remove_edges(...)`,
 5. regrow one generated interpretation graph to the seed's original edge count,
@@ -124,8 +145,10 @@ For each requested seed, `sample(...)` does the following:
 
 The returned value is a flat `list[nx.Graph]`. With
 `n_samples=4` and `n_instances_per_sample=2`, up to eight base graphs are
-returned. Failed edge-stage seeds are skipped with a `RuntimeWarning`, so the
-final count may be smaller.
+returned. Failed edge-stage seeds and unsupported-label seeds are skipped with a
+`RuntimeWarning`; the generator then tries another distinct seed until it has
+`n_samples` successful interpretation targets or exhausts `max_seed_attempts`.
+The final count may still be smaller if too many attempts fail.
 
 `conditional_generate_kwargs` are forwarded to
 `ConditionalAutoregressiveGenerator.generate(...)`, except `n_samples` and
@@ -139,21 +162,39 @@ final count may be smaller.
 After `sample(...)`, these attributes describe the last run:
 
 - `last_sampled_indices_`
+  Attempted seed indices, including skipped seeds.
+- `last_successful_sampled_indices_`
+  Seed indices that reached generated base-graph output. Use this for notebook
+  displays aligned with `generated_graphs`.
 - `last_interpretation_neighbor_indices_history_`
 - `last_conditional_neighbor_indices_history_`
 - `last_generated_interpretation_graphs_`
 - `last_edge_generation_paths_`
 - `last_conditional_training_graphs_history_`
 
+The successful-stage histories only receive entries after their stage succeeds.
 These are useful for notebooks and diagnostics. For example:
 
 ```python
-seed_graphs = [generator.stored_graphs_[i] for i in generator.last_sampled_indices_]
+attempted_seed_graphs = [
+    generator.stored_graphs_[i] for i in generator.last_sampled_indices_
+]
+successful_seed_graphs = [
+    generator.stored_graphs_[i] for i in generator.last_successful_sampled_indices_
+]
 generated_targets = generator.last_generated_interpretation_graphs_
 training_sets = generator.last_conditional_training_graphs_history_
 ```
 
 ## Interpretation Labels
+
+The edge stage requires the local interpretation-neighbor context to cover the
+sampled seed's interpretation-node labels. This is especially important with
+label modes such as `"histogram"` or `"histogram_values"`, where labels can be
+more specific than `"operator_hash"` labels. A seed with rare labels is skipped
+unless those labels appear in other stored interpretation graphs. This avoids
+fitting a feasibility estimator on a neighborhood that would necessarily mark
+the seed's own structure infeasible.
 
 The conditional stage preserves the target interpretation graph through the
 existing `ConditionalAutoregressiveGenerator` postcondition. That means every

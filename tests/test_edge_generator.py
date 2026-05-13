@@ -1862,6 +1862,95 @@ def test_partition_candidates_skips_lookahead_when_final_estimator_lacks_violati
     assert infeasible_candidates == []
 
 
+def test_rank_feasible_candidates_prioritizes_one_step_final_completion() -> None:
+    class _AlwaysFeasibleEstimator:
+        def predict(self, graphs):
+            return np.ones(len(graphs), dtype=bool)
+
+    class _PathFinalEstimator:
+        def predict(self, graphs):
+            return np.asarray(
+                [
+                    set(graph.edges()) == {(0, 1), (1, 2)}
+                    for graph in graphs
+                ],
+                dtype=bool,
+            )
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
+        final_feasibility_estimator=_PathFinalEstimator(),
+        graph_estimator=object(),
+    )
+    generator.edge_attribute_templates_ = [{}]
+    generator._positive_scores = lambda graphs: np.asarray([0.2, 0.9], dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.zeros(len(graphs), dtype=float)
+    generator._repulsion_values = lambda graphs, *, fallback_index: (
+        np.zeros(len(graphs), dtype=float),
+        0.0,
+    )
+
+    graph_with_completion = nx.Graph()
+    graph_with_completion.add_nodes_from([0, 1, 2])
+    graph_with_completion.add_edge(0, 1)
+    graph_without_completion = nx.Graph()
+    graph_without_completion.add_nodes_from([0, 1, 2])
+    graph_without_completion.add_edge(0, 2)
+    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
+    cand_with_completion = generator._make_state(
+        graph_with_completion,
+        parent=root,
+        score=None,
+        depth=1,
+    )
+    cand_without_completion = generator._make_state(
+        graph_without_completion,
+        parent=root,
+        score=None,
+        depth=1,
+    )
+    feasible_candidates = []
+    infeasible_candidates = []
+
+    generator._partition_candidates_by_feasibility(
+        [cand_with_completion, cand_without_completion],
+        n_edges=2,
+        max_total_edges=2,
+        target=None,
+        target_lambda=1.0,
+        feasible_candidates=feasible_candidates,
+        infeasible_candidates=infeasible_candidates,
+    )
+    generator._rank_feasible_candidates(feasible_candidates, fallback_index=-1)
+
+    assert feasible_candidates[0] is cand_with_completion
+    assert cand_with_completion["final_lookahead_feasible"] is True
+    assert cand_without_completion["final_lookahead_feasible"] is False
+
+
+def test_retain_unseen_candidates_allows_final_feasible_diversity_hit() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        enforce_diversity=True,
+    )
+    graph = nx.path_graph(3)
+    root = generator._make_state(nx.empty_graph(3), parent=None, score=1.0, depth=0)
+    cand = generator._make_state(graph, parent=root, score=1.0, depth=1)
+    cand["connected_components"] = 1
+    generator.diversity_memory_hash_set_ = {cand["graph_hash"]}
+    search = generator._initialize_search_state(nx.empty_graph(3))
+
+    retained = generator._retain_unseen_candidates(
+        [cand],
+        search=search,
+        next_depth=1,
+        beam_limit=1,
+    )
+
+    assert retained == [cand]
+
+
 def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None:
     class _AlwaysFeasibleEstimator:
         def predict(self, graphs):

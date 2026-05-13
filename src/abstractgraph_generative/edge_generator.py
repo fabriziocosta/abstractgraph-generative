@@ -2357,6 +2357,7 @@ class EdgeGenerator:
                 self._mark_trace_state_status(cand, "lookahead_infeasible")
                 infeasible_candidates.append(cand)
             else:
+                self._annotate_final_one_step_lookahead(cand, n_edges=n_edges)
                 feasible_candidates.append(cand)
         self._promote_final_feasible_candidates(
             partial_terminal_candidates,
@@ -2459,6 +2460,28 @@ class EdgeGenerator:
                 self._mark_trace_state_status(cand, "final_infeasible")
                 infeasible_candidates.append(cand)
 
+    def _annotate_final_one_step_lookahead(self, cand, *, n_edges: int) -> None:
+        remaining_edges = int(n_edges) - cand["graph"].number_of_edges()
+        cand["final_lookahead_feasible"] = False
+        if remaining_edges != 1:
+            return
+
+        completion_graphs = []
+        edge_attribute_templates = self.edge_attribute_templates_ or [{}]
+        for edge in self._missing_edges(cand["graph"]):
+            for edge_attrs in edge_attribute_templates:
+                completion_graph = cand["graph"].copy()
+                completion_graph.add_edge(*edge, **edge_attrs)
+                completion_graphs.append(completion_graph)
+        if not completion_graphs:
+            return
+
+        final_mask = np.asarray(
+            self.final_feasibility_estimator.predict(completion_graphs),
+            dtype=bool,
+        )
+        cand["final_lookahead_feasible"] = bool(np.any(final_mask))
+
     def _rank_feasible_candidates(self, feasible_candidates, *, fallback_index: int):
         if not feasible_candidates:
             return 0.0
@@ -2473,6 +2496,7 @@ class EdgeGenerator:
             )
         feasible_candidates.sort(
             key=lambda cand: (
+                bool(cand.get("final_lookahead_feasible", False)),
                 cand["selection_score"],
             ),
             reverse=True,
@@ -2500,7 +2524,12 @@ class EdgeGenerator:
                 continue
             if cand["path_signature"] in search["tabu_path_signatures"]:
                 continue
-            if self.enforce_diversity and cand["graph_hash"] in self.diversity_memory_hash_set_:
+            is_final_feasible_candidate = "connected_components" in cand
+            if (
+                self.enforce_diversity
+                and not is_final_feasible_candidate
+                and cand["graph_hash"] in self.diversity_memory_hash_set_
+            ):
                 continue
             unseen_candidates.append(cand)
         retained = self._select_beam_candidates(unseen_candidates, beam_limit=beam_limit)
