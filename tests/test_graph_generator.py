@@ -7,6 +7,8 @@ from sklearn.ensemble import RandomForestClassifier
 
 from abstractgraph import node as node_operator
 from abstractgraph.hashing import hash_graph
+from abstractgraph_ml.estimators import GraphEstimator
+from abstractgraph_generative.edge_generator import EdgeGenerator
 from abstractgraph_generative.graph_generator import GraphGenerator
 
 
