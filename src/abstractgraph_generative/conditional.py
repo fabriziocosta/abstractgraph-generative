@@ -2503,6 +2503,21 @@ class ConditionalAutoregressiveGenerator:
                         phase="sequential",
                     )
                     continue
+                if not self._matches_target_interpretation(
+                    generated_local,
+                    target_local,
+                ):
+                    if capture_traces:
+                        attempt_outcomes["interpretation_mismatch"] += 1
+                    _maybe_log_progress(
+                        attempts_now=attempts_local,
+                        completed_now=attempts_local,
+                        constructed_now=constructed_local,
+                        filtered_now=filtered_local,
+                        kept_now=len(outputs_local),
+                        phase="sequential",
+                    )
+                    continue
                 constructed_local += 1
                 filtered_local_batch = self._filter_feasible_graphs([generated_local])
                 if filtered_local_batch:

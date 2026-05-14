@@ -37,7 +37,13 @@ class GraphGenerator:
         label_mode: str = "operator_hash",
         interpretation_neighbor_vectorizer=None,
         seed: int | None = None,
+        debug: bool = False,
+        require_new_interpretation_graph: bool = True,
+        max_same_interpretation_retries: int = 3,
     ):
+        max_same_interpretation_retries = int(max_same_interpretation_retries)
+        if max_same_interpretation_retries < 0:
+            raise ValueError("max_same_interpretation_retries must be >= 0")
         self.edge_generator = edge_generator
         self.conditional_generator = conditional_generator
         self.decomposition_function = decomposition_function
@@ -45,6 +51,10 @@ class GraphGenerator:
         self.label_mode = label_mode
         self.interpretation_neighbor_vectorizer = interpretation_neighbor_vectorizer
         self.seed = seed
+        self.debug = bool(debug)
+        self.require_new_interpretation_graph = bool(require_new_interpretation_graph)
+        self.max_same_interpretation_retries = max_same_interpretation_retries
+        self._propagate_debug()
 
         self.stored_graphs_: list[nx.Graph] | None = None
         self.stored_interpretation_graphs_: list[nx.Graph] | None = None
@@ -57,7 +67,10 @@ class GraphGenerator:
         self.last_sampled_indices_: list[int] = []
         self.last_successful_sampled_indices_: list[int] = []
         self.last_interpretation_neighbor_indices_history_: list[list[int]] = []
+        self.last_interpretation_neighbor_distances_history_: list[list[float]] = []
         self.last_conditional_neighbor_indices_history_: list[list[int]] = []
+        self.last_seed_graphs_: list[nx.Graph] = []
+        self.last_seed_interpretation_graphs_: list[nx.Graph] = []
         self.last_generated_interpretation_graphs_: list[nx.Graph] = []
         self.last_edge_generation_paths_: list[list[nx.Graph]] = []
         self.last_conditional_training_graphs_history_: list[list[nx.Graph]] = []
@@ -155,6 +168,7 @@ class GraphGenerator:
         generated_base_graphs: list[nx.Graph] = []
         successful_samples = 0
         seed_order: list[int] = []
+        skip_edge_stage = float(interpretation_edge_removal_size) == 0.0
 
         for _ in range(max_seed_attempts):
             if successful_samples >= n_samples:
@@ -166,95 +180,115 @@ class GraphGenerator:
             seed_interpretation_graph = stored_interpretation_graphs[seed_idx].copy()
             self.last_sampled_indices_.append(seed_idx)
 
-            interpretation_candidate_indices = self._nearest_interpretation_indices(
-                seed_interpretation_graph,
-                n_neighbors=len(stored_interpretation_graphs),
-                query_index=seed_idx,
-                exclude_query=True,
-            )
-            (
-                interpretation_neighbor_indices,
-                interpretation_labels_covered,
-            ) = self._augment_interpretation_indices_for_label_coverage(
-                seed_interpretation_graph,
-                interpretation_candidate_indices,
-                n_neighbors=n_interpretation_neighbors,
-            )
-            if not interpretation_labels_covered:
-                warnings.warn(
-                    "No interpretation-neighbor context covers the sampled seed's "
-                    "interpretation node labels; skipping seed.",
-                    RuntimeWarning,
-                    stacklevel=2,
+            if skip_edge_stage:
+                start_graph = seed_interpretation_graph.copy()
+                generated_interpretation_graph = seed_interpretation_graph.copy()
+                self.last_interpretation_neighbor_indices_history_.append([])
+                self.last_interpretation_neighbor_distances_history_.append([])
+            else:
+                interpretation_candidate_indices = self._nearest_interpretation_indices(
+                    seed_interpretation_graph,
+                    n_neighbors=len(stored_interpretation_graphs),
+                    query_index=seed_idx,
+                    exclude_query=True,
                 )
-                continue
-            self.last_interpretation_neighbor_indices_history_.append(
-                list(interpretation_neighbor_indices)
-            )
-
-            edge_training_graphs = [
-                stored_interpretation_graphs[idx].copy()
-                for idx in interpretation_neighbor_indices
-            ]
-            if (
-                seed_interpretation_graph.number_of_edges() > 0
-                and all(graph.number_of_edges() == 0 for graph in edge_training_graphs)
-                and seed_idx not in interpretation_neighbor_indices
-            ):
-                edge_training_graphs.append(seed_interpretation_graph.copy())
-                interpretation_neighbor_indices = list(interpretation_neighbor_indices) + [
-                    seed_idx
-                ]
-                self.last_interpretation_neighbor_indices_history_[-1] = list(
+                interpretation_candidate_indices = (
+                    self._deduplicate_interpretation_indices_by_hash(
+                        interpretation_candidate_indices
+                    )
+                )
+                (
+                    interpretation_neighbor_indices,
+                    interpretation_labels_covered,
+                ) = self._augment_interpretation_indices_for_label_coverage(
+                    seed_interpretation_graph,
+                    interpretation_candidate_indices,
+                    n_neighbors=n_interpretation_neighbors,
+                )
+                if not interpretation_labels_covered:
+                    warnings.warn(
+                        "No interpretation-neighbor context covers the sampled seed's "
+                        "interpretation node labels; skipping seed.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                self.last_interpretation_neighbor_indices_history_.append(
                     interpretation_neighbor_indices
                 )
-            edge_targets = self._select_targets(interpretation_neighbor_indices)
-            try:
-                self._fit_edge_generator(edge_training_graphs, edge_targets)
-            except Exception as exc:
-                warnings.warn(
-                    "Edge stage failed while fitting on interpretation neighbors; "
-                    f"skipping seed. Error: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
+                self.last_interpretation_neighbor_distances_history_.append(
+                    self._interpretation_distances_for_indices(
+                        seed_interpretation_graph,
+                        interpretation_neighbor_indices,
+                        query_index=seed_idx,
+                    )
                 )
-                continue
 
-            start_graph, original_edge_count = remove_edges(
-                seed_interpretation_graph,
-                size=interpretation_edge_removal_size,
-                rng=rng,
-            )
-            try:
-                generated_interpretation_graph = self.edge_generator.generate(
-                    start_graph,
-                    original_edge_count,
-                    return_path=False,
-                    **edge_generate_kwargs,
+                edge_training_graphs = [
+                    stored_interpretation_graphs[idx].copy()
+                    for idx in interpretation_neighbor_indices
+                ]
+                if (
+                    seed_interpretation_graph.number_of_edges() > 0
+                    and all(
+                        graph.number_of_edges() == 0 for graph in edge_training_graphs
+                    )
+                    and seed_idx not in interpretation_neighbor_indices
+                ):
+                    edge_training_graphs.append(seed_interpretation_graph.copy())
+                    interpretation_neighbor_indices = list(
+                        interpretation_neighbor_indices
+                    ) + [seed_idx]
+                    self.last_interpretation_neighbor_indices_history_[-1] = list(
+                        interpretation_neighbor_indices
+                    )
+                    self.last_interpretation_neighbor_distances_history_[-1] = (
+                        self._interpretation_distances_for_indices(
+                            seed_interpretation_graph,
+                            interpretation_neighbor_indices,
+                            query_index=seed_idx,
+                        )
+                    )
+                self._log_edge_neighbor_context(
+                    seed_idx=seed_idx,
+                    neighbor_indices=interpretation_neighbor_indices,
+                    neighbor_distances=self.last_interpretation_neighbor_distances_history_[
+                        -1
+                    ],
                 )
-            except Exception as exc:
-                warnings.warn(
-                    "Edge stage failed while generating an interpretation graph; "
-                    f"skipping seed. Error: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
+                edge_targets = self._select_targets(interpretation_neighbor_indices)
+                try:
+                    self._fit_edge_generator(edge_training_graphs, edge_targets)
+                except Exception as exc:
+                    warnings.warn(
+                        "Edge stage failed while fitting on interpretation neighbors; "
+                        f"skipping seed. Error: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+
+                start_graph, original_edge_count = remove_edges(
+                    seed_interpretation_graph,
+                    size=self._interpretation_edge_removal_size_for_remove_edges(
+                        seed_interpretation_graph,
+                        interpretation_edge_removal_size,
+                    ),
+                    rng=rng,
                 )
-                continue
-            if isinstance(generated_interpretation_graph, list):
                 generated_interpretation_graph = (
-                    generated_interpretation_graph[-1]
-                    if generated_interpretation_graph
-                    else None
+                    self._generate_interpretation_graph_with_retries(
+                        start_graph,
+                        original_edge_count,
+                        seed_interpretation_graph=seed_interpretation_graph,
+                        edge_generate_kwargs=edge_generate_kwargs,
+                    )
                 )
-            if generated_interpretation_graph is None:
-                warnings.warn(
-                    "Edge stage failed to generate an interpretation graph; skipping seed.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                continue
+                if generated_interpretation_graph is None:
+                    continue
 
             generated_interpretation_graph = generated_interpretation_graph.copy()
+
             conditional_neighbor_indices = self._nearest_interpretation_indices(
                 generated_interpretation_graph,
                 n_neighbors=n_conditional_neighbors,
@@ -278,11 +312,31 @@ class GraphGenerator:
                 **conditional_generate_kwargs,
             )
             generated_batch = self._as_output_graph_list(generated_batch)
+            generated_batch = [
+                graph
+                for graph in generated_batch
+                if self._conditional_output_matches_interpretation(
+                    graph,
+                    generated_interpretation_graph,
+                )
+            ]
+            if not generated_batch:
+                warnings.warn(
+                    "Conditional stage generated no graphs matching the generated "
+                    "interpretation graph; skipping seed.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
 
             self.last_conditional_neighbor_indices_history_.append(
                 list(conditional_neighbor_indices)
             )
             self.last_successful_sampled_indices_.append(seed_idx)
+            self.last_seed_graphs_.append(stored_graphs[seed_idx].copy())
+            self.last_seed_interpretation_graphs_.append(
+                seed_interpretation_graph.copy()
+            )
             self.last_generated_interpretation_graphs_.append(
                 generated_interpretation_graph.copy()
             )
@@ -301,10 +355,24 @@ class GraphGenerator:
         self.last_sampled_indices_ = []
         self.last_successful_sampled_indices_ = []
         self.last_interpretation_neighbor_indices_history_ = []
+        self.last_interpretation_neighbor_distances_history_ = []
         self.last_conditional_neighbor_indices_history_ = []
+        self.last_seed_graphs_ = []
+        self.last_seed_interpretation_graphs_ = []
         self.last_generated_interpretation_graphs_ = []
         self.last_edge_generation_paths_ = []
         self.last_conditional_training_graphs_history_ = []
+
+    def _propagate_debug(self) -> None:
+        for generator in (self.edge_generator, self.conditional_generator):
+            setattr(generator, "debug", self.debug)
+            if hasattr(generator, "debug_level"):
+                if self.debug:
+                    generator.debug_level = max(1, int(generator.debug_level))
+                else:
+                    generator.debug_level = 0
+            if hasattr(generator, "verbose"):
+                generator.verbose = self.debug
 
     def _require_stored(self) -> tuple[list[nx.Graph], list[nx.Graph]]:
         if self.stored_graphs_ is None or self.stored_interpretation_graphs_ is None:
@@ -398,6 +466,66 @@ class GraphGenerator:
                 break
         return indices
 
+    def _interpretation_distances_for_indices(
+        self,
+        graph: nx.Graph,
+        indices: Sequence[int],
+        *,
+        query_index: int | None = None,
+    ) -> list[float]:
+        if not indices:
+            return []
+        if (
+            query_index is not None
+            and self.stored_interpretation_distance_matrix_ is not None
+        ):
+            distances = np.asarray(
+                self.stored_interpretation_distance_matrix_[int(query_index)],
+                dtype=float,
+            )
+        else:
+            vectors = self.stored_interpretation_retrieval_vectors_
+            transformer = self.interpretation_retrieval_transformer_
+            if vectors is None or transformer is None:
+                raise ValueError("interpretation retrieval index is not initialized")
+            query_vector = self._vectorize_graphs(transformer, [graph], fit=False)
+            distances = pairwise_distances(query_vector, vectors)[0]
+        return [float(distances[int(idx)]) for idx in indices]
+
+    def _log_edge_neighbor_context(
+        self,
+        *,
+        seed_idx: int,
+        neighbor_indices: Sequence[int],
+        neighbor_distances: Sequence[float],
+    ) -> None:
+        if not self.debug:
+            return
+        rounded_distances = [round(float(distance), 4) for distance in neighbor_distances]
+        print(
+            "[graph-generator edge] "
+            f"seed_idx={int(seed_idx)} "
+            f"n_neighbors={len(neighbor_indices)} "
+            f"neighbor_indices={list(neighbor_indices)} "
+            f"neighbor_distances={rounded_distances}"
+        )
+
+    def _deduplicate_interpretation_indices_by_hash(
+        self,
+        indices: Sequence[int],
+    ) -> list[int]:
+        _stored_graphs, stored_interpretation_graphs = self._require_stored()
+        deduplicated = []
+        seen_hashes = set()
+        for idx in indices:
+            int_idx = int(idx)
+            graph_hash = hash_graph(stored_interpretation_graphs[int_idx])
+            if graph_hash in seen_hashes:
+                continue
+            seen_hashes.add(graph_hash)
+            deduplicated.append(int_idx)
+        return deduplicated
+
     def _augment_interpretation_indices_for_label_coverage(
         self,
         graph: nx.Graph,
@@ -457,10 +585,103 @@ class GraphGenerator:
         else:
             self.edge_generator.fit(graphs, targets=targets)
 
+    def _generate_interpretation_graph_with_retries(
+        self,
+        start_graph: nx.Graph,
+        original_edge_count: int,
+        *,
+        seed_interpretation_graph: nx.Graph,
+        edge_generate_kwargs: dict,
+    ) -> nx.Graph | None:
+        seed_hash = hash_graph(seed_interpretation_graph)
+        same_graph_retries = 0
+
+        while True:
+            try:
+                generated_interpretation_graph = self.edge_generator.generate(
+                    start_graph,
+                    original_edge_count,
+                    return_path=False,
+                    **edge_generate_kwargs,
+                )
+            except Exception as exc:
+                warnings.warn(
+                    "Edge stage failed while generating an interpretation graph; "
+                    f"skipping seed. Error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return None
+            if isinstance(generated_interpretation_graph, list):
+                generated_interpretation_graph = (
+                    generated_interpretation_graph[-1]
+                    if generated_interpretation_graph
+                    else None
+                )
+            if generated_interpretation_graph is None:
+                warnings.warn(
+                    "Edge stage failed to generate an interpretation graph; skipping seed.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return None
+
+            generated_interpretation_graph = generated_interpretation_graph.copy()
+            if (
+                not self.require_new_interpretation_graph
+                or hash_graph(generated_interpretation_graph) != seed_hash
+            ):
+                return generated_interpretation_graph
+
+            if same_graph_retries >= self.max_same_interpretation_retries:
+                warnings.warn(
+                    "Edge stage generated the same interpretation graph as the "
+                    "sampled seed after "
+                    f"{same_graph_retries} retries; skipping seed.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return None
+
+            same_graph_retries += 1
+            if self.debug:
+                print(
+                    "[graph-generator edge] "
+                    "generated same interpretation graph as seed; "
+                    f"retry={same_graph_retries}/"
+                    f"{self.max_same_interpretation_retries}"
+                )
+
+    @staticmethod
+    def _interpretation_edge_removal_size_for_remove_edges(
+        graph: nx.Graph,
+        size: float,
+    ) -> float | int:
+        if float(size) == 1.0:
+            return graph.number_of_edges()
+        return size
+
     def _select_targets(self, indices: Sequence[int]) -> list[Any] | None:
         if self.stored_targets_ is None:
             return None
         return [self.stored_targets_[idx] for idx in indices]
+
+    def _conditional_output_matches_interpretation(
+        self,
+        graph: nx.Graph,
+        interpretation_graph: nx.Graph,
+    ) -> bool:
+        if hasattr(self.conditional_generator, "_matches_target_interpretation"):
+            return bool(
+                self.conditional_generator._matches_target_interpretation(
+                    graph,
+                    interpretation_graph,
+                )
+            )
+        generated_interpretation_graph = self._interpretation_graph_for(graph)
+        return hash_graph(generated_interpretation_graph) == hash_graph(
+            interpretation_graph
+        )
 
     def _vectorize_graphs(self, transformer, graphs, *, fit: bool) -> np.ndarray:
         if fit and hasattr(transformer, "fit_transform"):

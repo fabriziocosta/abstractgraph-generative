@@ -24,10 +24,14 @@ generator retrieves a local stored-interpretation neighborhood, fits
 `EdgeGenerator` on that neighborhood, prunes edges from the seed interpretation
 graph, and regrows a new interpretation graph.
 
+If `interpretation_edge_removal_size=0`, the edge stage is bypassed: the sampled
+seed interpretation graph is used directly as the conditional target.
+
 The edge-stage neighborhood uses the same label-coverage principle as
 `EdgeGenerator.repair(...)`: candidates are scanned in nearest-neighbor order,
-neighbors that cover missing seed interpretation-node labels are selected first,
-and remaining slots are filled with nearest unused candidates. The seed
+duplicate interpretation graphs are removed with `hash_graph(...)`, neighbors
+that cover missing seed interpretation-node labels are selected first, and
+remaining slots are filled with nearest unused candidates. The seed
 interpretation graph is not used as evidence for its own feasibility. If no
 stored interpretation-neighbor context covers the sampled seed's labels, that
 seed is rejected and sampling continues with another seed.
@@ -50,6 +54,9 @@ generator = GraphGenerator(
     label_mode="histogram_values",
     interpretation_neighbor_vectorizer=None,
     seed=0,
+    debug=False,
+    require_new_interpretation_graph=True,
+    max_same_interpretation_retries=3,
 )
 
 generator.store(graphs, interpretation_graphs=interpretation_graphs)
@@ -79,6 +86,22 @@ Constructor arguments:
   `GraphGenerator` reuses `EdgeGenerator.store(...)` retrieval machinery.
 - `seed`
   Default random seed for sampling.
+- `debug`
+  If true, propagate debug/progress logging to the wrapped generators.
+  `ConditionalAutoregressiveGenerator.debug` is set directly, and
+  `EdgeGenerator.verbose` is enabled for edge-stage logs. The edge-stage
+  neighbor log includes `neighbor_indices` and their retrieval
+  `neighbor_distances` from the sampled seed interpretation graph.
+- `require_new_interpretation_graph`
+  If true, reject edge-stage outputs whose generated interpretation graph is
+  identical to the sampled seed interpretation graph. This does not affect the
+  explicit `interpretation_edge_removal_size=0` bypass, which intentionally
+  uses the seed interpretation graph directly.
+- `max_same_interpretation_retries`
+  Number of additional edge-generation attempts to make for the same seed when
+  `require_new_interpretation_graph=True` and the edge stage regenerates the
+  seed interpretation graph. The default `3` allows four total attempts before
+  the seed is skipped.
 
 ## Store Phase
 
@@ -130,6 +153,7 @@ For each attempted seed, `sample(...)` does the following:
 2. retrieve an interpretation-neighbor context using repair-style label
    coverage:
    - scan candidates in nearest-neighbor order,
+   - deduplicate candidates by `abstractgraph.hashing.hash_graph(...)`,
    - select neighbors that cover missing seed interpretation-node labels,
    - fill any remaining slots up to `n_interpretation_neighbors`,
    - reject the seed if its labels cannot be covered by other stored
@@ -141,11 +165,19 @@ For each attempted seed, `sample(...)` does the following:
    the generated interpretation graph,
 7. fit `ConditionalAutoregressiveGenerator` on the aligned base graphs,
 8. generate `n_instances_per_sample` base graphs for that generated
-   interpretation graph.
+   interpretation graph,
+9. discard conditional outputs whose re-decomposed interpretation graph does not
+   match the generated interpretation graph.
+
+When `interpretation_edge_removal_size=0`, steps 2 through 5 are skipped and the
+seed interpretation graph is used directly in step 6.
+When `interpretation_edge_removal_size=1.0`, all edges are removed from the seed
+interpretation graph before regrowth.
 
 The returned value is a flat `list[nx.Graph]`. With
 `n_samples=4` and `n_instances_per_sample=2`, up to eight base graphs are
-returned. Failed edge-stage seeds and unsupported-label seeds are skipped with a
+returned. Failed edge-stage seeds, unsupported-label seeds, and unchanged
+edge-stage outputs that exhaust their retry budget are skipped with a
 `RuntimeWarning`; the generator then tries another distinct seed until it has
 `n_samples` successful interpretation targets or exhausts `max_seed_attempts`.
 The final count may still be smaller if too many attempts fail.
@@ -167,7 +199,10 @@ After `sample(...)`, these attributes describe the last run:
   Seed indices that reached generated base-graph output. Use this for notebook
   displays aligned with `generated_graphs`.
 - `last_interpretation_neighbor_indices_history_`
+- `last_interpretation_neighbor_distances_history_`
 - `last_conditional_neighbor_indices_history_`
+- `last_seed_graphs_`
+- `last_seed_interpretation_graphs_`
 - `last_generated_interpretation_graphs_`
 - `last_edge_generation_paths_`
 - `last_conditional_training_graphs_history_`
@@ -186,6 +221,11 @@ generated_targets = generator.last_generated_interpretation_graphs_
 training_sets = generator.last_conditional_training_graphs_history_
 ```
 
+`last_seed_graphs_`, `last_seed_interpretation_graphs_`, and
+`last_generated_interpretation_graphs_` are aligned by successful
+interpretation target. Generated base graphs are returned flat; group them by
+`n_instances_per_sample` to align them with each successful target.
+
 ## Interpretation Labels
 
 The edge stage requires the local interpretation-neighbor context to cover the
@@ -196,10 +236,16 @@ unless those labels appear in other stored interpretation graphs. This avoids
 fitting a feasibility estimator on a neighborhood that would necessarily mark
 the seed's own structure infeasible.
 
+This label-coverage requirement applies only when the edge stage runs. With
+`interpretation_edge_removal_size=0`, no edge generator is fit, so the seed's
+interpretation graph can be passed directly to the conditional stage.
+
 The conditional stage preserves the target interpretation graph through the
 existing `ConditionalAutoregressiveGenerator` postcondition. That means every
 generated base graph must re-decompose to the generated interpretation graph
 under the same `decomposition_function`, `nbits`, and `label_mode`.
+`GraphGenerator` also applies this check defensively before recording histories
+and returning generated base graphs.
 
 For decomposition modes such as cycle/tree decomposition, this is the key
 invariant: once the edge stage proposes a generated interpretation graph, the
