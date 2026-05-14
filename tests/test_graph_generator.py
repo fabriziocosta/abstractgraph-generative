@@ -3,6 +3,7 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 import pytest
+from sklearn.ensemble import RandomForestClassifier
 
 from abstractgraph import node as node_operator
 from abstractgraph.hashing import hash_graph
@@ -24,6 +25,19 @@ class SizeVectorizer:
             ],
             dtype=float,
         )
+
+
+class EdgeOnlyVectorizer:
+    def fit_transform(self, graphs, targets=None):
+        return self.transform(graphs)
+
+    def transform(self, graphs, targets=None):
+        rows = []
+        for graph in graphs:
+            if graph.number_of_edges() == 0:
+                raise ValueError("edgeless graphs are unsupported")
+            rows.append([float(graph.number_of_nodes()), float(graph.number_of_edges())])
+        return np.asarray(rows, dtype=float)
 
 
 class FakeEdgeGenerator:
@@ -91,6 +105,14 @@ class FakeConditionalGenerator:
             (graph.copy(), target_interpretation_graph.copy())
         )
         return bool(self.match_results[match_index])
+
+
+class AlwaysFeasible:
+    def fit(self, graphs):
+        return self
+
+    def predict(self, graphs):
+        return [1] * len(graphs)
 
 
 def _labeled_path(n_nodes: int) -> nx.Graph:
@@ -723,3 +745,25 @@ def test_store_requires_at_least_two_graphs() -> None:
 
     with pytest.raises(ValueError, match="at least two"):
         generator.store([_labeled_path(2)])
+
+
+def test_edge_generator_does_not_train_graph_estimator_on_edgeless_fragments() -> None:
+    graph_estimator = GraphEstimator(
+        transformer=EdgeOnlyVectorizer(),
+        estimator=RandomForestClassifier(n_estimators=5, random_state=0),
+        postprocessor=None,
+    )
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=AlwaysFeasible(),
+        final_feasibility_estimator=AlwaysFeasible(),
+        graph_estimator=graph_estimator,
+        n_negative_per_positive=1,
+        n_replicates=1,
+        fit_n_jobs=1,
+        seed=0,
+    )
+
+    generator.fit([nx.path_graph(3)])
+
+    assert any(graph.number_of_edges() == 0 for graph, _ in generator.dataset_)
+    assert generator.targets_.tolist() == [1, 0]

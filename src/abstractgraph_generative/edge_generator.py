@@ -856,8 +856,12 @@ class EdgeGenerator:
                     f"lookahead_rejection_model={self.lookahead_rejection_model}"
                 )
 
-        self.targets_ = np.array([label for graph, label in self.dataset_], dtype=int)
-        train_graphs = [graph for graph, label in self.dataset_]
+        graph_estimator_dataset = self._graph_estimator_dataset(self.dataset_)
+        self.targets_ = np.array(
+            [label for graph, label in graph_estimator_dataset],
+            dtype=int,
+        )
+        train_graphs = [graph for graph, label in graph_estimator_dataset]
         graph_estimator_fit_start = time.perf_counter()
         self.graph_estimator.fit(train_graphs, self.targets_)
         graph_estimator_fit_time = time.perf_counter() - graph_estimator_fit_start
@@ -3413,7 +3417,10 @@ class EdgeGenerator:
             )
         if hasattr(features, "toarray"):
             features = features.toarray()
-        return np.asarray(features, dtype=float)
+        matrix = np.asarray(features, dtype=float)
+        if matrix.ndim == 1:
+            matrix = matrix.reshape(1, -1)
+        return matrix
 
     def _build_pair_query_corpus(self, graph_a, graph_b):
         graphs = [graph.copy() for graph in self.stored_graphs_]
@@ -3626,6 +3633,24 @@ class EdgeGenerator:
             self.positives_.extend(positives)
             self.negatives_.extend(negatives)
             self.dataset_.extend(dataset)
+
+    def _graph_estimator_dataset(self, dataset):
+        edgeful_dataset = [
+            (graph, label) for graph, label in dataset if graph.number_of_edges() > 0
+        ]
+        if self._has_binary_labels(edgeful_dataset):
+            return edgeful_dataset
+        if self._has_binary_labels(dataset):
+            return list(dataset)
+        raise ValueError(
+            "EdgeGenerator graph-estimator training requires positive and negative "
+            "edge-fragment examples; provide seed graphs with at least two movable edges."
+        )
+
+    @staticmethod
+    def _has_binary_labels(dataset) -> bool:
+        labels = {int(label) for _, label in dataset}
+        return labels == {0, 1}
 
     def _build_target_fragment_dataset(self, dataset_parts, targets):
         target_graphs = []
