@@ -44,15 +44,26 @@ materializes concrete base graph instances for the generated target structure.
 ## Main API
 
 ```python
+from abstractgraph_ml.estimators import GraphEstimator
+from nsppk import NSPPK
+
 from abstractgraph_generative.graph_generator import GraphGenerator
+from abstractgraph_generative.edge_generator import EdgeGenerator
+
+edge_retrieval_vectorizer = NSPPK(...)
+edge_graph_estimator = GraphEstimator(
+    transformer=edge_retrieval_vectorizer,
+    estimator=edge_estimator,
+)
+edge_generator = EdgeGenerator(
+    graph_estimator=edge_graph_estimator,
+    partial_feasibility_estimator=partial_feasibility_estimator,
+    final_feasibility_estimator=final_feasibility_estimator,
+)
 
 generator = GraphGenerator(
     edge_generator=edge_generator,
     conditional_generator=conditional_generator,
-    decomposition_function=decomposition_function,
-    nbits=14,
-    label_mode="histogram_values",
-    interpretation_neighbor_vectorizer=None,
     seed=0,
     debug=False,
     require_new_interpretation_graph=True,
@@ -77,13 +88,9 @@ Constructor arguments:
 - `edge_generator`
   Configured `EdgeGenerator` used on interpretation graphs.
 - `conditional_generator`
-  Configured `ConditionalAutoregressiveGenerator` used on base graphs.
-- `decomposition_function`, `nbits`, `label_mode`
-  The exact interpretation configuration used to compute or validate
-  interpretation graphs.
-- `interpretation_neighbor_vectorizer`
-  Optional graph vectorizer for interpretation-neighbor retrieval. If omitted,
-  `GraphGenerator` reuses `EdgeGenerator.store(...)` retrieval machinery.
+  Configured `ConditionalAutoregressiveGenerator` used on base graphs. Its
+  `decomposition_function`, `nbits`, and `label_mode` define the interpretation
+  semantics used by `GraphGenerator`.
 - `seed`
   Default random seed for sampling.
 - `debug`
@@ -121,9 +128,9 @@ with:
 ```python
 graph_to_abstract_graph(
     graph,
-    decomposition_function=decomposition_function,
-    nbits=nbits,
-    label_mode=label_mode,
+    decomposition_function=conditional_generator.decomposition_function,
+    nbits=conditional_generator.nbits,
+    label_mode=conditional_generator.label_mode,
 ).interpretation_graph
 ```
 
@@ -133,11 +140,15 @@ Stored attributes:
 - `stored_interpretation_graphs_`
 - `stored_targets_`
 - `stored_interpretation_hash_to_index_`
-- `stored_interpretation_retrieval_vectors_`
 - `stored_interpretation_distance_matrix_`
 
 `targets` are optional and are forwarded to the local `EdgeGenerator.fit(...)`
 calls when present.
+
+Interpretation-neighbor retrieval is owned by `EdgeGenerator.store(...)`.
+Configure the retrieval vectorizer through the edge generator's
+`graph_estimator.transformer`; `GraphGenerator` reuses the retrieval vectors and
+distance matrix initialized by `EdgeGenerator`.
 
 ## Sample Phase
 
@@ -195,6 +206,18 @@ The final count may still be smaller if too many attempts fail.
 
 `edge_generate_kwargs` are forwarded to `EdgeGenerator.generate(...)`, except
 `return_path`, which is controlled internally.
+
+## Ownership Notes
+
+`GraphGenerator` derives `decomposition_function`, `nbits`, and `label_mode`
+from the configured `ConditionalAutoregressiveGenerator`. This keeps the
+interpretation semantics used for storage, conditional fitting, and output
+validation aligned with the generator that materializes base graphs.
+
+The current implementation supports one interpretation level. Future chained
+generators should treat each conditional generator as the owner of its own
+decomposition config, and each edge generator as the owner of its own per-level
+interpretation retrieval vectorizer.
 
 ## Bookkeeping
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import random
 import warnings
 from collections.abc import Sequence
@@ -32,10 +31,7 @@ class GraphGenerator:
         self,
         edge_generator: EdgeGenerator,
         conditional_generator: ConditionalAutoregressiveGenerator,
-        decomposition_function,
-        nbits: int,
-        label_mode: str = "operator_hash",
-        interpretation_neighbor_vectorizer=None,
+        *,
         seed: int | None = None,
         debug: bool = False,
         require_new_interpretation_graph: bool = True,
@@ -44,12 +40,26 @@ class GraphGenerator:
         max_same_interpretation_retries = int(max_same_interpretation_retries)
         if max_same_interpretation_retries < 0:
             raise ValueError("max_same_interpretation_retries must be >= 0")
+        decomposition_function = getattr(
+            conditional_generator,
+            "decomposition_function",
+            None,
+        )
+        nbits = getattr(conditional_generator, "nbits", None)
+        label_mode = getattr(conditional_generator, "label_mode", None)
+        if decomposition_function is None:
+            raise ValueError(
+                "conditional_generator.decomposition_function is required."
+            )
+        if nbits is None:
+            raise ValueError("conditional_generator.nbits is required.")
+        if label_mode is None:
+            raise ValueError("conditional_generator.label_mode is required.")
         self.edge_generator = edge_generator
         self.conditional_generator = conditional_generator
         self.decomposition_function = decomposition_function
         self.nbits = int(nbits)
         self.label_mode = label_mode
-        self.interpretation_neighbor_vectorizer = interpretation_neighbor_vectorizer
         self.seed = seed
         self.debug = bool(debug)
         self.require_new_interpretation_graph = bool(require_new_interpretation_graph)
@@ -60,8 +70,6 @@ class GraphGenerator:
         self.stored_interpretation_graphs_: list[nx.Graph] | None = None
         self.stored_targets_: list[Any] | None = None
         self.stored_interpretation_hash_to_index_: dict[Any, int] = {}
-        self.interpretation_retrieval_transformer_ = None
-        self.stored_interpretation_retrieval_vectors_: np.ndarray | None = None
         self.stored_interpretation_distance_matrix_: np.ndarray | None = None
 
         self.last_sampled_indices_: list[int] = []
@@ -527,36 +535,13 @@ class GraphGenerator:
 
     def _fit_interpretation_retrieval_index(self, *, targets) -> None:
         _stored_graphs, interpretation_graphs = self._require_stored()
-        if self.interpretation_neighbor_vectorizer is None:
-            self.edge_generator.store(interpretation_graphs, targets=targets)
-            self.interpretation_retrieval_transformer_ = copy.deepcopy(
-                getattr(self.edge_generator, "retrieval_transformer_", None)
-            )
-            vectors = getattr(self.edge_generator, "stored_retrieval_vectors_", None)
-            distances = getattr(self.edge_generator, "stored_distance_matrix_", None)
-            if (
-                self.interpretation_retrieval_transformer_ is None
-                or vectors is None
-                or distances is None
-            ):
-                raise ValueError(
-                    "edge_generator.store(...) did not initialize retrieval vectors"
-                )
-            self.stored_interpretation_retrieval_vectors_ = self._as_dense_matrix(vectors)
-            self.stored_interpretation_distance_matrix_ = self._as_dense_matrix(
-                distances
-            )
-            return
-
-        transformer = self.interpretation_neighbor_vectorizer
-        self.interpretation_retrieval_transformer_ = transformer
-        vectors = self._vectorize_graphs(transformer, interpretation_graphs, fit=True)
+        self.edge_generator.store(interpretation_graphs, targets=targets)
+        _transformer, vectors, distances = self._edge_retrieval_state()
         if vectors.shape[0] != len(interpretation_graphs):
             raise ValueError(
-                "interpretation_neighbor_vectorizer must return one row per graph"
+                "edge_generator.store(...) must initialize one retrieval row per graph"
             )
-        self.stored_interpretation_retrieval_vectors_ = vectors
-        self.stored_interpretation_distance_matrix_ = pairwise_distances(vectors)
+        self.stored_interpretation_distance_matrix_ = distances
         np.fill_diagonal(self.stored_interpretation_distance_matrix_, 0.0)
 
     def _nearest_interpretation_indices(
@@ -581,10 +566,7 @@ class GraphGenerator:
                 dtype=float,
             )
         else:
-            vectors = self.stored_interpretation_retrieval_vectors_
-            transformer = self.interpretation_retrieval_transformer_
-            if vectors is None or transformer is None:
-                raise ValueError("interpretation retrieval index is not initialized")
+            transformer, vectors, _distances = self._edge_retrieval_state()
             query_vector = self._vectorize_graphs(transformer, [graph], fit=False)
             distances = pairwise_distances(query_vector, vectors)[0]
             if query_index is None:
@@ -621,13 +603,24 @@ class GraphGenerator:
                 dtype=float,
             )
         else:
-            vectors = self.stored_interpretation_retrieval_vectors_
-            transformer = self.interpretation_retrieval_transformer_
-            if vectors is None or transformer is None:
-                raise ValueError("interpretation retrieval index is not initialized")
+            transformer, vectors, _distances = self._edge_retrieval_state()
             query_vector = self._vectorize_graphs(transformer, [graph], fit=False)
             distances = pairwise_distances(query_vector, vectors)[0]
         return [float(distances[int(idx)]) for idx in indices]
+
+    def _edge_retrieval_state(self):
+        transformer = getattr(self.edge_generator, "retrieval_transformer_", None)
+        vectors = getattr(self.edge_generator, "stored_retrieval_vectors_", None)
+        distances = getattr(self.edge_generator, "stored_distance_matrix_", None)
+        if transformer is None or vectors is None or distances is None:
+            raise ValueError(
+                "edge_generator.store(...) did not initialize retrieval state"
+            )
+        return (
+            transformer,
+            self._as_dense_matrix(vectors),
+            self._as_dense_matrix(distances),
+        )
 
     def _log_edge_neighbor_context(
         self,
@@ -878,7 +871,8 @@ class GraphGenerator:
             features = transformer.transform(graphs)
         else:
             raise ValueError(
-                "interpretation_neighbor_vectorizer must provide fit_transform(...) or transform(...)"
+                "edge_generator retrieval transformer must provide "
+                "fit_transform(...) or transform(...)"
             )
         return self._as_dense_matrix(features)
 

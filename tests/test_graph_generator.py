@@ -4,6 +4,7 @@ import networkx as nx
 import numpy as np
 import pytest
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import pairwise_distances
 
 from abstractgraph import node as node_operator
 from abstractgraph.hashing import hash_graph
@@ -48,12 +49,23 @@ class FakeEdgeGenerator:
         self.generated_graphs = None if generated_graphs is None else list(generated_graphs)
         self.fit_exception = fit_exception
         self.verbose = True
+        self.retrieval_transformer_ = None
+        self.stored_retrieval_vectors_ = None
+        self.stored_distance_matrix_ = None
         self.store_calls = []
         self.fit_calls = []
         self.generate_calls = []
 
     def store(self, graphs, targets=None):
-        self.store_calls.append((list(graphs), targets))
+        graph_list = list(graphs)
+        self.store_calls.append((graph_list, targets))
+        self.retrieval_transformer_ = SizeVectorizer()
+        self.stored_retrieval_vectors_ = self.retrieval_transformer_.fit_transform(
+            graph_list
+        )
+        self.stored_distance_matrix_ = pairwise_distances(
+            self.stored_retrieval_vectors_
+        )
         return self
 
     def fit(self, graphs, targets=None):
@@ -75,10 +87,22 @@ class FakeEdgeGenerator:
 
 
 class FakeConditionalGenerator:
-    def __init__(self, *, match_results=None):
+    def __init__(
+        self,
+        *,
+        match_results=None,
+        decomposition_function=None,
+        nbits: int = 6,
+        label_mode: str = "operator_hash",
+    ):
         self.debug = True
         self.debug_level = 2
         self.match_results = None if match_results is None else list(match_results)
+        self.decomposition_function = (
+            node_operator() if decomposition_function is None else decomposition_function
+        )
+        self.nbits = int(nbits)
+        self.label_mode = label_mode
         self.fit_calls = []
         self.generate_calls = []
 
@@ -180,9 +204,6 @@ def test_store_computes_and_aligns_interpretation_graphs() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     )
 
     result = generator.store(graphs, targets=[0, 1])
@@ -201,9 +222,6 @@ def test_constructor_propagates_default_debug_false_to_generators() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     )
 
     assert generator.debug is False
@@ -221,9 +239,6 @@ def test_constructor_propagates_debug_true_to_generators() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         debug=True,
     )
 
@@ -232,6 +247,53 @@ def test_constructor_propagates_debug_true_to_generators() -> None:
     assert edge_generator.verbose is True
     assert conditional_generator.debug is True
     assert conditional_generator.debug_level == 1
+
+
+def test_constructor_derives_interpretation_config_from_conditional_generator() -> None:
+    decomposition = node_operator()
+    conditional_generator = FakeConditionalGenerator(
+        decomposition_function=decomposition,
+        nbits=9,
+        label_mode="histogram",
+    )
+
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+        conditional_generator=conditional_generator,
+    )
+
+    assert generator.decomposition_function is decomposition
+    assert generator.nbits == 9
+    assert generator.label_mode == "histogram"
+
+
+def test_constructor_requires_conditional_generator_interpretation_config() -> None:
+    conditional_generator = FakeConditionalGenerator()
+    del conditional_generator.decomposition_function
+
+    with pytest.raises(ValueError, match="decomposition_function"):
+        GraphGenerator(
+            edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+            conditional_generator=conditional_generator,
+        )
+
+    conditional_generator = FakeConditionalGenerator()
+    del conditional_generator.nbits
+
+    with pytest.raises(ValueError, match="nbits"):
+        GraphGenerator(
+            edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+            conditional_generator=conditional_generator,
+        )
+
+    conditional_generator = FakeConditionalGenerator()
+    del conditional_generator.label_mode
+
+    with pytest.raises(ValueError, match="label_mode"):
+        GraphGenerator(
+            edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+            conditional_generator=conditional_generator,
+        )
 
 
 def test_sample_bypasses_edge_generator_when_no_interpretation_edges_removed() -> None:
@@ -243,9 +305,6 @@ def test_sample_bypasses_edge_generator_when_no_interpretation_edges_removed() -
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         seed=0,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -299,9 +358,6 @@ def test_sample_deduplicates_conditional_neighbors_by_interpretation_hash() -> N
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         require_new_interpretation_graph=False,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -330,9 +386,6 @@ def test_sample_can_include_seed_in_conditional_neighbors_when_requested() -> No
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         require_new_interpretation_graph=False,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -358,9 +411,6 @@ def test_sample_full_interpretation_edge_removal_removes_all_seed_edges() -> Non
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -400,9 +450,6 @@ def test_sample_deduplicates_interpretation_neighbors_by_graph_hash() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -427,9 +474,6 @@ def test_sample_logs_edge_neighbor_distances_when_debug_enabled(capsys) -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         debug=True,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -464,9 +508,6 @@ def test_sample_logs_skip_progress_when_debug_enabled(capsys) -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         debug=True,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -495,9 +536,6 @@ def test_sample_rejects_generated_interpretation_graph_matching_seed_by_default(
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="same interpretation graph"):
@@ -533,9 +571,6 @@ def test_sample_retries_same_interpretation_graph_until_new_graph() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -561,9 +596,6 @@ def test_sample_filters_conditional_outputs_that_do_not_match_target() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -587,9 +619,6 @@ def test_sample_passes_seed_subgraph_hashes_to_conditional_generation() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -615,9 +644,6 @@ def test_sample_retries_conditional_generation_without_seed_avoidance() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -646,9 +672,6 @@ def test_sample_refits_with_seed_when_seedless_neighbors_cannot_generate() -> No
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -678,9 +701,6 @@ def test_sample_records_generated_graph_batches_per_successful_seed() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -715,9 +735,6 @@ def test_sample_uses_configured_same_interpretation_retry_limit() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         max_same_interpretation_retries=1,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -739,9 +756,6 @@ def test_constructor_rejects_negative_same_interpretation_retry_limit() -> None:
         GraphGenerator(
             edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
             conditional_generator=FakeConditionalGenerator(),
-            decomposition_function=node_operator(),
-            nbits=6,
-            interpretation_neighbor_vectorizer=SizeVectorizer(),
             max_same_interpretation_retries=-1,
         )
 
@@ -753,9 +767,6 @@ def test_sample_can_allow_generated_interpretation_graph_matching_seed() -> None
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         require_new_interpretation_graph=False,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -779,9 +790,6 @@ def test_sample_records_histories_for_successful_generation() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -811,9 +819,6 @@ def test_edge_stage_failure_skips_seed_without_success_histories() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(generated_graph=None),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="Edge stage failed"):
@@ -840,9 +845,6 @@ def test_edge_fit_failure_skips_seed_without_success_histories() -> None:
             fit_exception=ValueError("bad fit"),
         ),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="failed while fitting"):
@@ -871,9 +873,6 @@ def test_sample_adds_seed_to_edge_training_when_neighbors_have_no_edges() -> Non
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
         require_new_interpretation_graph=False,
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
@@ -902,9 +901,6 @@ def test_sample_extends_interpretation_neighbors_for_label_coverage() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     generator.sample(
@@ -927,9 +923,6 @@ def test_sample_skips_seed_when_interpretation_labels_are_not_covered() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="covers the sampled seed"):
@@ -958,9 +951,6 @@ def test_sample_zero_edge_removal_does_not_require_label_coverage() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=conditional_generator,
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     outputs = generator.sample(
@@ -990,9 +980,6 @@ def test_sample_retries_distinct_seeds_until_success() -> None:
     generator = GraphGenerator(
         edge_generator=edge_generator,
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     ).store(base_graphs, interpretation_graphs=interpretation_graphs)
 
     with pytest.warns(RuntimeWarning, match="covers the sampled seed"):
@@ -1015,9 +1002,6 @@ def test_store_requires_at_least_two_graphs() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
         conditional_generator=FakeConditionalGenerator(),
-        decomposition_function=node_operator(),
-        nbits=6,
-        interpretation_neighbor_vectorizer=SizeVectorizer(),
     )
 
     with pytest.raises(ValueError, match="at least two"):
