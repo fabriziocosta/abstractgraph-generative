@@ -223,14 +223,87 @@ def test_sample_bypasses_edge_generator_when_no_interpretation_edges_removed() -
     )
     assert len(conditional_generator.fit_calls) == 1
     assert [graph.number_of_nodes() for graph in conditional_generator.fit_calls[0]] == [
-        3,
         2,
+        4,
     ]
     assert conditional_generator.generate_calls[0]["n_samples"] == 3
     assert len(conditional_generator.generate_calls[0]["interpretation_graphs"]) == 1
     assert generator.last_interpretation_neighbor_indices_history_ == [[]]
     assert len(generator.last_edge_generation_paths_) == 1
     assert len(generator.last_edge_generation_paths_[0]) == 2
+
+
+def test_sample_deduplicates_conditional_neighbors_by_interpretation_hash() -> None:
+    duplicate_a = nx.path_graph(2)
+    duplicate_b = nx.path_graph(2)
+    seed_interpretation = nx.path_graph(3)
+    distinct_neighbor = nx.path_graph(4)
+    interpretation_graphs = [
+        duplicate_a,
+        duplicate_b,
+        seed_interpretation,
+        distinct_neighbor,
+    ]
+    base_graphs = [
+        _labeled_path(2),
+        _labeled_path(20),
+        _labeled_path(3),
+        _labeled_path(4),
+    ]
+    conditional_generator = FakeConditionalGenerator()
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
+        conditional_generator=conditional_generator,
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+        require_new_interpretation_graph=False,
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    outputs = generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=1,
+        n_conditional_neighbors=3,
+        interpretation_edge_removal_size=0,
+        random_state=0,
+        max_seed_attempts=1,
+    )
+
+    assert len(outputs) == 1
+    assert generator.last_sampled_indices_ == [3]
+    assert generator.last_conditional_neighbor_indices_history_ == [[2, 0]]
+    assert [graph.number_of_nodes() for graph in conditional_generator.fit_calls[0]] == [
+        3,
+        2,
+    ]
+
+
+def test_sample_can_include_seed_in_conditional_neighbors_when_requested() -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3), nx.path_graph(4)]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    conditional_generator = FakeConditionalGenerator()
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
+        conditional_generator=conditional_generator,
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+        require_new_interpretation_graph=False,
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    outputs = generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=1,
+        n_conditional_neighbors=2,
+        interpretation_edge_removal_size=0,
+        exclude_seed_from_conditional_neighbors=False,
+        random_state=0,
+        max_seed_attempts=1,
+    )
+
+    assert len(outputs) == 1
+    assert generator.last_sampled_indices_ == [1]
+    assert generator.last_conditional_neighbor_indices_history_ == [[1, 0]]
 
 
 def test_sample_full_interpretation_edge_removal_removes_all_seed_edges() -> None:

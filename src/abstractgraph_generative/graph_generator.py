@@ -138,6 +138,8 @@ class GraphGenerator:
         max_seed_attempts: int | None = None,
         edge_generate_kwargs: dict | None = None,
         conditional_generate_kwargs: dict | None = None,
+        deduplicate_conditional_neighbors: bool = True,
+        exclude_seed_from_conditional_neighbors: bool = True,
     ) -> list[nx.Graph]:
         """Generate base graphs through interpretation-graph exploration."""
         stored_graphs, stored_interpretation_graphs = self._require_stored()
@@ -289,11 +291,26 @@ class GraphGenerator:
 
             generated_interpretation_graph = generated_interpretation_graph.copy()
 
-            conditional_neighbor_indices = self._nearest_interpretation_indices(
+            conditional_candidate_indices = self._nearest_interpretation_indices(
                 generated_interpretation_graph,
-                n_neighbors=n_conditional_neighbors,
+                n_neighbors=len(stored_interpretation_graphs),
                 exclude_query=False,
             )
+            if deduplicate_conditional_neighbors:
+                conditional_candidate_indices = (
+                    self._deduplicate_interpretation_indices_by_hash(
+                        conditional_candidate_indices
+                    )
+                )
+            if exclude_seed_from_conditional_neighbors:
+                seedless_candidate_indices = [
+                    idx for idx in conditional_candidate_indices if idx != seed_idx
+                ]
+                if seedless_candidate_indices:
+                    conditional_candidate_indices = seedless_candidate_indices
+            conditional_neighbor_indices = conditional_candidate_indices[
+                : min(int(n_conditional_neighbors), len(conditional_candidate_indices))
+            ]
             if not conditional_neighbor_indices:
                 warnings.warn(
                     "No conditional neighbors found for generated interpretation graph; skipping seed.",
