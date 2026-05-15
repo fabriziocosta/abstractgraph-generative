@@ -88,7 +88,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import copy
 import math
 import os
@@ -214,6 +214,7 @@ class _GenerationState:
     comp_of: dict
     node_maps: dict
     edge_bindings: dict
+    avoid_component_subgraph_hashes: frozenset = field(default_factory=frozenset)
 
 
 _WORKER_GENERATOR: Optional["ConditionalAutoregressiveGenerator"] = None
@@ -230,6 +231,7 @@ def _generate_one_worker(
     target_interpretation_graph: nx.Graph,
     seed: int,
     max_backtracks: int,
+    avoid_component_subgraph_hashes=None,
 ) -> tuple[Optional[nx.Graph], dict]:
     """Worker entrypoint for parallel sample generation."""
     if _WORKER_GENERATOR is None:
@@ -241,6 +243,7 @@ def _generate_one_worker(
         rng,
         max_backtracks=int(max_backtracks),
         attempt_trace=attempt_trace,
+        avoid_component_subgraph_hashes=avoid_component_subgraph_hashes,
     )
     return generated, attempt_trace
 
@@ -315,6 +318,7 @@ class ConditionalAutoregressiveGenerator:
         self._inv_freq: dict[tuple[int, int, int, int], int] = {}
         self._interpretation_graph_pool: list[nx.Graph] = []
         self._component_signature_by_id: dict[int, tuple] = {}
+        self._component_subgraph_hash_by_id: dict[int, int] = {}
         self._component_ids_by_signature: dict[tuple, list[int]] = {}
         self._component_context_embeddings: dict[int, object] = {}
         self._full_graph_context_embeddings: dict[int, object] = {}
@@ -668,9 +672,13 @@ class ConditionalAutoregressiveGenerator:
         return (
             int(component.interpretation_type),
             int(component.deg),
-            int(hash_graph(component.subgraph, nbits=max(int(self.nbits), 31))),
+            self._component_subgraph_hash(component),
             port_signatures,
         )
+
+    def _component_subgraph_hash(self, component: ComponentInstance) -> int:
+        """Build a stable hash for the concrete mapped base subgraph only."""
+        return int(hash_graph(component.subgraph, nbits=max(int(self.nbits), 31)))
 
     def _query_component_embedding(self, ag: AbstractGraph, interpretation_node):
         """Return the context embedding used to score one query component."""
@@ -829,6 +837,21 @@ class ConditionalAutoregressiveGenerator:
             subgraph=local_subgraph,
             ports=ports,
         )
+
+    def component_subgraph_hashes_for_graph(self, graph: nx.Graph) -> set[int]:
+        """Return mapped base-subgraph hashes extracted from one base graph."""
+        ag = graph_to_abstract_graph(
+            graph,
+            decomposition_function=self.decomposition_function,
+            nbits=self.nbits,
+            label_mode=self.label_mode,
+        )
+        return {
+            self._component_subgraph_hash(
+                self._build_component_instance(ag, interpretation_node, comp_id=-1)
+            )
+            for interpretation_node in ag.interpretation_graph.nodes()
+        }
 
     @staticmethod
     def _fallback_neighbor_features(graphs: Sequence[nx.Graph]) -> np.ndarray:
@@ -1135,6 +1158,7 @@ class ConditionalAutoregressiveGenerator:
         inv: dict[tuple[int, int, int, int], set[int]] = {}
         inv_freq: dict[tuple[int, int, int, int], int] = {}
         component_signature_by_id: dict[int, tuple] = {}
+        component_subgraph_hash_by_id: dict[int, int] = {}
         component_ids_by_signature: dict[tuple, list[int]] = {}
         skipped_missing_anchor_components = 0
 
@@ -1153,6 +1177,9 @@ class ConditionalAutoregressiveGenerator:
                 components[comp_id] = comp
                 comp_signature = self._component_signature(comp)
                 component_signature_by_id[comp_id] = comp_signature
+                component_subgraph_hash_by_id[comp_id] = self._component_subgraph_hash(
+                    comp
+                )
                 component_ids_by_signature.setdefault(comp_signature, []).append(comp_id)
                 key = (comp.interpretation_type, comp.deg)
                 bucket.setdefault(key, []).append(comp_id)
@@ -1177,6 +1204,7 @@ class ConditionalAutoregressiveGenerator:
         self._inv_freq = inv_freq
         self._interpretation_graph_pool = interpretation_pool
         self._component_signature_by_id = component_signature_by_id
+        self._component_subgraph_hash_by_id = component_subgraph_hash_by_id
         self._component_ids_by_signature = component_ids_by_signature
         self._component_context_embeddings = {}
         self._full_graph_context_embeddings = {}
@@ -1812,6 +1840,22 @@ class ConditionalAutoregressiveGenerator:
                     req_anchor_pairs=req_anchor_pairs,
                 )
             )
+        if matches and state.avoid_component_subgraph_hashes:
+            alternative_matches = [
+                candidate
+                for candidate in matches
+                if self._component_subgraph_hash_by_id.get(candidate.component.comp_id)
+                not in state.avoid_component_subgraph_hashes
+            ]
+            if alternative_matches:
+                self._dbg(
+                    2,
+                    "retrieve_avoid_seed_subgraphs",
+                    node=node,
+                    matched_before=len(matches),
+                    matched_after=len(alternative_matches),
+                )
+                matches = alternative_matches
         self._dbg(
             2,
             "retrieve_done",
@@ -1946,6 +1990,7 @@ class ConditionalAutoregressiveGenerator:
             comp_of=dict(state.comp_of),
             node_maps=copy.deepcopy(state.node_maps),
             edge_bindings=copy.deepcopy(state.edge_bindings),
+            avoid_component_subgraph_hashes=state.avoid_component_subgraph_hashes,
         )
 
     def _commit(
@@ -2267,6 +2312,7 @@ class ConditionalAutoregressiveGenerator:
         *,
         max_backtracks: int,
         attempt_trace: Optional[dict] = None,
+        avoid_component_subgraph_hashes=None,
     ) -> Optional[nx.Graph]:
         """Generate one graph from a fixed target interpretation graph.
 
@@ -2288,6 +2334,9 @@ class ConditionalAutoregressiveGenerator:
             comp_of={},
             node_maps={},
             edge_bindings={},
+            avoid_component_subgraph_hashes=frozenset(
+                avoid_component_subgraph_hashes or ()
+            ),
         )
         counters = {
             "branches": 0,
@@ -2377,6 +2426,7 @@ class ConditionalAutoregressiveGenerator:
         neighbor_coverage_factor: int = 10,
         max_seed_retries: int = 16,
         require_signature_coverage: bool = True,
+        avoid_component_subgraph_hashes=None,
     ) -> list[nx.Graph]:
         """Generate new base graphs by component assembly and backtracking.
 
@@ -2407,6 +2457,8 @@ class ConditionalAutoregressiveGenerator:
             require_signature_coverage: If True, skip stored seed graphs whose
                 target interpretation signatures are not covered by the expanded
                 nearest-neighbor context.
+            avoid_component_subgraph_hashes: Optional set of mapped base-subgraph
+                hashes to avoid when an alternative candidate exists.
 
         Returns:
             list[nx.Graph]: Generated graphs.
@@ -2459,6 +2511,7 @@ class ConditionalAutoregressiveGenerator:
                         rng_obj,
                         max_backtracks=int(max_backtracks),
                         attempt_trace=attempt_trace,
+                        avoid_component_subgraph_hashes=avoid_component_subgraph_hashes,
                     )
                     stage = str(attempt_trace.get("failure_stage", "unknown"))
                     attempt_outcomes[stage] += 1
@@ -2492,6 +2545,7 @@ class ConditionalAutoregressiveGenerator:
                         target_local,
                         rng_obj,
                         max_backtracks=int(max_backtracks),
+                        avoid_component_subgraph_hashes=avoid_component_subgraph_hashes,
                     )
                 if generated_local is None:
                     _maybe_log_progress(
@@ -2669,6 +2723,7 @@ class ConditionalAutoregressiveGenerator:
                                 target,
                                 int(seed),
                                 int(max_backtracks),
+                                avoid_component_subgraph_hashes,
                             )
                             future.target_interpretation_graph = target
                             futures.append(future)

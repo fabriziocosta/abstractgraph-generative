@@ -140,6 +140,7 @@ class GraphGenerator:
         conditional_generate_kwargs: dict | None = None,
         deduplicate_conditional_neighbors: bool = True,
         exclude_seed_from_conditional_neighbors: bool = True,
+        avoid_seed_components: bool = True,
     ) -> list[nx.Graph]:
         """Generate base graphs through interpretation-graph exploration."""
         stored_graphs, stored_interpretation_graphs = self._require_stored()
@@ -323,6 +324,16 @@ class GraphGenerator:
                 stored_graphs[idx].copy() for idx in conditional_neighbor_indices
             ]
             self.conditional_generator.fit(conditional_training_graphs)
+            if avoid_seed_components and hasattr(
+                self.conditional_generator,
+                "component_subgraph_hashes_for_graph",
+            ):
+                conditional_generate_kwargs.setdefault(
+                    "avoid_component_subgraph_hashes",
+                    self.conditional_generator.component_subgraph_hashes_for_graph(
+                        stored_graphs[seed_idx]
+                    ),
+                )
             generated_batch = self.conditional_generator.generate(
                 n_samples=n_instances_per_sample,
                 interpretation_graphs=[generated_interpretation_graph],

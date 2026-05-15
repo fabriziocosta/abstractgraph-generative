@@ -169,6 +169,13 @@ For each attempted seed, `sample(...)` does the following:
 9. discard conditional outputs whose re-decomposed interpretation graph does not
    match the generated interpretation graph.
 
+By default, the conditional stage also avoids reusing mapped base subgraphs from
+the sampled seed when an alternative candidate exists. This comparison uses the
+mapped subgraph hash, not the interpretation-node hash, because the
+interpretation-node type must still match the generated target. Set
+`avoid_seed_components=False` in `sample(...)` to disable this soft diversity
+filter.
+
 When `interpretation_edge_removal_size=0`, steps 2 through 5 are skipped and the
 seed interpretation graph is used directly in step 6.
 When `interpretation_edge_removal_size=1.0`, all edges are removed from the seed

@@ -108,6 +108,9 @@ class FakeConditionalGenerator:
         )
         return bool(self.match_results[match_index])
 
+    def component_subgraph_hashes_for_graph(self, graph):
+        return {hash_graph(graph)}
+
 
 class AlwaysFeasible:
     def fit(self, graphs):
@@ -497,6 +500,34 @@ def test_sample_filters_conditional_outputs_that_do_not_match_target() -> None:
     assert len(outputs) == 1
     assert len(conditional_generator.generate_calls[0]["match_checks"]) == 2
     assert len(generator.last_generated_interpretation_graphs_) == 1
+
+
+def test_sample_passes_seed_subgraph_hashes_to_conditional_generation() -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3), nx.path_graph(4)]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    conditional_generator = FakeConditionalGenerator()
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
+        conditional_generator=conditional_generator,
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    outputs = generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=2,
+        n_conditional_neighbors=1,
+        n_instances_per_sample=1,
+        random_state=0,
+        max_seed_attempts=1,
+    )
+
+    assert len(outputs) == 1
+    sampled_idx = generator.last_sampled_indices_[0]
+    assert conditional_generator.generate_calls[0]["kwargs"][
+        "avoid_component_subgraph_hashes"
+    ] == {hash_graph(base_graphs[sampled_idx])}
 
 
 def test_sample_uses_configured_same_interpretation_retry_limit() -> None:
