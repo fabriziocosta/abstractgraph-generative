@@ -112,6 +112,48 @@ class FakeConditionalGenerator:
         return {hash_graph(graph)}
 
 
+class EmptyWhenAvoidingSeedConditionalGenerator(FakeConditionalGenerator):
+    def generate(self, n_samples=1, *, interpretation_graphs=None, **kwargs):
+        self.generate_calls.append(
+            {
+                "n_samples": n_samples,
+                "interpretation_graphs": list(interpretation_graphs or []),
+                "kwargs": dict(kwargs),
+            }
+        )
+        if "avoid_component_subgraph_hashes" in kwargs:
+            return []
+        return [nx.path_graph(2) for _ in range(n_samples)]
+
+
+class EmptyUntilSeedFallbackConditionalGenerator(FakeConditionalGenerator):
+    def generate(self, n_samples=1, *, interpretation_graphs=None, **kwargs):
+        self.generate_calls.append(
+            {
+                "n_samples": n_samples,
+                "interpretation_graphs": list(interpretation_graphs or []),
+                "kwargs": dict(kwargs),
+                "fit_size": len(self.fit_calls[-1]),
+            }
+        )
+        if len(self.fit_calls[-1]) < 2:
+            return []
+        return [nx.path_graph(2) for _ in range(n_samples)]
+
+
+class ShortFirstBatchConditionalGenerator(FakeConditionalGenerator):
+    def generate(self, n_samples=1, *, interpretation_graphs=None, **kwargs):
+        self.generate_calls.append(
+            {
+                "n_samples": n_samples,
+                "interpretation_graphs": list(interpretation_graphs or []),
+                "kwargs": dict(kwargs),
+            }
+        )
+        batch_size = 1 if len(self.generate_calls) == 1 else int(n_samples)
+        return [nx.path_graph(2) for _ in range(batch_size)]
+
+
 class AlwaysFeasible:
     def fit(self, graphs):
         return self
@@ -402,12 +444,48 @@ def test_sample_logs_edge_neighbor_distances_when_debug_enabled(capsys) -> None:
     assert len(outputs) == 1
     out = capsys.readouterr().out
     assert "[graph-generator edge]" in out
+    assert "[graph-generator sample]" in out
+    assert "event=seed_start" in out
+    assert "event=seed_success" in out
+    assert "currently_generated=1/1" in out
+    assert "attempted_seeds=1/1" in out
+    assert "generated_graphs=1" in out
     assert "seed_idx=1" in out
     assert "neighbor_indices=[0, 2]" in out
     assert "neighbor_distances=[1.4142, 1.4142]" in out
     assert generator.last_interpretation_neighbor_distances_history_ == [
         pytest.approx([np.sqrt(2.0), np.sqrt(2.0)])
     ]
+
+
+def test_sample_logs_skip_progress_when_debug_enabled(capsys) -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3)]
+    base_graphs = [_labeled_path(2), _labeled_path(3)]
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(3)),
+        conditional_generator=FakeConditionalGenerator(),
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+        debug=True,
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    with pytest.warns(RuntimeWarning, match="same interpretation graph"):
+        outputs = generator.sample(
+            n_samples=1,
+            n_interpretation_neighbors=1,
+            n_conditional_neighbors=1,
+            random_state=0,
+            max_seed_attempts=1,
+        )
+
+    assert outputs == []
+    out = capsys.readouterr().out
+    assert "event=seed_start" in out
+    assert "event=seed_skip" in out
+    assert "currently_generated=0/1" in out
+    assert "attempted_seeds=1/1" in out
+    assert "reason=edge_generation_failed" in out
 
 
 def test_sample_rejects_generated_interpretation_graph_matching_seed_by_default() -> None:
@@ -528,6 +606,99 @@ def test_sample_passes_seed_subgraph_hashes_to_conditional_generation() -> None:
     assert conditional_generator.generate_calls[0]["kwargs"][
         "avoid_component_subgraph_hashes"
     ] == {hash_graph(base_graphs[sampled_idx])}
+
+
+def test_sample_retries_conditional_generation_without_seed_avoidance() -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3), nx.path_graph(4)]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    conditional_generator = EmptyWhenAvoidingSeedConditionalGenerator()
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
+        conditional_generator=conditional_generator,
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    outputs = generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=2,
+        n_conditional_neighbors=1,
+        n_instances_per_sample=1,
+        random_state=0,
+        max_seed_attempts=1,
+    )
+
+    assert len(outputs) == 1
+    assert len(conditional_generator.generate_calls) == 2
+    assert "avoid_component_subgraph_hashes" in conditional_generator.generate_calls[0][
+        "kwargs"
+    ]
+    assert "avoid_component_subgraph_hashes" not in conditional_generator.generate_calls[
+        1
+    ]["kwargs"]
+
+
+def test_sample_refits_with_seed_when_seedless_neighbors_cannot_generate() -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3), nx.path_graph(4)]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    conditional_generator = EmptyUntilSeedFallbackConditionalGenerator()
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
+        conditional_generator=conditional_generator,
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    outputs = generator.sample(
+        n_samples=1,
+        n_interpretation_neighbors=2,
+        n_conditional_neighbors=1,
+        n_instances_per_sample=1,
+        interpretation_edge_removal_size=0,
+        random_state=0,
+        max_seed_attempts=1,
+    )
+
+    assert len(outputs) == 1
+    assert len(conditional_generator.fit_calls) == 2
+    assert len(conditional_generator.fit_calls[0]) == 1
+    assert len(conditional_generator.fit_calls[1]) == 2
+    assert (
+        generator.last_sampled_indices_[0]
+        in generator.last_conditional_neighbor_indices_history_[0]
+    )
+
+
+def test_sample_records_generated_graph_batches_per_successful_seed() -> None:
+    interpretation_graphs = [nx.path_graph(2), nx.path_graph(3), nx.path_graph(4)]
+    base_graphs = [_labeled_path(2), _labeled_path(3), _labeled_path(4)]
+    conditional_generator = ShortFirstBatchConditionalGenerator()
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(4)),
+        conditional_generator=conditional_generator,
+        decomposition_function=node_operator(),
+        nbits=6,
+        interpretation_neighbor_vectorizer=SizeVectorizer(),
+    ).store(base_graphs, interpretation_graphs=interpretation_graphs)
+
+    outputs = generator.sample(
+        n_samples=2,
+        n_interpretation_neighbors=2,
+        n_conditional_neighbors=1,
+        n_instances_per_sample=3,
+        interpretation_edge_removal_size=0,
+        random_state=0,
+        max_seed_attempts=2,
+        avoid_seed_components=False,
+    )
+
+    assert len(outputs) == 4
+    assert [len(batch) for batch in generator.last_generated_graphs_history_] == [
+        1,
+        3,
+    ]
 
 
 def test_sample_uses_configured_same_interpretation_retry_limit() -> None:

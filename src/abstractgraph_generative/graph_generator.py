@@ -72,6 +72,7 @@ class GraphGenerator:
         self.last_seed_graphs_: list[nx.Graph] = []
         self.last_seed_interpretation_graphs_: list[nx.Graph] = []
         self.last_generated_interpretation_graphs_: list[nx.Graph] = []
+        self.last_generated_graphs_history_: list[list[nx.Graph]] = []
         self.last_edge_generation_paths_: list[list[nx.Graph]] = []
         self.last_conditional_training_graphs_history_: list[list[nx.Graph]] = []
 
@@ -182,6 +183,15 @@ class GraphGenerator:
             seed_idx = seed_order.pop()
             seed_interpretation_graph = stored_interpretation_graphs[seed_idx].copy()
             self.last_sampled_indices_.append(seed_idx)
+            self._log_sample_progress(
+                event="seed_start",
+                successful_samples=successful_samples,
+                requested_samples=n_samples,
+                attempted_seeds=len(self.last_sampled_indices_),
+                max_seed_attempts=max_seed_attempts,
+                generated_graphs=len(generated_base_graphs),
+                seed_idx=seed_idx,
+            )
 
             if skip_edge_stage:
                 start_graph = seed_interpretation_graph.copy()
@@ -214,6 +224,16 @@ class GraphGenerator:
                         "interpretation node labels; skipping seed.",
                         RuntimeWarning,
                         stacklevel=2,
+                    )
+                    self._log_sample_progress(
+                        event="seed_skip",
+                        successful_samples=successful_samples,
+                        requested_samples=n_samples,
+                        attempted_seeds=len(self.last_sampled_indices_),
+                        max_seed_attempts=max_seed_attempts,
+                        generated_graphs=len(generated_base_graphs),
+                        seed_idx=seed_idx,
+                        reason="interpretation_label_coverage",
                     )
                     continue
                 self.last_interpretation_neighbor_indices_history_.append(
@@ -269,6 +289,16 @@ class GraphGenerator:
                         RuntimeWarning,
                         stacklevel=2,
                     )
+                    self._log_sample_progress(
+                        event="seed_skip",
+                        successful_samples=successful_samples,
+                        requested_samples=n_samples,
+                        attempted_seeds=len(self.last_sampled_indices_),
+                        max_seed_attempts=max_seed_attempts,
+                        generated_graphs=len(generated_base_graphs),
+                        seed_idx=seed_idx,
+                        reason="edge_fit_failed",
+                    )
                     continue
 
                 start_graph, original_edge_count = remove_edges(
@@ -288,6 +318,16 @@ class GraphGenerator:
                     )
                 )
                 if generated_interpretation_graph is None:
+                    self._log_sample_progress(
+                        event="seed_skip",
+                        successful_samples=successful_samples,
+                        requested_samples=n_samples,
+                        attempted_seeds=len(self.last_sampled_indices_),
+                        max_seed_attempts=max_seed_attempts,
+                        generated_graphs=len(generated_base_graphs),
+                        seed_idx=seed_idx,
+                        reason="edge_generation_failed",
+                    )
                     continue
 
             generated_interpretation_graph = generated_interpretation_graph.copy()
@@ -318,42 +358,91 @@ class GraphGenerator:
                     RuntimeWarning,
                     stacklevel=2,
                 )
+                self._log_sample_progress(
+                    event="seed_skip",
+                    successful_samples=successful_samples,
+                    requested_samples=n_samples,
+                    attempted_seeds=len(self.last_sampled_indices_),
+                    max_seed_attempts=max_seed_attempts,
+                    generated_graphs=len(generated_base_graphs),
+                    seed_idx=seed_idx,
+                    reason="no_conditional_neighbors",
+                )
                 continue
 
             conditional_training_graphs = [
                 stored_graphs[idx].copy() for idx in conditional_neighbor_indices
             ]
             self.conditional_generator.fit(conditional_training_graphs)
-            if avoid_seed_components and hasattr(
-                self.conditional_generator,
-                "component_subgraph_hashes_for_graph",
+            attempt_conditional_generate_kwargs = dict(conditional_generate_kwargs)
+            avoidance_applied = False
+            if (
+                avoid_seed_components
+                and "avoid_component_subgraph_hashes"
+                not in attempt_conditional_generate_kwargs
+                and hasattr(
+                    self.conditional_generator,
+                    "component_subgraph_hashes_for_graph",
+                )
             ):
-                conditional_generate_kwargs.setdefault(
-                    "avoid_component_subgraph_hashes",
+                attempt_conditional_generate_kwargs[
+                    "avoid_component_subgraph_hashes"
+                ] = (
                     self.conditional_generator.component_subgraph_hashes_for_graph(
                         stored_graphs[seed_idx]
-                    ),
+                    )
                 )
-            generated_batch = self.conditional_generator.generate(
-                n_samples=n_instances_per_sample,
-                interpretation_graphs=[generated_interpretation_graph],
-                **conditional_generate_kwargs,
+                avoidance_applied = True
+
+            def _generate_conditional_batch(generate_kwargs: dict) -> list[nx.Graph]:
+                generated = self.conditional_generator.generate(
+                    n_samples=n_instances_per_sample,
+                    interpretation_graphs=[generated_interpretation_graph],
+                    **generate_kwargs,
+                )
+                return [
+                    graph
+                    for graph in self._as_output_graph_list(generated)
+                    if self._conditional_output_matches_interpretation(
+                        graph,
+                        generated_interpretation_graph,
+                    )
+                ]
+
+            generated_batch = _generate_conditional_batch(
+                attempt_conditional_generate_kwargs
             )
-            generated_batch = self._as_output_graph_list(generated_batch)
-            generated_batch = [
-                graph
-                for graph in generated_batch
-                if self._conditional_output_matches_interpretation(
-                    graph,
-                    generated_interpretation_graph,
+            if not generated_batch and avoidance_applied:
+                generated_batch = _generate_conditional_batch(
+                    dict(conditional_generate_kwargs)
                 )
-            ]
+            if not generated_batch and seed_idx not in conditional_neighbor_indices:
+                conditional_neighbor_indices = list(conditional_neighbor_indices) + [
+                    seed_idx
+                ]
+                conditional_training_graphs = conditional_training_graphs + [
+                    stored_graphs[seed_idx].copy()
+                ]
+                self.conditional_generator.fit(conditional_training_graphs)
+                generated_batch = _generate_conditional_batch(
+                    dict(conditional_generate_kwargs)
+                )
             if not generated_batch:
                 warnings.warn(
                     "Conditional stage generated no graphs matching the generated "
                     "interpretation graph; skipping seed.",
                     RuntimeWarning,
                     stacklevel=2,
+                )
+                self._log_sample_progress(
+                    event="seed_skip",
+                    successful_samples=successful_samples,
+                    requested_samples=n_samples,
+                    attempted_seeds=len(self.last_sampled_indices_),
+                    max_seed_attempts=max_seed_attempts,
+                    generated_graphs=len(generated_base_graphs),
+                    seed_idx=seed_idx,
+                    reason="conditional_generation_failed",
                 )
                 continue
 
@@ -368,6 +457,9 @@ class GraphGenerator:
             self.last_generated_interpretation_graphs_.append(
                 generated_interpretation_graph.copy()
             )
+            self.last_generated_graphs_history_.append(
+                [graph.copy() for graph in generated_batch]
+            )
             self.last_edge_generation_paths_.append(
                 [start_graph.copy(), generated_interpretation_graph.copy()]
             )
@@ -376,7 +468,23 @@ class GraphGenerator:
             )
             generated_base_graphs.extend(graph.copy() for graph in generated_batch)
             successful_samples += 1
+            self._log_sample_progress(
+                event="seed_success",
+                successful_samples=successful_samples,
+                requested_samples=n_samples,
+                attempted_seeds=len(self.last_sampled_indices_),
+                max_seed_attempts=max_seed_attempts,
+                generated_graphs=len(generated_base_graphs),
+                seed_idx=seed_idx,
+            )
 
+        self._log_sample_summary(
+            successful_samples=successful_samples,
+            requested_samples=n_samples,
+            attempted_seeds=len(self.last_sampled_indices_),
+            max_seed_attempts=max_seed_attempts,
+            generated_graphs=len(generated_base_graphs),
+        )
         return generated_base_graphs
 
     def _reset_histories(self) -> None:
@@ -388,6 +496,7 @@ class GraphGenerator:
         self.last_seed_graphs_ = []
         self.last_seed_interpretation_graphs_ = []
         self.last_generated_interpretation_graphs_ = []
+        self.last_generated_graphs_history_ = []
         self.last_edge_generation_paths_ = []
         self.last_conditional_training_graphs_history_ = []
 
@@ -536,6 +645,54 @@ class GraphGenerator:
             f"n_neighbors={len(neighbor_indices)} "
             f"neighbor_indices={list(neighbor_indices)} "
             f"neighbor_distances={rounded_distances}"
+        )
+
+    def _log_sample_progress(
+        self,
+        *,
+        event: str,
+        successful_samples: int,
+        requested_samples: int,
+        attempted_seeds: int,
+        max_seed_attempts: int,
+        generated_graphs: int,
+        seed_idx: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if not self.debug:
+            return
+        parts = [
+            "[graph-generator sample]",
+            f"event={event}",
+            f"currently_generated={int(successful_samples)}/{int(requested_samples)}",
+            f"attempted_seeds={int(attempted_seeds)}/{int(max_seed_attempts)}",
+            f"generated_graphs={int(generated_graphs)}",
+        ]
+        if seed_idx is not None:
+            parts.append(f"seed_idx={int(seed_idx)}")
+        if reason is not None:
+            parts.append(f"reason={reason}")
+        print(
+            " ".join(parts)
+        )
+
+    def _log_sample_summary(
+        self,
+        *,
+        successful_samples: int,
+        requested_samples: int,
+        attempted_seeds: int,
+        max_seed_attempts: int,
+        generated_graphs: int,
+    ) -> None:
+        if not self.debug:
+            return
+        print(
+            "[graph-generator sample] "
+            "summary "
+            f"currently_generated={int(successful_samples)}/{int(requested_samples)} "
+            f"attempted_seeds={int(attempted_seeds)}/{int(max_seed_attempts)} "
+            f"generated_graphs={int(generated_graphs)}"
         )
 
     def _deduplicate_interpretation_indices_by_hash(
