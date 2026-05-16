@@ -96,7 +96,7 @@ def test_generate_accepts_interpretation_graphs_alias() -> None:
     assert isinstance(outputs, list)
 
 
-@pytest.mark.parametrize("label_mode", ["operator_hash", "graph_hash", "histogram"])
+@pytest.mark.parametrize("label_mode", ["operator", "graph_hash", "histogram"])
 def test_conditional_generator_checks_generated_interpretation_postcondition(label_mode: str) -> None:
     def decomposition(ag: AbstractGraph) -> AbstractGraph:
         ag.interpretation_graph = nx.Graph()

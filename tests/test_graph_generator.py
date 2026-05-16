@@ -95,7 +95,7 @@ class FakeConditionalGenerator:
         match_results=None,
         decomposition_function=None,
         nbits: int = 6,
-        label_mode: str = "operator_hash",
+        label_mode: str = "operator",
         context_vectorizer=None,
     ):
         self.debug = True

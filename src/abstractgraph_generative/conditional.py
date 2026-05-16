@@ -256,7 +256,7 @@ class ConditionalAutoregressiveGenerator:
         *,
         decomposition_function,
         nbits: int,
-        label_mode: str = "operator_hash",
+        label_mode: str = "operator",
         feasibility_estimator=None,
         base_cut_radius: Optional[int] = None,
         interpretation_cut_radius: Optional[int] = None,
@@ -271,7 +271,7 @@ class ConditionalAutoregressiveGenerator:
         Args:
             decomposition_function: Decomposition function for AbstractGraph conversion.
             nbits: Hash bit width for hashing base and interpretation neighborhoods.
-            label_mode: str = "operator_hash" (default) or "histogram" or "histogram_values" for AbstractGraph node labeling.
+            label_mode: str = "operator" (default) or "histogram" or "histogram_values" for AbstractGraph node labeling.
             feasibility_estimator: Optional final-graph feasibility estimator.
             base_cut_radius: Radius for anchor neighborhood hashes.
             interpretation_cut_radius: Radius for interpretation-node neighborhood hashes.
