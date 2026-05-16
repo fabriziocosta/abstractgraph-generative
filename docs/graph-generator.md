@@ -1,286 +1,150 @@
 # GraphGenerator
 
-`GraphGenerator` combines two existing generators into one two-stage
-workflow:
+`GraphGenerator` combines one top-level `EdgeGenerator` with one or more
+bottom-up `ConditionalAutoregressiveGenerator` stages.
 
-1. generate a target interpretation graph with `EdgeGenerator`,
-2. instantiate base graphs for that target with
-   `ConditionalAutoregressiveGenerator`.
+The conditional generators are ordered from base graph to top interpretation
+graph:
 
-The implementation lives in `abstractgraph_generative.graph_generator`.
+```text
+base graph -> level 1 interpretation -> ... -> top interpretation
+```
 
-## Core Idea
-
-`GraphGenerator` keeps two aligned corpora:
-
-- `stored_graphs_`
-  The original base graphs.
-- `stored_interpretation_graphs_`
-  The interpretation graphs produced from those base graphs, or supplied
-  directly by the caller.
-
-Sampling happens in interpretation-graph space first. For each sampled seed, the
-generator retrieves a local stored-interpretation neighborhood, fits
-`EdgeGenerator` on that neighborhood, prunes edges from the seed interpretation
-graph, and regrows a new interpretation graph.
-
-If `interpretation_edge_removal_size=0`, the edge stage is bypassed: the sampled
-seed interpretation graph is used directly as the conditional target.
-
-The edge-stage neighborhood uses the same label-coverage principle as
-`EdgeGenerator.repair(...)`: candidates are scanned in nearest-neighbor order,
-duplicate interpretation graphs are removed with `hash_graph(...)`, neighbors
-that cover missing seed interpretation-node labels are selected first, and
-remaining slots are filled with nearest unused candidates. The seed
-interpretation graph is not used as evidence for its own feasibility. If no
-stored interpretation-neighbor context covers the sampled seed's labels, that
-seed is rejected and sampling continues with another seed.
-
-The generated interpretation graph is then used as a query against the same
-stored interpretation corpus. The nearest matches identify the corresponding
-base graphs used to fit `ConditionalAutoregressiveGenerator`, which then
-materializes concrete base graph instances for the generated target structure.
+Sampling first generates a top-level target with `EdgeGenerator`, then walks
+back down through the conditional generators in reverse order until final base
+graphs are produced.
 
 ## Main API
 
 ```python
-from abstractgraph_ml.estimators import GraphEstimator
-from nsppk import NSPPK
-
-from abstractgraph_generative.graph_generator import GraphGenerator
-from abstractgraph_generative.edge_generator import EdgeGenerator
-
-edge_retrieval_vectorizer = NSPPK(...)
-edge_graph_estimator = GraphEstimator(
-    transformer=edge_retrieval_vectorizer,
-    estimator=edge_estimator,
-)
-edge_generator = EdgeGenerator(
-    graph_estimator=edge_graph_estimator,
-    partial_feasibility_estimator=partial_feasibility_estimator,
-    final_feasibility_estimator=final_feasibility_estimator,
-)
-
 generator = GraphGenerator(
     edge_generator=edge_generator,
-    conditional_generator=conditional_generator,
+    conditional_generators=[
+        base_to_interpretation_generator,
+        interpretation_to_top_generator,
+    ],
     seed=0,
     debug=False,
     require_new_interpretation_graph=True,
     max_same_interpretation_retries=3,
 )
 
-generator.store(graphs, interpretation_graphs=interpretation_graphs)
+generator.store(graphs, targets=targets)
 
 samples = generator.sample(
     n_samples=4,
     n_interpretation_neighbors=30,
-    n_conditional_neighbors=30,
+    n_conditional_neighbors=[100, 30],
     n_instances_per_sample=2,
     interpretation_edge_removal_size=0.5,
     random_state=0,
-    max_seed_attempts=None,
+    conditional_generate_kwargs=[
+        {"max_backtracks": 2000},
+        {"max_backtracks": 1000},
+    ],
 )
 ```
 
-Constructor arguments:
+For backwards compatibility, a single stage can still be passed as:
 
-- `edge_generator`
-  Configured `EdgeGenerator` used on interpretation graphs.
-- `conditional_generator`
-  Configured `ConditionalAutoregressiveGenerator` used on base graphs. Its
-  `decomposition_function`, `nbits`, and `label_mode` define the interpretation
-  semantics used by `GraphGenerator`.
-- `seed`
-  Default random seed for sampling.
-- `debug`
-  If true, propagate debug/progress logging to the wrapped generators.
-  `ConditionalAutoregressiveGenerator.debug` is set directly, and
-  `EdgeGenerator.verbose` is enabled for edge-stage logs. The edge-stage
-  neighbor log includes `neighbor_indices` and their retrieval
-  `neighbor_distances` from the sampled seed interpretation graph.
-- `require_new_interpretation_graph`
-  If true, reject edge-stage outputs whose generated interpretation graph is
-  identical to the sampled seed interpretation graph. This does not affect the
-  explicit `interpretation_edge_removal_size=0` bypass, which intentionally
-  uses the seed interpretation graph directly.
-- `max_same_interpretation_retries`
-  Number of additional edge-generation attempts to make for the same seed when
-  `require_new_interpretation_graph=True` and the edge stage regenerates the
-  seed interpretation graph. The default `3` allows four total attempts before
-  the seed is skipped.
+```python
+generator = GraphGenerator(
+    edge_generator=edge_generator,
+    conditional_generator=conditional_generator,
+)
+```
 
 ## Store Phase
 
-```python
-generator.store(
-    graphs,
-    interpretation_graphs=None,
-    targets=None,
-)
-```
-
-`store(...)` requires at least two base graphs.
-
-If `interpretation_graphs` is omitted, each interpretation graph is computed
-with:
+`store(graphs, targets=None)` computes and stores all hierarchy levels. Explicit
+`interpretation_graphs` are no longer accepted by the public store interface.
+Each level is computed from the previous one with that stage's conditional
+generator config:
 
 ```python
 graph_to_abstract_graph(
     graph,
-    decomposition_function=conditional_generator.decomposition_function,
-    nbits=conditional_generator.nbits,
-    label_mode=conditional_generator.label_mode,
+    decomposition_function=conditional_generators[i].decomposition_function,
+    nbits=conditional_generators[i].nbits,
+    label_mode=conditional_generators[i].label_mode,
 ).interpretation_graph
 ```
 
 Stored attributes:
 
-- `stored_graphs_`
-- `stored_interpretation_graphs_`
-- `stored_targets_`
-- `stored_interpretation_hash_to_index_`
-- `stored_interpretation_distance_matrix_`
+- `stored_level_graphs_[0]`: base graphs.
+- `stored_level_graphs_[i + 1]`: interpretation graphs computed by stage `i`.
+- `stored_graphs_`: compatibility alias for level `0`.
+- `stored_interpretation_graphs_`: compatibility alias for the top level.
+- `stored_targets_`: optional targets forwarded to top edge fitting.
 
-`targets` are optional and are forwarded to the local `EdgeGenerator.fit(...)`
-calls when present.
-
-Interpretation-neighbor retrieval is owned by `EdgeGenerator.store(...)`.
-Configure the retrieval vectorizer through the edge generator's
-`graph_estimator.transformer`; `GraphGenerator` reuses the retrieval vectors and
-distance matrix initialized by `EdgeGenerator`.
+The top retrieval index is owned by `edge_generator.store(top_level_graphs,
+targets=targets)`. Intermediate conditional retrieval indexes use that stage's
+`context_vectorizer` when present, otherwise a small graph descriptor fallback.
 
 ## Sample Phase
 
-`sample(...)` treats `n_samples` as the number of successful interpretation
-targets requested. Since seeds can be skipped, the generator may try more seed
-indices than `n_samples`. By default, `max_seed_attempts=None` allows up to
-`10 * n_samples` distinct seed attempts, capped by the stored corpus size. Set
-`max_seed_attempts` explicitly to make this stricter or more exhaustive.
+`sample(...)` treats `n_samples` as the number of successful top-level targets.
+`n_instances_per_sample` controls the final number of base graphs per successful
+target, not multiplicative fanout at every level.
 
-For each attempted seed, `sample(...)` does the following:
+Top-level controls remain scalar:
 
-1. sample one stored interpretation graph index,
-2. retrieve an interpretation-neighbor context using repair-style label
-   coverage:
-   - scan candidates in nearest-neighbor order,
-   - deduplicate candidates by `abstractgraph.hashing.hash_graph(...)`,
-   - select neighbors that cover missing seed interpretation-node labels,
-   - fill any remaining slots up to `n_interpretation_neighbors`,
-   - reject the seed if its labels cannot be covered by other stored
-     interpretation graphs,
-3. fit `EdgeGenerator` on those interpretation graphs,
-4. prune the seed interpretation graph with `remove_edges(...)`,
-5. regrow one generated interpretation graph to the seed's original edge count,
-6. retrieve `n_conditional_neighbors` stored interpretation graphs nearest to
-   the generated interpretation graph,
-7. fit `ConditionalAutoregressiveGenerator` on the aligned base graphs,
-8. generate `n_instances_per_sample` base graphs for that generated
-   interpretation graph,
-9. discard conditional outputs whose re-decomposed interpretation graph does not
-   match the generated interpretation graph.
+- `n_interpretation_neighbors`
+- `interpretation_edge_removal_size`
+- `edge_generate_kwargs`
+- `max_seed_attempts`
 
-By default, the conditional stage also avoids reusing mapped base subgraphs from
-the sampled seed when an alternative candidate exists. This comparison uses the
-mapped subgraph hash, not the interpretation-node hash, because the
-interpretation-node type must still match the generated target. Set
-`avoid_seed_components=False` in `sample(...)` to disable this soft diversity
-filter.
+Conditional controls accept either one value for every stage or a sequence
+aligned with `conditional_generators`:
 
-When `interpretation_edge_removal_size=0`, steps 2 through 5 are skipped and the
-seed interpretation graph is used directly in step 6.
-When `interpretation_edge_removal_size=1.0`, all edges are removed from the seed
-interpretation graph before regrowth.
+- `n_conditional_neighbors`
+- `conditional_generate_kwargs`
+- `deduplicate_conditional_neighbors`
+- `exclude_seed_from_conditional_neighbors`
+- `avoid_seed_components`
 
-The returned value is a flat `list[nx.Graph]`. With
-`n_samples=4` and `n_instances_per_sample=2`, up to eight base graphs are
-returned. Failed edge-stage seeds, unsupported-label seeds, and unchanged
-edge-stage outputs that exhaust their retry budget are skipped with a
-`RuntimeWarning`; the generator then tries another distinct seed until it has
-`n_samples` successful interpretation targets or exhausts `max_seed_attempts`.
-The final count may still be smaller if too many attempts fail.
+For each attempted seed, sampling:
 
-`conditional_generate_kwargs` are forwarded to
-`ConditionalAutoregressiveGenerator.generate(...)`, except `n_samples` and
-`interpretation_graphs`, which are controlled by `GraphGenerator`.
+1. selects a stored top-level seed graph,
+2. optionally fits the edge generator on nearby top-level graphs and regrows a
+   new top-level target,
+3. for each conditional stage in reverse order, retrieves nearest stored
+   upper-level graphs, fits on aligned lower-level graphs, generates lower-level
+   candidates, and validates the generated interpretation postcondition,
+4. returns final level-0 graphs as a flat `list[nx.Graph]`.
 
-`edge_generate_kwargs` are forwarded to `EdgeGenerator.generate(...)`, except
-`return_path`, which is controlled internally.
-
-## Ownership Notes
-
-`GraphGenerator` derives `decomposition_function`, `nbits`, and `label_mode`
-from the configured `ConditionalAutoregressiveGenerator`. This keeps the
-interpretation semantics used for storage, conditional fitting, and output
-validation aligned with the generator that materializes base graphs.
-
-The current implementation supports one interpretation level. Future chained
-generators should treat each conditional generator as the owner of its own
-decomposition config, and each edge generator as the owner of its own per-level
-interpretation retrieval vectorizer.
+If `interpretation_edge_removal_size=0`, the edge stage is bypassed and the
+sampled top-level seed is used directly as the first conditional target.
 
 ## Bookkeeping
 
 After `sample(...)`, these attributes describe the last run:
 
-- `last_sampled_indices_`
-  Attempted seed indices, including skipped seeds.
-- `last_successful_sampled_indices_`
-  Seed indices that reached generated base-graph output. Use this for notebook
-  displays aligned with `generated_graphs`.
-- `last_interpretation_neighbor_indices_history_`
-- `last_interpretation_neighbor_distances_history_`
-- `last_conditional_neighbor_indices_history_`
-- `last_seed_graphs_`
-- `last_seed_interpretation_graphs_`
-- `last_generated_interpretation_graphs_`
-- `last_edge_generation_paths_`
-- `last_conditional_training_graphs_history_`
+- `last_sampled_indices_`: attempted top-level seed indices.
+- `last_successful_sampled_indices_`: seeds that reached final base output.
+- `last_interpretation_neighbor_indices_history_`: top edge-stage neighbors.
+- `last_interpretation_neighbor_distances_history_`: top edge-stage distances.
+- `last_edge_generation_paths_`: `[start_graph, generated_top_graph]` per
+  successful seed.
+- `last_level_seed_graphs_history_`: per-success seed graph at every stored
+  level.
+- `last_level_generated_graphs_history_`: per-success generated graphs at every
+  level, where index `0` is final base output and the last index is the top
+  target.
+- `last_level_neighbor_indices_history_`: per-success, per-stage conditional
+  neighbor indices.
+- `last_level_training_graphs_history_`: per-success, per-stage conditional
+  training graphs.
 
-The successful-stage histories only receive entries after their stage succeeds.
-These are useful for notebooks and diagnostics. For example:
+## Interpretation Ownership
 
-```python
-attempted_seed_graphs = [
-    generator.stored_graphs_[i] for i in generator.last_sampled_indices_
-]
-successful_seed_graphs = [
-    generator.stored_graphs_[i] for i in generator.last_successful_sampled_indices_
-]
-generated_targets = generator.last_generated_interpretation_graphs_
-training_sets = generator.last_conditional_training_graphs_history_
-```
+Each conditional generator owns its own `decomposition_function`, `nbits`, and
+`label_mode`. `GraphGenerator` validates that every stage provides these fields
+and uses the stage's config for level construction and output validation.
 
-`last_seed_graphs_`, `last_seed_interpretation_graphs_`, and
-`last_generated_interpretation_graphs_` are aligned by successful
-interpretation target. Generated base graphs are returned flat; group them by
-`n_instances_per_sample` to align them with each successful target.
-
-## Interpretation Labels
-
-The edge stage requires the local interpretation-neighbor context to cover the
-sampled seed's interpretation-node labels. This is especially important with
-label modes such as `"histogram"` or `"histogram_values"`, where labels can be
-more specific than `"operator_hash"` labels. A seed with rare labels is skipped
-unless those labels appear in other stored interpretation graphs. This avoids
-fitting a feasibility estimator on a neighborhood that would necessarily mark
-the seed's own structure infeasible.
-
-This label-coverage requirement applies only when the edge stage runs. With
-`interpretation_edge_removal_size=0`, no edge generator is fit, so the seed's
-interpretation graph can be passed directly to the conditional stage.
-
-The conditional stage preserves the target interpretation graph through the
-existing `ConditionalAutoregressiveGenerator` postcondition. That means every
-generated base graph must re-decompose to the generated interpretation graph
-under the same `decomposition_function`, `nbits`, and `label_mode`.
-`GraphGenerator` also applies this check defensively before recording histories
-and returning generated base graphs.
-
-For decomposition modes such as cycle/tree decomposition, this is the key
-invariant: once the edge stage proposes a generated interpretation graph, the
-conditional stage should instantiate a base graph whose re-decomposition matches
-that proposal.
+The edge generator is singular and always operates on the top computed
+interpretation level.
 
 ## ZINC Example
 
@@ -288,8 +152,7 @@ See:
 
 - `notebooks/examples/example_graph_generator_zinc.ipynb`
 
-The notebook uses a small ZINC slice, a cycle/tree interpretation
-decomposition, an `EdgeGenerator` configured for interpretation graphs, and a
-`ConditionalAutoregressiveGenerator` configured for base molecule
-instantiation. It displays sampled source molecules, generated interpretation
-graphs, generated molecules, and seed/target/final interpretation label counts.
+The current notebook uses the backwards-compatible single conditional generator
+form. A hierarchical notebook should pass `conditional_generators=[...]` in
+bottom-up order and tune conditional parameters either as scalars or per-stage
+lists.
