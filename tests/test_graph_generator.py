@@ -217,6 +217,18 @@ def test_constructor_accepts_conditional_generator_sequence() -> None:
     assert generator.conditional_generators == generators
 
 
+def test_constructor_accepts_legacy_sequence_in_singular_argument() -> None:
+    generators = [FakeConditionalGenerator(), FakeConditionalGenerator(nbits=8)]
+
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+        conditional_generator=generators,
+    )
+
+    assert generator.conditional_generator is generators[0]
+    assert generator.conditional_generators == generators
+
+
 def test_constructor_rejects_ambiguous_generator_arguments() -> None:
     with pytest.raises(ValueError, match="either conditional_generator"):
         GraphGenerator(

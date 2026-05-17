@@ -110,6 +110,15 @@ class GraphGenerator:
                 raise ValueError(
                     "conditional_generator or conditional_generators is required."
                 )
+            if (
+                isinstance(conditional_generator, Sequence)
+                and not isinstance(conditional_generator, (str, bytes))
+                and getattr(conditional_generator, "decomposition_function", None) is None
+            ):
+                generators = list(conditional_generator)
+                if not generators:
+                    raise ValueError("conditional_generators must be non-empty.")
+                return generators
             return [conditional_generator]
         generators = list(conditional_generators)
         if not generators:
