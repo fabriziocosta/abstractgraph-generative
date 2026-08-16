@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import copy
 import math
+import os
+import pickle
 import random
+import re
+import tempfile
 import time
 import warnings
 from itertools import combinations, permutations
@@ -19,6 +23,391 @@ from abstractgraph_generative.interpolate import _build_adjacency
 
 
 DrawGraphsFn = Callable[..., object]
+
+EDGE_RANKER_ARTIFACT_VERSION = 1
+_EDGE_RANKER_FEATURE_VERSION = 1
+
+
+def _sanitize_edge_ranker_name(name: str) -> str:
+    """Return a safe, deterministic filename component for a ranker name."""
+    if not isinstance(name, str):
+        raise TypeError("edge ranker name must be a string")
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    sanitized = sanitized.strip("._-")
+    if not sanitized:
+        raise ValueError("edge ranker name must contain at least one safe character")
+    return sanitized
+
+
+def _edge_ranker_path(name: str, directory="edge_rankers"):
+    safe_name = _sanitize_edge_ranker_name(name)
+    return os.path.join(os.fspath(directory), f"edge_ranker__{safe_name}.pkl")
+
+
+def _stable_edge_ranker_value(value):
+    """Make common NetworkX attribute values safe for a feature signature."""
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _edge_ranker_attrs_signature(attrs) -> tuple:
+    return tuple(
+        sorted(
+            (
+                (
+                    _stable_edge_ranker_value(key),
+                    _stable_edge_ranker_value(value),
+                )
+                for key, value in dict(attrs or {}).items()
+            ),
+            key=lambda item: (
+                repr(type(item[0])),
+                repr(item[0]),
+                repr(type(item[1])),
+                repr(item[1]),
+            ),
+        )
+    )
+
+
+def _edge_ranker_action_signature(partial_graph: nx.Graph, edge, edge_attrs=None) -> tuple:
+    """Describe an edge action without encoding arbitrary node identifiers."""
+    u, v = edge
+    u_attrs = dict(partial_graph.nodes[u]) if u in partial_graph else {}
+    v_attrs = dict(partial_graph.nodes[v]) if v in partial_graph else {}
+    u_degree = int(partial_graph.degree(u)) if u in partial_graph else 0
+    v_degree = int(partial_graph.degree(v)) if v in partial_graph else 0
+    if nx.is_directed(partial_graph):
+        u_degree = (int(partial_graph.in_degree(u)), int(partial_graph.out_degree(u)))
+        v_degree = (int(partial_graph.in_degree(v)), int(partial_graph.out_degree(v)))
+        common_neighbors = len(
+            set(partial_graph.successors(u)) & set(partial_graph.predecessors(v))
+        ) if u in partial_graph and v in partial_graph else 0
+    else:
+        common_neighbors = len(
+            set(partial_graph.neighbors(u)) & set(partial_graph.neighbors(v))
+        ) if u in partial_graph and v in partial_graph else 0
+    return (
+        bool(nx.is_directed(partial_graph)),
+        _stable_edge_ranker_value(u_attrs.get("label")),
+        _stable_edge_ranker_value(v_attrs.get("label")),
+        u_degree,
+        v_degree,
+        int(common_neighbors),
+        int(partial_graph.number_of_nodes()),
+        int(partial_graph.number_of_edges()),
+        _edge_ranker_attrs_signature(edge_attrs),
+    )
+
+
+def _edge_ranker_action_from_input(value):
+    if isinstance(value, dict):
+        partial_graph = value.get("partial_graph")
+        if partial_graph is None:
+            parent = value.get("parent")
+            partial_graph = parent.get("graph") if parent is not None else None
+        edge = value.get("edge", value.get("added_edge"))
+        if edge is None:
+            raise ValueError("edge ranker inputs must include an edge action")
+        edge_attrs = value.get("edge_attrs")
+        if edge_attrs is None and value.get("graph") is not None:
+            graph = value["graph"]
+            if graph.has_edge(*edge):
+                edge_attrs = dict(graph.edges[edge])
+        if partial_graph is None:
+            raise ValueError("edge ranker inputs must include a partial graph")
+        return partial_graph, edge, edge_attrs
+    if isinstance(value, tuple) and len(value) == 3:
+        return value
+    raise TypeError(
+        "edge ranker inputs must be candidate dictionaries or "
+        "(partial_graph, edge, edge_attrs) tuples"
+    )
+
+
+class _EmpiricalEdgeRanker:
+    """Small fitted action ranker used when no external estimator is supplied."""
+
+    feature_version = _EDGE_RANKER_FEATURE_VERSION
+
+    def __init__(self, smoothing: float = 1.0):
+        self.smoothing = float(smoothing)
+        self.positive_counts_ = {}
+        self.negative_counts_ = {}
+        self.n_positive_ = 0
+        self.n_negative_ = 0
+        self.is_fitted_ = False
+
+    def fit(self, examples, targets=None):
+        examples = list(examples)
+        if targets is None:
+            targets = [example["label"] for example in examples]
+        targets = [int(target) for target in targets]
+        if len(examples) != len(targets):
+            raise ValueError("edge ranker examples and targets must have the same length")
+        if not examples:
+            raise ValueError("edge ranker training requires at least one example")
+        if any(target not in {0, 1} for target in targets):
+            raise ValueError("edge ranker targets must be binary 0/1 labels")
+        self.positive_counts_.clear()
+        self.negative_counts_.clear()
+        self.n_positive_ = 0
+        self.n_negative_ = 0
+        for example, target in zip(examples, targets):
+            signature = _edge_ranker_action_signature(*_edge_ranker_action_from_input(example))
+            counts = self.positive_counts_ if target == 1 else self.negative_counts_
+            counts[signature] = counts.get(signature, 0) + 1
+            if target == 1:
+                self.n_positive_ += 1
+            else:
+                self.n_negative_ += 1
+        if self.n_positive_ == 0 or self.n_negative_ == 0:
+            raise ValueError("edge ranker training requires both positive and negative examples")
+        self.is_fitted_ = True
+        return self
+
+    def predict(self, examples):
+        if not self.is_fitted_:
+            raise ValueError("edge ranker is not fitted")
+        examples = list(examples)
+        smoothing = max(0.0, self.smoothing)
+        signatures = [
+            _edge_ranker_action_signature(*_edge_ranker_action_from_input(example))
+            for example in examples
+        ]
+        n_signatures = max(1, len(set(self.positive_counts_) | set(self.negative_counts_)))
+        positive_denominator = self.n_positive_ + smoothing * n_signatures
+        negative_denominator = self.n_negative_ + smoothing * n_signatures
+        global_score = math.log(
+            (self.n_positive_ + smoothing) / max(positive_denominator, 1e-12)
+        ) - math.log(
+            (self.n_negative_ + smoothing) / max(negative_denominator, 1e-12)
+        )
+        scores = []
+        for signature in signatures:
+            positive = self.positive_counts_.get(signature, 0)
+            negative = self.negative_counts_.get(signature, 0)
+            if positive == 0 and negative == 0:
+                scores.append(global_score)
+                continue
+            scores.append(
+                math.log((positive + smoothing) / max(positive_denominator, 1e-12))
+                - math.log((negative + smoothing) / max(negative_denominator, 1e-12))
+            )
+        return np.asarray(scores, dtype=float)
+
+
+def _edge_ranker_missing_edges(graph: nx.Graph, *, allow_self_loops: bool):
+    nodes = list(graph.nodes())
+    if nx.is_directed(graph):
+        candidate_edges = list(permutations(nodes, 2))
+    else:
+        candidate_edges = list(combinations(nodes, 2))
+    if allow_self_loops:
+        candidate_edges.extend((node, node) for node in nodes)
+    occupied = {_canonicalize_edge(edge, graph) for edge in graph.edges()}
+    return [edge for edge in candidate_edges if _canonicalize_edge(edge, graph) not in occupied]
+
+
+def _build_edge_ranker_examples(
+    graphs,
+    *,
+    n_negative_per_positive: int,
+    n_replicates: int,
+    seed: int | None,
+    allow_self_loops: bool,
+    decomposition_function=None,
+    nbits: int | None = None,
+):
+    if n_negative_per_positive < 1:
+        raise ValueError("n_negative_per_positive must be >= 1")
+    if n_replicates < 1:
+        raise ValueError("n_replicates must be >= 1")
+    rng = random.Random(seed)
+    examples = []
+    for graph in graphs:
+        if decomposition_function is None:
+            edge_groups = None
+        else:
+            if nbits is None:
+                raise ValueError("nbits is required when decomposition_function is provided")
+            edge_groups = _decomposition_edge_groups(
+                graph,
+                decomposition_function=decomposition_function,
+                nbits=int(nbits),
+            )
+        for _ in range(n_replicates):
+            current_graph = graph.copy()
+            groups = None if edge_groups is None else [list(group) for group in edge_groups]
+            if groups is not None:
+                rng.shuffle(groups)
+                ordered_edges = [edge for group in groups for edge in group]
+            else:
+                ordered_edges = None
+            while current_graph.number_of_edges() > 0:
+                if ordered_edges is None:
+                    edge = rng.choice(list(current_graph.edges()))
+                else:
+                    available = [
+                        candidate for candidate in ordered_edges
+                        if _canonicalize_edge(candidate, current_graph)
+                        in {_canonicalize_edge(existing, current_graph) for existing in current_graph.edges()}
+                    ]
+                    if not available:
+                        break
+                    edge = rng.choice(available)
+                    ordered_edges.remove(edge)
+                edge = _canonicalize_edge(edge, current_graph)
+                edge_attrs = dict(current_graph.edges[edge])
+                partial_graph = current_graph.copy()
+                partial_graph.remove_edge(*edge)
+                examples.append({
+                    "partial_graph": partial_graph,
+                    "edge": edge,
+                    "edge_attrs": edge_attrs,
+                    "label": 1,
+                })
+                negative_edges = [
+                    candidate
+                    for candidate in _edge_ranker_missing_edges(
+                        partial_graph, allow_self_loops=allow_self_loops
+                    )
+                    if _canonicalize_edge(candidate, partial_graph) != edge
+                ]
+                rng.shuffle(negative_edges)
+                for negative_edge in negative_edges[:n_negative_per_positive]:
+                    examples.append({
+                        "partial_graph": partial_graph.copy(),
+                        "edge": _canonicalize_edge(negative_edge, partial_graph),
+                        "edge_attrs": dict(edge_attrs),
+                        "label": 0,
+                    })
+                current_graph = partial_graph
+    return examples
+
+
+def fit_edge_ranker(
+    graphs,
+    *,
+    dataset_name: str,
+    output_dir="edge_rankers",
+    ranker=None,
+    estimator=None,
+    n_negative_per_positive: int = 3,
+    n_replicates: int = 1,
+    seed: int | None = None,
+    allow_self_loops: bool = False,
+    decomposition_function=None,
+    nbits: int | None = None,
+):
+    """Fit and persist a reusable domain prior over edge-addition actions.
+
+    The fitted ranker's prediction direction is ``larger = more preferred``.
+    A custom ``ranker``/``estimator`` must implement ``fit(examples, targets)``
+    and ``predict(candidates)`` using the action dictionaries documented by the
+    default ranker.
+    """
+    if ranker is not None and estimator is not None:
+        raise ValueError("provide at most one of ranker and estimator")
+    graph_list = (
+        [graphs.copy()]
+        if is_simple_graph(graphs)
+        else [graph.copy() for graph in graphs]
+    )
+    if not graph_list:
+        raise ValueError("graphs must contain at least one graph")
+    examples = _build_edge_ranker_examples(
+        graph_list,
+        n_negative_per_positive=n_negative_per_positive,
+        n_replicates=n_replicates,
+        seed=seed,
+        allow_self_loops=allow_self_loops,
+        decomposition_function=decomposition_function,
+        nbits=nbits,
+    )
+    if not examples:
+        raise ValueError("graphs did not produce any edge-ranker training examples")
+    fitted_ranker = ranker if ranker is not None else estimator
+    if fitted_ranker is None:
+        fitted_ranker = _EmpiricalEdgeRanker()
+    targets = [example["label"] for example in examples]
+    if not hasattr(fitted_ranker, "fit") or not hasattr(fitted_ranker, "predict"):
+        raise TypeError("ranker must provide fit(examples, targets) and predict(candidates)")
+    fit_result = fitted_ranker.fit(examples, targets)
+    if fit_result is not None:
+        fitted_ranker = fit_result
+    if not hasattr(fitted_ranker, "predict"):
+        raise TypeError("fitted edge ranker must provide predict(candidates)")
+    try:
+        fitted_ranker.dataset_name = dataset_name
+        fitted_ranker.artifact_version = EDGE_RANKER_ARTIFACT_VERSION
+    except Exception:
+        pass
+    safe_name = _sanitize_edge_ranker_name(dataset_name)
+    artifact = {
+        "dataset_name": dataset_name,
+        "artifact_version": EDGE_RANKER_ARTIFACT_VERSION,
+        "ranker": fitted_ranker,
+        "feature_version": _EDGE_RANKER_FEATURE_VERSION,
+        "n_training_examples": len(examples),
+    }
+    output_path = os.path.join(os.fspath(output_dir), f"edge_ranker__{safe_name}.pkl")
+    os.makedirs(os.fspath(output_dir), exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=os.fspath(output_dir), prefix=".edge_ranker__", delete=False
+        ) as handle:
+            temporary_path = handle.name
+            pickle.dump(artifact, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+    return fitted_ranker
+
+
+def load_edge_ranker(name: str, *, directory="edge_rankers"):
+    """Load and validate ``edge_ranker__{name}.pkl`` from ``directory``."""
+    path = _edge_ranker_path(name, directory)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No persisted edge ranker named {name!r} found at {path!r}"
+        )
+    with open(path, "rb") as handle:
+        artifact = pickle.load(handle)
+    if not isinstance(artifact, dict):
+        raise ValueError(f"Invalid edge ranker artifact at {path!r}: expected a dictionary")
+    if artifact.get("artifact_version") != EDGE_RANKER_ARTIFACT_VERSION:
+        raise ValueError(
+            f"Unsupported edge ranker artifact version {artifact.get('artifact_version')!r}; "
+            f"expected {EDGE_RANKER_ARTIFACT_VERSION}"
+        )
+    if artifact.get("feature_version") != _EDGE_RANKER_FEATURE_VERSION:
+        raise ValueError(
+            f"Unsupported edge ranker feature version {artifact.get('feature_version')!r}; "
+            f"expected {_EDGE_RANKER_FEATURE_VERSION}"
+        )
+    stored_name = artifact.get("dataset_name")
+    if not isinstance(stored_name, str):
+        raise ValueError(f"Invalid edge ranker artifact at {path!r}: missing dataset_name")
+    if _sanitize_edge_ranker_name(stored_name) != _sanitize_edge_ranker_name(name):
+        raise ValueError(
+            f"Edge ranker artifact at {path!r} was trained for dataset "
+            f"{stored_name!r}, not {name!r}"
+        )
+    ranker = artifact.get("ranker")
+    if ranker is None or not hasattr(ranker, "predict"):
+        raise ValueError(f"Invalid edge ranker artifact at {path!r}: missing usable ranker")
+    try:
+        ranker.dataset_name = artifact.get("dataset_name")
+        ranker.artifact_version = artifact.get("artifact_version")
+    except Exception:
+        pass
+    return ranker
 
 
 class _OnlineGraphRegressorAdapter:
@@ -538,6 +927,10 @@ class EdgeGenerator:
         repulsion_weight: float = 0.2,
         repulsion_growth_factor: float = 1.5,
         edge_risk_lambda: float = 0.0,
+        edge_ranker_name: str | None = None,
+        edge_ranker_dir: str = "edge_rankers",
+        edge_rank_lambda: float = 0.0,
+        edge_ranker=None,
         max_repulsion_memory: int = 256,
         allow_self_loops: bool = False,
         fit_n_jobs: int = -1,
@@ -605,6 +998,15 @@ class EdgeGenerator:
             Multiplicative growth of repulsion during fallback phases.
         edge_risk_lambda : float, optional
             Weight of the edge-risk penalty subtracted from selection scores.
+        edge_ranker_name : str | None, optional
+            Logical name of a persisted domain edge ranker to load.
+        edge_ranker_dir : str, optional
+            Directory containing persisted edge ranker artifacts.
+        edge_rank_lambda : float, optional
+            Non-negative weight of the persisted edge-ranker score.
+        edge_ranker : object, optional
+            Directly supplied fitted ranker. This is useful for tests and
+            programmatic use; persisted names remain the primary workflow.
         max_repulsion_memory : int, optional
             Maximum number of failed graph embeddings retained for repulsion.
         allow_self_loops : bool, optional
@@ -685,6 +1087,22 @@ class EdgeGenerator:
         self.repulsion_weight = repulsion_weight
         self.repulsion_growth_factor = repulsion_growth_factor
         self.edge_risk_lambda = edge_risk_lambda
+        if float(edge_rank_lambda) < 0.0:
+            raise ValueError("edge_rank_lambda must be >= 0")
+        if edge_ranker is not None and edge_ranker_name is not None:
+            raise ValueError("provide at most one of edge_ranker and edge_ranker_name")
+        self.edge_ranker_name = edge_ranker_name
+        self.edge_ranker_dir = edge_ranker_dir
+        self.edge_rank_lambda = float(edge_rank_lambda)
+        self.edge_ranker_ = (
+            edge_ranker
+            if edge_ranker is not None
+            else (
+                load_edge_ranker(edge_ranker_name, directory=edge_ranker_dir)
+                if edge_ranker_name is not None
+                else None
+            )
+        )
         self.max_repulsion_memory = max_repulsion_memory
         self.allow_self_loops = allow_self_loops
         self.fit_n_jobs = fit_n_jobs
@@ -2314,6 +2732,7 @@ class EdgeGenerator:
         positive_scores = self._positive_scores(generated_graphs)
         target_scores = self._target_scores(generated_graphs, target=target)
         risk_scores = self._edge_risk_scores(generated)
+        edge_rank_scores = self._edge_rank_scores(generated)
         lookahead_violation_counts = [None for _ in generated]
         lookahead_indices = [
             idx
@@ -2330,21 +2749,24 @@ class EdgeGenerator:
             ):
                 lookahead_violation_counts[idx] = violation_count
         partial_terminal_candidates = []
-        for cand, is_partial_feasible, score, target_score, risk_score, lookahead_violation_count in zip(
+        for cand, is_partial_feasible, score, target_score, risk_score, edge_rank_score, lookahead_violation_count in zip(
             generated,
             partial_feasibility_mask,
             positive_scores,
             target_scores,
             risk_scores,
+            edge_rank_scores,
             lookahead_violation_counts,
         ):
             cand["score"] = float(score)
             cand["target_score"] = float(target_score)
             cand["risk_score"] = float(risk_score)
+            cand["edge_rank_score"] = float(edge_rank_score)
             cand["selection_score"] = float(
                 cand["score"]
                 + target_lambda * cand["target_score"]
                 - self.edge_risk_lambda * cand["risk_score"]
+                + self.edge_rank_lambda * cand["edge_rank_score"]
             )
             if not is_partial_feasible:
                 cand["feasibility_stage"] = "partial"
@@ -2570,15 +2992,17 @@ class EdgeGenerator:
         repulsion_lambda = scored["repulsion_lambda"]
         target_active = target is not None
         repulsion_active = repulsion_lambda > 0.0
+        edge_rank_active = self.edge_ranker_ is not None and self.edge_rank_lambda > 0.0
         best_score = retained[0]["score"] if retained else None
         best_selection_score = (
             retained[0]["selection_score"] if retained else None
-        ) if (target_active or repulsion_active) else None
+        ) if (target_active or repulsion_active or edge_rank_active) else None
         best_target_score = (
             retained[0].get("target_score") if retained and target_active else None
         )
         best_repulsion = retained[0].get("repulsion", 0.0) if retained else 0.0
         best_risk = retained[0].get("risk_score", 0.0) if retained else 0.0
+        best_edge_rank = retained[0].get("edge_rank_score", 0.0) if retained else 0.0
         step_elapsed = time.perf_counter() - step_start_time
         current_edges = (
             retained[0]["graph"].number_of_edges()
@@ -2632,7 +3056,7 @@ class EdgeGenerator:
             line4_parts.append(
                 f"best_target_score={self._format_optional_score(best_target_score)}"
             )
-        if target_active or repulsion_active:
+        if target_active or repulsion_active or edge_rank_active:
             line4_parts.append(
                 f"best_selection_score={self._format_optional_score(best_selection_score)}"
             )
@@ -2640,6 +3064,8 @@ class EdgeGenerator:
             line4_parts.append(f"best_repulsion={best_repulsion:.3f}")
         if self.edge_risk_lambda > 0.0:
             line4_parts.append(f"best_risk={best_risk:.3f}")
+        if edge_rank_active:
+            line4_parts.append(f"best_edge_rank_score={best_edge_rank:.3f}")
         line5_parts = []
         if target_active:
             line5_parts.append(f"target_lambda={target_lambda:.3f}")
@@ -2647,6 +3073,9 @@ class EdgeGenerator:
             line5_parts.append(f"repulsion_lambda={repulsion_lambda:.3f}")
         if self.edge_risk_lambda > 0.0 and self.edge_risk_estimator is not None:
             line5_parts.append(f"edge_risk_lambda={self.edge_risk_lambda:.3f}")
+        if edge_rank_active:
+            line5_parts.append(f"edge_rank_lambda={self.edge_rank_lambda:.3f}")
+            line5_parts.append(f"edge_ranker_name={self.edge_ranker_name!r}")
         line5_parts.append(f"beam_limit={beam_limit}")
         log_lines = [line1, line2, line3, " ".join(line4_parts), " ".join(line5_parts)]
         if len(scored["feasible_candidates"]) == 0:
@@ -2849,13 +3278,15 @@ class EdgeGenerator:
         positive_scores = self._positive_scores(beam_graphs)
         target_scores = self._target_scores(beam_graphs, target=target)
         risk_scores = self._edge_risk_scores(beam)
+        edge_rank_scores = self._edge_rank_scores(beam)
         final_states = []
-        for state, is_final_feasible, score, target_score, risk_score in zip(
+        for state, is_final_feasible, score, target_score, risk_score, edge_rank_score in zip(
             beam,
             final_mask,
             positive_scores,
             target_scores,
             risk_scores,
+            edge_rank_scores,
         ):
             if not is_final_feasible:
                 continue
@@ -2864,10 +3295,12 @@ class EdgeGenerator:
             state["score"] = float(score)
             state["target_score"] = float(target_score)
             state["risk_score"] = float(risk_score)
+            state["edge_rank_score"] = float(edge_rank_score)
             state["selection_score"] = float(
                 state["score"]
                 + target_lambda * state["target_score"]
                 - self.edge_risk_lambda * state["risk_score"]
+                + self.edge_rank_lambda * state["edge_rank_score"]
             )
             final_states.append(state)
 
@@ -3923,6 +4356,41 @@ class EdgeGenerator:
                     self._make_edge_risk_graph_pair(parent["graph"], cand["graph"])
                 )
         return self.edge_risk_model_.predict(pair_graphs)
+
+    def _edge_rank_scores(self, candidates):
+        """Score materialized edge actions without filtering candidates."""
+        if (
+            self.edge_ranker_ is None
+            or self.edge_rank_lambda == 0.0
+            or not candidates
+        ):
+            return np.zeros(len(candidates), dtype=float)
+        # The root state has no edge action. It is a valid input to the
+        # current-beam scoring path, but receives the neutral prior score.
+        actionable_indices = [
+            idx
+            for idx, candidate in enumerate(candidates)
+            if candidate.get("added_edge", candidate.get("edge")) is not None
+        ]
+        scores = np.zeros(len(candidates), dtype=float)
+        if not actionable_indices:
+            return scores
+        actionable_candidates = [candidates[idx] for idx in actionable_indices]
+        if hasattr(self.edge_ranker_, "predict_edge_scores"):
+            predicted = self.edge_ranker_.predict_edge_scores(actionable_candidates)
+        elif hasattr(self.edge_ranker_, "predict"):
+            predicted = self.edge_ranker_.predict(actionable_candidates)
+        else:
+            raise ValueError("edge ranker must provide predict(...) or predict_edge_scores(...)")
+        predicted = np.asarray(predicted, dtype=float).reshape(-1)
+        if len(predicted) != len(actionable_candidates):
+            raise ValueError(
+                "edge ranker returned a score for a different number of candidates"
+            )
+        if not np.all(np.isfinite(predicted)):
+            raise ValueError("edge ranker scores must be finite")
+        scores[actionable_indices] = predicted
+        return scores
 
     def _make_edge_risk_graph_pair(self, parent_graph: nx.Graph, child_graph: nx.Graph):
         return nx.disjoint_union(parent_graph.copy(), child_graph.copy())

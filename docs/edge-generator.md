@@ -465,6 +465,42 @@ where:
 - `repulsion` is the maximum cosine similarity to the failed-memory bank
 - `repulsion_lambda` grows with the number of fallback stages already used
 
+## Persisted domain edge rankers
+
+For a reusable domain prior, fit an edge-action ranker once on a larger graph
+corpus and save it under a dataset-specific name:
+
+```python
+from abstractgraph_generative.edge_generator import fit_edge_ranker
+
+fit_edge_ranker(
+    large_chemical_graph_corpus,
+    dataset_name="zinc250k",
+    output_dir="edge_rankers",
+)
+```
+
+This creates `edge_rankers/edge_ranker__zinc250k.pkl`. Load and use it in later
+independent generation runs:
+
+```python
+generator = EdgeGenerator(
+    partial_feasibility_estimator=partial_feasibility_estimator,
+    final_feasibility_estimator=final_feasibility_estimator,
+    graph_estimator=graph_estimator,
+    edge_ranker_name="zinc250k",
+    edge_ranker_dir="edge_rankers",
+    edge_rank_lambda=0.5,
+)
+```
+
+The ranker is trained once from reconstruction transitions, serialized with
+its dataset name, artifact version, and fitted state, then reused without
+online updates. It biases candidate ordering through the additive
+`edge_rank_lambda * edge_rank_score` term; it does not prune or truncate edge
+candidates. Feasibility checks, target scoring, instance-specific edge risk,
+fallback repair, and beam search remain separate.
+
 ## Online Edge Risk Learning
 
 When `edge_risk_estimator` is provided, the generator learns online from its
