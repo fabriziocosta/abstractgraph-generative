@@ -312,6 +312,7 @@ def fit_edge_ranker(
     """
     if ranker is not None and estimator is not None:
         raise ValueError("provide at most one of ranker and estimator")
+    safe_name = _sanitize_edge_ranker_name(dataset_name)
     graph_list = (
         [graphs.copy()]
         if is_simple_graph(graphs)
@@ -346,7 +347,6 @@ def fit_edge_ranker(
         fitted_ranker.artifact_version = EDGE_RANKER_ARTIFACT_VERSION
     except Exception:
         pass
-    safe_name = _sanitize_edge_ranker_name(dataset_name)
     artifact = {
         "dataset_name": dataset_name,
         "artifact_version": EDGE_RANKER_ARTIFACT_VERSION,
@@ -922,6 +922,7 @@ class EdgeGenerator:
         fallback_growth_factor: float = 2.0,
         beam_growth_factor: float = 1.5,
         max_beam_size: int | None = None,
+        allow_infeasible_fallback: bool = True,
         enforce_diversity: bool = True,
         use_similarity_repulsion: bool = True,
         repulsion_weight: float = 0.2,
@@ -986,6 +987,10 @@ class EdgeGenerator:
             Multiplicative growth applied to beam size after each fallback.
         max_beam_size : int | None, optional
             Optional cap on the expanded fallback beam size.
+        allow_infeasible_fallback : bool, optional
+            After all feasible-search fallback phases are exhausted, retain and
+            continue the candidates with the lowest infeasibility score instead
+            of failing immediately. The resulting path may still be infeasible.
         enforce_diversity : bool, optional
             Whether previously seen graphs are filtered to encourage diverse
             search trajectories.
@@ -1082,18 +1087,20 @@ class EdgeGenerator:
         self.fallback_growth_factor = fallback_growth_factor
         self.beam_growth_factor = beam_growth_factor
         self.max_beam_size = max_beam_size
+        self.allow_infeasible_fallback = bool(allow_infeasible_fallback)
         self.enforce_diversity = enforce_diversity
         self.use_similarity_repulsion = use_similarity_repulsion
         self.repulsion_weight = repulsion_weight
         self.repulsion_growth_factor = repulsion_growth_factor
         self.edge_risk_lambda = edge_risk_lambda
-        if float(edge_rank_lambda) < 0.0:
-            raise ValueError("edge_rank_lambda must be >= 0")
+        edge_rank_lambda = float(edge_rank_lambda)
+        if not math.isfinite(edge_rank_lambda) or edge_rank_lambda < 0.0:
+            raise ValueError("edge_rank_lambda must be >= 0 and finite")
         if edge_ranker is not None and edge_ranker_name is not None:
             raise ValueError("provide at most one of edge_ranker and edge_ranker_name")
         self.edge_ranker_name = edge_ranker_name
         self.edge_ranker_dir = edge_ranker_dir
-        self.edge_rank_lambda = float(edge_rank_lambda)
+        self.edge_rank_lambda = edge_rank_lambda
         self.edge_ranker_ = (
             edge_ranker
             if edge_ranker is not None
@@ -2508,6 +2515,18 @@ class EdgeGenerator:
 
         # Main search loop: expand, score, retain, then optionally repair/backtrack.
         while search["beam"]:
+            if search.get("infeasible_mode", False):
+                infeasible_path = self._find_infeasible_path_in_beam(
+                    search["beam"],
+                    n_edges=n_edges,
+                    graph_index=graph_index,
+                    total_phases=total_phases,
+                    fallback_index=search["fallback_index"],
+                    start_time=start_time,
+                    verbose=verbose,
+                )
+                if infeasible_path is not None:
+                    return infeasible_path
             expandable_beam = [
                 state
                 for state in search["beam"]
@@ -2540,6 +2559,26 @@ class EdgeGenerator:
                 if early_stop_path is not None:
                     return early_stop_path
                 self._mark_unexpandable_beam_as_completion_infeasible(search)
+                if not search.get("infeasible_mode", False) and self.allow_infeasible_fallback:
+                    self._enter_infeasible_mode(
+                        search,
+                        graph_index=graph_index,
+                        total_phases=total_phases,
+                        verbose=verbose,
+                    )
+                if search.get("infeasible_mode", False):
+                    infeasible_path = self._find_infeasible_path_in_beam(
+                        search["beam"],
+                        n_edges=n_edges,
+                        allow_shortfall=True,
+                        graph_index=graph_index,
+                        total_phases=total_phases,
+                        fallback_index=search["fallback_index"],
+                        start_time=start_time,
+                        verbose=verbose,
+                    )
+                    if infeasible_path is not None:
+                        return infeasible_path
                 break
 
             generated = self._expand_beam(expandable_beam)
@@ -2565,12 +2604,20 @@ class EdgeGenerator:
             )
             if early_stop_path is not None:
                 return early_stop_path
-            retained = self._retain_unseen_candidates(
-                scored["feasible_candidates"],
-                search=search,
-                next_depth=search["depth"] + 1,
-                beam_limit=beam_limit,
-            )
+            if search.get("infeasible_mode", False):
+                retained = self._retain_infeasible_candidates(
+                    scored["feasible_candidates"] + scored["infeasible_candidates"],
+                    search=search,
+                    next_depth=search["depth"] + 1,
+                    beam_limit=beam_limit,
+                )
+            else:
+                retained = self._retain_unseen_candidates(
+                    scored["feasible_candidates"],
+                    search=search,
+                    next_depth=search["depth"] + 1,
+                    beam_limit=beam_limit,
+                )
 
             self._log_search_step(
                 retained,
@@ -2603,6 +2650,9 @@ class EdgeGenerator:
                     return path
                 continue
 
+            if search.get("infeasible_mode", False):
+                break
+
             beam_limit = self._apply_search_fallback(
                 search,
                 infeasible_candidates=scored["infeasible_candidates"],
@@ -2612,6 +2662,42 @@ class EdgeGenerator:
                 verbose=verbose,
             )
             if beam_limit is None:
+                if self.allow_infeasible_fallback:
+                    self._enter_infeasible_mode(
+                        search,
+                        graph_index=graph_index,
+                        total_phases=total_phases,
+                        verbose=verbose,
+                    )
+                    retained = self._retain_infeasible_candidates(
+                        scored["feasible_candidates"] + scored["infeasible_candidates"],
+                        search=search,
+                        next_depth=search["depth"] + 1,
+                        beam_limit=beam_limit if beam_limit is not None else self._beam_limit_for_fallback(search["fallback_index"]),
+                    )
+                    if retained:
+                        self._advance_search_with_retained(
+                            retained,
+                            search=search,
+                            n_edges=n_edges,
+                            graph_index=graph_index,
+                            total_phases=total_phases,
+                            start_time=start_time,
+                            verbose=verbose,
+                        )
+                        continue
+                    infeasible_path = self._find_infeasible_path_in_beam(
+                        search["beam"],
+                        n_edges=n_edges,
+                        allow_shortfall=True,
+                        graph_index=graph_index,
+                        total_phases=total_phases,
+                        fallback_index=search["fallback_index"],
+                        start_time=start_time,
+                        verbose=verbose,
+                    )
+                    if infeasible_path is not None:
+                        return infeasible_path
                 break
 
         self._close_edge_risk_training_states(open_state_ids=set())
@@ -2666,6 +2752,7 @@ class EdgeGenerator:
             "visited": self._rebuild_visited_from_history(beam_history),
             "depth": 0,
             "fallback_index": -1,
+            "infeasible_mode": False,
             "step_start_time": time.perf_counter(),
         }
 
@@ -2941,6 +3028,49 @@ class EdgeGenerator:
             reverse=True,
         )
 
+    def _rank_infeasible_candidates_for_fallback(self, candidates) -> None:
+        """Order rejected candidates by lowest violation count first."""
+        if not candidates:
+            return
+        for cand in candidates:
+            if "feasibility_stage" not in cand and "connected_components" in cand:
+                cand["feasibility_stage"] = "final"
+        self._annotate_infeasible_candidates_with_violations(candidates)
+        candidates.sort(
+            key=lambda cand: (
+                cand.get("violation_count", float("inf")),
+                -float(cand.get("selection_score") or cand.get("score") or 0.0),
+            )
+        )
+
+    def _retain_infeasible_candidates(
+        self,
+        candidates,
+        *,
+        search,
+        next_depth: int,
+        beam_limit: int,
+    ):
+        if not candidates:
+            return []
+        self._rank_infeasible_candidates_for_fallback(candidates)
+        blocked_state_keys = search["blocked_state_keys_by_depth"].get(next_depth, set())
+        retainable = [
+            cand
+            for cand in candidates
+            if cand["key"] not in search["visited"]
+            and cand["key"] not in blocked_state_keys
+            and cand["path_signature"] not in search["tabu_path_signatures"]
+        ]
+        retained = self._select_beam_candidates(retainable, beam_limit=beam_limit)
+        retained_ids = {cand.get("state_id") for cand in retained}
+        for cand in retainable:
+            self._mark_trace_state_status(
+                cand,
+                "retained_infeasible" if cand.get("state_id") in retained_ids else "pruned_infeasible",
+            )
+        return retained
+
     def _retain_unseen_candidates(self, feasible_candidates, *, search, next_depth: int, beam_limit: int):
         blocked_state_keys = search["blocked_state_keys_by_depth"].get(next_depth, set())
         unseen_candidates = []
@@ -3202,6 +3332,51 @@ class EdgeGenerator:
             return path
         return None
 
+    def _find_infeasible_path_in_beam(
+        self,
+        beam,
+        *,
+        n_edges: int,
+        allow_shortfall: bool = False,
+        graph_index: int,
+        total_phases: int,
+        fallback_index: int,
+        start_time: float,
+        verbose: bool,
+    ):
+        terminal_states = [
+            state for state in beam
+            if state["graph"].number_of_edges() >= int(n_edges)
+        ]
+        if not terminal_states and allow_shortfall:
+            terminal_states = list(beam)
+        if not terminal_states:
+            return None
+
+        candidates = []
+        for state in terminal_states:
+            state["feasibility_stage"] = (
+                "final"
+                if state["graph"].number_of_edges() >= int(n_edges)
+                else "partial"
+            )
+            candidates.append(state)
+        self._rank_infeasible_candidates_for_fallback(candidates)
+        best_state = candidates[0]
+        self._mark_trace_state_status(best_state, "infeasible_solution")
+        if verbose:
+            elapsed_str = self._format_minutes_seconds(time.perf_counter() - start_time)
+            edge_shortfall = max(0, int(n_edges) - best_state["graph"].number_of_edges())
+            print(
+                f"[graph {graph_index}] infeasible_fallback_solution "
+                f"search_phase={fallback_index + 2}/{total_phases} "
+                f"depth={best_state['depth']} edges={best_state['graph'].number_of_edges()} "
+                f"edge_shortfall={edge_shortfall} "
+                f"violation_count={best_state.get('violation_count', 0.0):.3f} "
+                f"elapsed={elapsed_str}"
+            )
+        return self._reconstruct_path(best_state)
+
     def _find_early_stop_in_beam(
         self,
         beam,
@@ -3368,6 +3543,21 @@ class EdgeGenerator:
             verbose=verbose,
         )
         return beam_limit
+
+    def _enter_infeasible_mode(
+        self,
+        search,
+        *,
+        graph_index: int,
+        total_phases: int,
+        verbose: bool,
+    ) -> None:
+        search["infeasible_mode"] = True
+        if verbose:
+            print(
+                f"[graph {graph_index}] entering infeasible fallback mode "
+                f"after search_phase={total_phases}/{total_phases}"
+            )
 
     def _mark_blocked_beam(self, search) -> None:
         search["blocked_state_keys_by_depth"].setdefault(search["depth"], set()).update(
