@@ -17,7 +17,9 @@ from abstractgraph_generative.optimize import (  # noqa: F401
 )
 from abstractgraph_generative.edge_generator import (  # noqa: F401
     EdgeGenerator,
+    fit_edge_ranker,
     edge_neighbors,
+    load_edge_ranker,
     make_edge_regression_dataset,
     mix_connected_components,
     remove_edges,
@@ -106,6 +108,8 @@ __all__ = [
     "GraphOptimizationResult",
     "GraphOptimizer",
     "EdgeGenerator",
+    "fit_edge_ranker",
+    "load_edge_ranker",
     "GraphGenerator",
     "edge_neighbors",
     "make_edge_regression_dataset",
