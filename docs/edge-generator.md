@@ -24,6 +24,8 @@ Key helpers:
 - `remove_edges`
 - `make_edge_regression_dataset`
 - `mix_connected_components`
+- `fit_edge_ranker`
+- `load_edge_ranker`
 - `EdgeGenerator`
 
 Typical usage:
@@ -500,6 +502,15 @@ online updates. It biases candidate ordering through the additive
 `edge_rank_lambda * edge_rank_score` term; it does not prune or truncate edge
 candidates. Feasibility checks, target scoring, instance-specific edge risk,
 fallback repair, and beam search remain separate.
+
+## Infeasible fallback
+
+`allow_infeasible_fallback=True` by default. If all configured feasible-search
+phases are exhausted, the generator enters a final rescue phase: it keeps the
+best available candidates ranked by lowest `number_of_violations(...)` score
+and continues generation without excluding infeasible candidates. The returned
+path may therefore remain infeasible. Set `allow_infeasible_fallback=False` to
+preserve the previous fail-fast behavior.
 
 ## Online Edge Risk Learning
 

@@ -238,6 +238,104 @@ def test_persisted_edge_ranker_is_added_to_candidate_selection_score() -> None:
     assert scored_candidate["selection_score"] == pytest.approx(2.0)
 
 
+def test_allow_infeasible_fallback_defaults_to_true() -> None:
+    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    assert generator.allow_infeasible_fallback is True
+
+    disabled = EdgeGenerator(
+        feasibility_estimator=object(),
+        graph_estimator=object(),
+        allow_infeasible_fallback=False,
+    )
+    assert disabled.allow_infeasible_fallback is False
+
+
+def test_infeasible_fallback_ranks_by_lowest_violation_count() -> None:
+    class _ViolationEstimator:
+        def predict(self, graphs):
+            return np.zeros(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.asarray(
+                [5.0 if graph.has_edge(0, 1) else 1.0 for graph in graphs]
+            )
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_ViolationEstimator(),
+        final_feasibility_estimator=_ViolationEstimator(),
+        graph_estimator=object(),
+        use_similarity_repulsion=False,
+    )
+    root = generator._make_state(nx.empty_graph(3), parent=None, score=0.0, depth=0)
+    worse = generator._make_state(
+        nx.Graph([(0, 1)]), parent=root, score=10.0, depth=1
+    )
+    better = generator._make_state(
+        nx.Graph([(0, 2)]), parent=root, score=0.0, depth=1
+    )
+    search = generator._initialize_search_state(root["graph"])
+
+    retained = generator._retain_infeasible_candidates(
+        [worse, better],
+        search=search,
+        next_depth=1,
+        beam_limit=1,
+    )
+
+    assert retained == [better]
+    assert better["violation_count"] == pytest.approx(1.0)
+
+
+def test_infeasible_fallback_returns_best_target_length_path() -> None:
+    class _AlwaysInfeasibleEstimator:
+        def predict(self, graphs):
+            return np.zeros(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.ones(len(graphs), dtype=float)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysInfeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysInfeasibleEstimator(),
+        graph_estimator=object(),
+        max_restarts=0,
+        use_similarity_repulsion=False,
+        require_single_connected_component=False,
+    )
+    generator.edge_attribute_templates_ = [{}]
+    generator._positive_scores = lambda graphs: np.zeros(len(graphs), dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.zeros(len(graphs), dtype=float)
+
+    path = generator._generate_one(nx.empty_graph(3), 1)
+
+    assert path[-1].number_of_edges() == 1
+
+
+def test_infeasible_fallback_can_be_disabled() -> None:
+    class _AlwaysInfeasibleEstimator:
+        def predict(self, graphs):
+            return np.zeros(len(graphs), dtype=bool)
+
+        def number_of_violations(self, graphs):
+            return np.ones(len(graphs), dtype=float)
+
+    generator = EdgeGenerator(
+        partial_feasibility_estimator=_AlwaysInfeasibleEstimator(),
+        final_feasibility_estimator=_AlwaysInfeasibleEstimator(),
+        graph_estimator=object(),
+        max_restarts=0,
+        allow_infeasible_fallback=False,
+        use_similarity_repulsion=False,
+        require_single_connected_component=False,
+    )
+    generator.edge_attribute_templates_ = [{}]
+    generator._positive_scores = lambda graphs: np.zeros(len(graphs), dtype=float)
+    generator._target_scores = lambda graphs, *, target: np.zeros(len(graphs), dtype=float)
+
+    with pytest.raises(ValueError, match="Could not generate a feasible graph"):
+        generator._generate_one(nx.empty_graph(3), 1)
+
+
 def test_unique_graphs_keeps_directed_edge_orientation_distinct() -> None:
     generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
     graph = _directed_path()
