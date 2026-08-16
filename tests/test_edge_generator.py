@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import pickle
 
 import networkx as nx
 import numpy as np
@@ -11,6 +12,8 @@ from abstractgraph.hashing import hash_graph
 from abstractgraph_generative.edge_generator import (
     EdgeGenerator,
     _OnlineGraphRegressorAdapter,
+    fit_edge_ranker,
+    load_edge_ranker,
     remove_edges,
 )
 
@@ -136,6 +139,14 @@ class _NativePartialFitRiskEstimator:
         return np.asarray([0.5] * len(graphs), dtype=float)
 
 
+class _ConstantEdgeRanker:
+    def __init__(self, score: float):
+        self.score = score
+
+    def predict(self, candidates):
+        return np.full(len(candidates), self.score, dtype=float)
+
+
 def _labeled_edge_graph(node_labels: list[str]) -> nx.Graph:
     graph = nx.Graph()
     for idx, label in enumerate(node_labels):
@@ -163,6 +174,68 @@ def _reversed_directed_path() -> nx.DiGraph:
     graph.add_edge(1, 0, label="x")
     graph.add_edge(2, 1, label="y")
     return graph
+
+
+def test_fit_and_load_edge_ranker_persists_dataset_metadata(tmp_path) -> None:
+    ranker = fit_edge_ranker(
+        [nx.path_graph(3)],
+        dataset_name="zinc/250k",
+        output_dir=tmp_path,
+        seed=0,
+    )
+
+    artifact_path = tmp_path / "edge_ranker__zinc_250k.pkl"
+    assert artifact_path.exists()
+    with artifact_path.open("rb") as handle:
+        artifact = pickle.load(handle)
+    assert artifact["dataset_name"] == "zinc/250k"
+    assert artifact["artifact_version"] == 1
+    assert artifact["ranker"] is not None
+
+    loaded = load_edge_ranker("zinc/250k", directory=tmp_path)
+    assert type(loaded) is type(ranker)
+    assert loaded.predict([{
+        "partial_graph": nx.path_graph(2),
+        "edge": (0, 2),
+        "edge_attrs": {},
+    }]).shape == (1,)
+
+
+def test_load_edge_ranker_rejects_missing_artifact(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="No persisted edge ranker"):
+        load_edge_ranker("missing", directory=tmp_path)
+
+
+def test_persisted_edge_ranker_is_added_to_candidate_selection_score() -> None:
+    generator = EdgeGenerator(
+        feasibility_estimator=_RecordingFeasibilityEstimator("partial"),
+        graph_estimator=object(),
+        edge_ranker=_ConstantEdgeRanker(2.0),
+        edge_rank_lambda=0.5,
+    )
+    root = generator._make_state(nx.empty_graph(2), parent=None, score=0.0, depth=0)
+    candidate = generator._make_state(
+        nx.path_graph(2),
+        parent=root,
+        score=None,
+        added_edge=(0, 1),
+        depth=1,
+    )
+    generator._positive_scores = lambda graphs: np.asarray([1.0] * len(graphs))
+    generator._target_scores = lambda graphs, *, target: np.zeros(len(graphs))
+
+    scored = generator._score_generated_candidates(
+        [candidate],
+        n_edges=2,
+        max_total_edges=2,
+        target=None,
+        target_lambda=0.0,
+        fallback_index=0,
+    )
+
+    scored_candidate = scored["feasible_candidates"][0]
+    assert scored_candidate["edge_rank_score"] == pytest.approx(2.0)
+    assert scored_candidate["selection_score"] == pytest.approx(2.0)
 
 
 def test_unique_graphs_keeps_directed_edge_orientation_distinct() -> None:
