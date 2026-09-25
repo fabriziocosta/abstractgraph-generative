@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import networkx as nx
 import numpy as np
 import pytest
@@ -204,6 +206,47 @@ def test_constructor_accepts_single_generator_shorthand() -> None:
 
     assert generator.conditional_generator is conditional_generator
     assert generator.conditional_generators == [conditional_generator]
+
+
+@pytest.mark.parametrize("verbose", [0, 1, 2])
+def test_warning_verbosity_filters_expected_retry_messages(verbose: int) -> None:
+    generator = GraphGenerator(
+        edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+        conditional_generator=FakeConditionalGenerator(),
+        verbose=verbose,
+    )
+
+    def emit_warnings():
+        warnings.warn(
+            "generate requested n_samples=1 but produced 0 after 32 attempts "
+            "(budget=32).",
+            RuntimeWarning,
+        )
+        warnings.warn("An unrelated runtime issue", RuntimeWarning)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        generator._generate_with_warning_verbosity(emit_warnings)
+
+    messages = [str(warning.message) for warning in caught]
+    expected_message = (
+        "generate requested n_samples=1 but produced 0 after 32 attempts "
+        "(budget=32)."
+    )
+    if verbose == 0:
+        assert expected_message not in messages
+    else:
+        assert expected_message in messages
+    assert "An unrelated runtime issue" in messages
+
+
+def test_constructor_rejects_unknown_warning_verbosity() -> None:
+    with pytest.raises(ValueError, match="verbose must be 0"):
+        GraphGenerator(
+            edge_generator=FakeEdgeGenerator(nx.path_graph(2)),
+            conditional_generator=FakeConditionalGenerator(),
+            verbose=3,
+        )
 
 
 def test_constructor_accepts_conditional_generator_sequence() -> None:
@@ -535,6 +578,7 @@ def test_sample_rejects_same_top_interpretation_graph_by_default() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(),
         conditional_generator=FakeConditionalGenerator(),
+        verbose=1,
     ).store(base_graphs)
     seed_idx = 1
     generator.edge_generator.generated_graph = generator.stored_interpretation_graphs_[
@@ -560,6 +604,7 @@ def test_sample_uses_configured_same_interpretation_retry_limit() -> None:
     generator = GraphGenerator(
         edge_generator=FakeEdgeGenerator(),
         conditional_generator=FakeConditionalGenerator(),
+        verbose=1,
         max_same_interpretation_retries=1,
     ).store(base_graphs)
     seed_graph = generator.stored_interpretation_graphs_[1]

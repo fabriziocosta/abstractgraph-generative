@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 import warnings
 from collections.abc import Sequence
 from typing import Any
@@ -46,7 +47,18 @@ class GraphGenerator:
     edge generator operates on the final top interpretation level. Sampling
     creates a top-level target, then applies the conditional generators in
     reverse order until base graphs are produced.
+
+    ``verbose`` controls generation warnings: ``0`` hides expected retry and
+    empty-result diagnostics, ``1`` uses Python's normal warning behavior, and
+    ``2`` shows every occurrence. Other warnings remain visible at every level.
     """
+
+    _QUIET_WARNING_PREFIXES = (
+        "Edge stage generated the same interpretation graph as the sampled seed",
+        "generate requested n_samples=",
+        "ConditionalAutoregressiveGenerator.generate returned 0 samples",
+        "Conditional stage generated no graphs matching the generated target",
+    )
 
     def __init__(
         self,
@@ -57,12 +69,15 @@ class GraphGenerator:
         | None = None,
         seed: int | None = None,
         debug: bool = False,
+        verbose: int = 0,
         require_new_interpretation_graph: bool = True,
         max_same_interpretation_retries: int = 3,
     ):
         max_same_interpretation_retries = int(max_same_interpretation_retries)
         if max_same_interpretation_retries < 0:
             raise ValueError("max_same_interpretation_retries must be >= 0")
+        if isinstance(verbose, bool) or verbose not in (0, 1, 2):
+            raise ValueError("verbose must be 0 (quiet), 1 (normal), or 2 (all)")
 
         self.conditional_generators = self._normalize_conditional_generators(
             conditional_generator,
@@ -74,6 +89,7 @@ class GraphGenerator:
         self.conditional_generator = self.conditional_generators[0]
         self.seed = seed
         self.debug = bool(debug)
+        self.verbose = int(verbose)
         self.require_new_interpretation_graph = bool(require_new_interpretation_graph)
         self.max_same_interpretation_retries = max_same_interpretation_retries
         self._propagate_debug()
@@ -364,11 +380,9 @@ class GraphGenerator:
                 current_targets = generated_lower
 
             if failed_stage is not None:
-                warnings.warn(
+                self._warn_generation(
                     "Conditional stage generated no graphs matching the generated "
-                    f"target at stage {failed_stage}; skipping seed.",
-                    RuntimeWarning,
-                    stacklevel=2,
+                    f"target at stage {failed_stage}; skipping seed."
                 )
                 self._log_sample_progress(
                     event="seed_skip",
@@ -617,7 +631,8 @@ class GraphGenerator:
             avoidance_applied = True
 
         def generate_with_kwargs(kwargs: dict) -> list[nx.Graph]:
-            generated = generator.generate(
+            generated = self._generate_with_warning_verbosity(
+                generator.generate,
                 n_samples=n_samples,
                 interpretation_graphs=[target_graph],
                 **kwargs,
@@ -668,6 +683,27 @@ class GraphGenerator:
                     generator.debug_level = 0
             if hasattr(generator, "verbose"):
                 generator.verbose = self.debug
+
+    def _generate_with_warning_verbosity(self, generate, *args, **kwargs):
+        with warnings.catch_warnings():
+            if self.verbose == 0:
+                for prefix in self._QUIET_WARNING_PREFIXES:
+                    warnings.filterwarnings(
+                        "ignore",
+                        category=RuntimeWarning,
+                        message=re.escape(prefix),
+                    )
+            elif self.verbose == 2:
+                warnings.simplefilter("always", RuntimeWarning)
+            return generate(*args, **kwargs)
+
+    def _warn_generation(self, message: str, *, stacklevel: int = 2) -> None:
+        if self.verbose == 0 and message.startswith(self._QUIET_WARNING_PREFIXES):
+            return
+        with warnings.catch_warnings():
+            if self.verbose == 2:
+                warnings.simplefilter("always", RuntimeWarning)
+            warnings.warn(message, RuntimeWarning, stacklevel=stacklevel)
 
     def _require_stored_levels(self) -> list[list[nx.Graph]]:
         if self.stored_level_graphs_ is None:
@@ -988,7 +1024,8 @@ class GraphGenerator:
 
         while True:
             try:
-                generated_interpretation_graph = self.edge_generator.generate(
+                generated_interpretation_graph = self._generate_with_warning_verbosity(
+                    self.edge_generator.generate,
                     start_graph,
                     original_edge_count,
                     return_path=False,
@@ -1024,12 +1061,10 @@ class GraphGenerator:
                 return generated_interpretation_graph
 
             if same_graph_retries >= self.max_same_interpretation_retries:
-                warnings.warn(
+                self._warn_generation(
                     "Edge stage generated the same interpretation graph as the "
                     "sampled seed after "
-                    f"{same_graph_retries} retries; skipping seed.",
-                    RuntimeWarning,
-                    stacklevel=2,
+                    f"{same_graph_retries} retries; skipping seed."
                 )
                 return None
 
