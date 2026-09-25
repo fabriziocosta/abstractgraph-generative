@@ -381,7 +381,7 @@ class GraphGenerator:
 
             if failed_stage is not None:
                 self._warn_generation(
-                    "Conditional stage generated no graphs matching the generated "
+                    "\nConditional stage generated no graphs matching the generated "
                     f"target at stage {failed_stage}; skipping seed."
                 )
                 self._log_sample_progress(
@@ -1033,7 +1033,7 @@ class GraphGenerator:
                 )
             except Exception as exc:
                 warnings.warn(
-                    "Edge stage failed while generating an interpretation graph; "
+                    "\nEdge stage failed while generating an interpretation graph; "
                     f"skipping seed. Error: {exc}",
                     RuntimeWarning,
                     stacklevel=2,
@@ -1047,7 +1047,7 @@ class GraphGenerator:
                 )
             if generated_interpretation_graph is None:
                 warnings.warn(
-                    "Edge stage failed to generate an interpretation graph; skipping seed.",
+                    "\nEdge stage failed to generate an interpretation graph; skipping seed.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -1062,7 +1062,7 @@ class GraphGenerator:
 
             if same_graph_retries >= self.max_same_interpretation_retries:
                 self._warn_generation(
-                    "Edge stage generated the same interpretation graph as the "
+                    "\nEdge stage generated the same interpretation graph as the "
                     "sampled seed after "
                     f"{same_graph_retries} retries; skipping seed."
                 )

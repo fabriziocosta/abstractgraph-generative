@@ -2802,7 +2802,7 @@ class ConditionalAutoregressiveGenerator:
                 filtered_fraction = 0.0
             self._dbg(
                 1,
-                "generation_summary",
+                "\ngeneration_summary",
                 attempts=attempts,
                 constructed=constructed_candidates,
                 kept=kept,
@@ -2821,14 +2821,14 @@ class ConditionalAutoregressiveGenerator:
                 unseen_avg = float(unseen_signature_nodes_total) / float(unseen_signature_nodes_attempts)
                 self._dbg(
                     1,
-                    "generation_unseen_signatures",
+                    "\ngeneration_unseen_signatures",
                     attempts=unseen_signature_nodes_attempts,
                     avg_unseen_nodes=f"{unseen_avg:.2f}",
                     total_unseen_nodes=unseen_signature_nodes_total,
                 )
         if len(outputs) < n_samples:
             warnings.warn(
-                f"generate requested n_samples={n_samples} but produced {len(outputs)} "
+                f"\ngenerate requested n_samples={n_samples} but produced {len(outputs)} "
                 f"after {attempts} attempts (budget={max_total_attempts}).",
                 RuntimeWarning,
             )
@@ -2838,7 +2838,7 @@ class ConditionalAutoregressiveGenerator:
             self._zero_generation_streak += 1
             if self.base_cut_radius > 0 and self._zero_generation_streak >= 2:
                 warnings.warn(
-                    "ConditionalAutoregressiveGenerator.generate returned 0 samples "
+                    "\nConditionalAutoregressiveGenerator.generate returned 0 samples "
                     f"for {self._zero_generation_streak} consecutive calls with "
                     f"base_cut_radius={self.base_cut_radius}. This may be "
                     "over-constraining anchor matching. Consider base_cut_radius=0 "
