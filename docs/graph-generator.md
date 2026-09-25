@@ -95,6 +95,10 @@ Top-level controls remain scalar:
 - `edge_generate_kwargs`
 - `max_seed_attempts`
 
+`max_seed_attempts` defaults to `60`. Conditional generation defaults to
+`max_backtracks=10000` and `max_attempts_per_sample=16`; pass
+`conditional_generate_kwargs` only when a stage needs different limits.
+
 Conditional controls accept either one value for every stage or a sequence
 aligned with `conditional_generators`:
 

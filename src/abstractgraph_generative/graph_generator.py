@@ -215,7 +215,7 @@ class GraphGenerator:
         n_instances_per_sample: int = 1,
         interpretation_edge_removal_size: float = 0.5,
         random_state: int | None = None,
-        max_seed_attempts: int | None = None,
+        max_seed_attempts: int | None = 60,
         edge_generate_kwargs: dict | None = None,
         conditional_generate_kwargs: dict | Sequence[dict | None] | None = None,
         deduplicate_conditional_neighbors: bool | Sequence[bool] = True,
