@@ -16,10 +16,8 @@ For the semantic role of this repository, see [overview.md](overview.md).
   from the original module.
 - `graph_generator.py` coordinates two-stage interpretation-graph and
   conditional base-graph generation.
-- `interpolation_path.py` estimates paths through donor graph embeddings.
+- `interpolation_path.py` estimates paths through donor graph embeddings;
   `interpolation_generation.py` orchestrates interpolation-based generation.
-  The historical `interpolate.py` and `interpolation.py` imports remain
-  available as compatibility shims.
 - `rewrite.py` provides graph rewrite, cut-index, and virtual-rewrite
   operations. Shared anchor and component operations live in
   `_rewrite_components.py` and remain re-exported by `rewrite.py`.
