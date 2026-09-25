@@ -691,14 +691,18 @@ class GraphGenerator:
                     warnings.filterwarnings(
                         "ignore",
                         category=RuntimeWarning,
-                        message=re.escape(prefix),
+                        # warnings.filterwarnings matches from the start of the
+                        # message; allow leading newlines from multiline diagnostics.
+                        message=rf"\s*{re.escape(prefix)}",
                     )
             elif self.verbose == 2:
                 warnings.simplefilter("always", RuntimeWarning)
             return generate(*args, **kwargs)
 
     def _warn_generation(self, message: str, *, stacklevel: int = 2) -> None:
-        if self.verbose == 0 and message.startswith(self._QUIET_WARNING_PREFIXES):
+        if self.verbose == 0 and message.lstrip().startswith(
+            self._QUIET_WARNING_PREFIXES
+        ):
             return
         with warnings.catch_warnings():
             if self.verbose == 2:
