@@ -8,7 +8,6 @@ For the semantic role of this repository, see [overview.md](overview.md).
 ## Package Layout
 
 - `src/abstractgraph_generative/rewrite.py`
-- `src/abstractgraph_generative/autoregressive.py`
 - `src/abstractgraph_generative/conditional.py`
 - `src/abstractgraph_generative/conditional_batch.py`
 - `src/abstractgraph_generative/conditional_attributed.py`
@@ -23,7 +22,7 @@ For the semantic role of this repository, see [overview.md](overview.md).
 - [README.md](README.md)
 - [Overview](overview.md)
 - [Notebook Guide](notebooks.md)
-- [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md)
+- [Graph Rewrite](graph-rewrite.md)
 - [Conditional Autoregressive Generation](conditional-autoregressive-generation.md)
 - [Edge Generator](edge-generator.md)
 

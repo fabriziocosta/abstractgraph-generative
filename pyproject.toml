@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "abstractgraph-generative"
 version = "0.1.0"
-description = "Generative AbstractGraph models, rewrite/interpolation/autoregressive pipelines, and graph-generation tooling."
+description = "Edge-based, conditional autoregressive, and combined AbstractGraph generation, with supporting graph utilities."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

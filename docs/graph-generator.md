@@ -150,9 +150,9 @@ interpretation level.
 
 See:
 
-- `notebooks/examples/example_graph_generator_zinc.ipynb`
+- `notebooks/examples/hierarchical-graph-generator-zinc-generation.ipynb`
 
-The current notebook uses the backwards-compatible single conditional generator
-form. A hierarchical notebook should pass `conditional_generators=[...]` in
-bottom-up order and tune conditional parameters either as scalars or per-stage
-lists.
+The notebook passes two conditional stages in bottom-up order and shows how the
+edge generator creates the top-level target before GraphGenerator descends
+through those stages. Conditional parameters can be tuned either as scalars or
+per-stage lists.

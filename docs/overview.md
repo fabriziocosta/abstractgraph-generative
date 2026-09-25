@@ -57,7 +57,7 @@ See [Edge Generator](edge-generator.md).
 Rewrite and interpolation utilities provide constructive operations for moving
 through graph space while retaining interpretable edit structure.
 
-See [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md).
+See [Graph Rewrite](graph-rewrite.md).
 
 ## Extracted Workflows
 

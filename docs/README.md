@@ -10,7 +10,7 @@ This directory is the documentation root for `abstractgraph-generative`.
 
 ## Guides
 
-- [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.md)
+- [Graph Rewrite](graph-rewrite.md)
 - [Conditional Autoregressive Generation](conditional-autoregressive-generation.md)
 - [Edge Generator](edge-generator.md)
 - [Graph Generator](graph-generator.md)
@@ -20,8 +20,9 @@ This directory is the documentation root for `abstractgraph-generative`.
 This repo owns the graph-only generation layer built on top of
 `abstractgraph` and `abstractgraph-ml`, including:
 
-- autoregressive generation
+- edge-by-edge generation
 - conditional autoregressive generation
+- two-stage graph generation
 - interpolation and path-construction workflows
 - graph rewrite and repair utilities
 - graph optimization helpers
@@ -30,10 +31,8 @@ This repo owns the graph-only generation layer built on top of
 
 ## Module Map
 
-- `abstractgraph_generative.autoregressive`
-  Autoregressive generator over mapped-subgraph rewrites.
 - `abstractgraph_generative.rewrite`
-  Rewrite primitives and boundary-compatible replacements.
+  Supporting rewrite primitives used by interpolation and repair workflows.
 - `abstractgraph_generative.conditional`
   Conditional autoregressive generator.
 - `abstractgraph_generative.conditional_batch`

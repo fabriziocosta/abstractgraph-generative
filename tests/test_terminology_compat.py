@@ -7,7 +7,6 @@ import pytest
 
 from abstractgraph import node as node_operator
 from abstractgraph.graphs import AbstractGraph, graph_to_abstract_graph
-from abstractgraph_generative.autoregressive import generate_pruning_sequences
 from abstractgraph_generative.conditional import ConditionalAutoregressiveGenerator
 
 
@@ -368,28 +367,3 @@ def test_conditional_generator_sample_records_stored_seed_history(monkeypatch) -
     assert generator.last_sampled_indices_ == [2, 0]
     assert generator.last_neighbor_indices_history_ == [[1], [1]]
     assert [len(graphs) for graphs in generator.last_generation_training_graphs_history_] == [1, 1]
-
-
-def test_generate_pruning_sequences_supports_canonical_interpretation_aliases() -> None:
-    graph = nx.path_graph(3)
-    for node in graph.nodes:
-        graph.nodes[node]["label"] = str(node)
-
-    interpretation_graph = AbstractGraph(graph=graph)
-    interpretation_graph.create_interpretation_node_with_subgraph_from_nodes([0, 1])
-    fixed_interpretation_graph = interpretation_graph.interpretation_graph.copy()
-
-    outputs, interpretation_steps = generate_pruning_sequences(
-        graph,
-        min_nodes_for_pruning=1,
-        decomposition_function=node_operator(),
-        nbits=6,
-        association_aware=True,
-        fixed_interpretation_graph=fixed_interpretation_graph,
-        return_interpretation_steps=True,
-        include_start=True,
-        seed=0,
-    )
-    assert isinstance(outputs, list)
-    assert isinstance(interpretation_steps, list)
-    assert interpretation_steps

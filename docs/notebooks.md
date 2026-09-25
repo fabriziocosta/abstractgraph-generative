@@ -1,26 +1,27 @@
 # Notebooks
 
-The notebooks are examples and diagnostics for autoregressive, interpolation,
-optimization, and edge-generation workflows built on top of `abstractgraph` and
-`abstractgraph-ml`.
+The example folder keeps one notebook for each supported generation mode:
+edge-based generation, conditional autoregressive generation, and their
+hierarchical combination. Older, specialized, and overlapping examples are
+preserved in `notebooks/archive/`.
 
 ## Layout
 
 - `notebooks/examples/`
-  Supported generator workflows.
+  The three current generator examples.
 - `notebooks/research/`
   Exploratory generation notebooks.
+- `notebooks/archive/`
+  Older or specialized notebooks retained for reference.
 
 ## Highlighted Examples
 
-- `notebooks/examples/example_edge_generator_from_pair.ipynb`
-  Pair-conditioned edge generation from a stored retrieval corpus.
-- `notebooks/examples/example_edge_generator_repair.ipynb`
-  Retrieval-based graph repair by perturbing one stored graph and regrowing
-  from surgically repaired infeasible starts.
-- `notebooks/examples/example_graph_generator_zinc.ipynb`
-  Two-stage ZINC generation: edge generation over cycle/tree interpretation
-  graphs followed by conditional molecule instantiation.
+- `notebooks/examples/edge-generator-zinc-molecule-generation.ipynb`
+  Edge-by-edge generation from a partial molecule.
+- `notebooks/examples/conditional-autoregressive-local-zinc-generation.ipynb`
+  Conditional generation from a local neighborhood of stored ZINC molecules.
+- `notebooks/examples/hierarchical-graph-generator-zinc-generation.ipynb`
+  Hierarchical ZINC generation with one edge stage and two conditional stages.
 
 ## Bootstrap Behavior
 
