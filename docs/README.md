@@ -45,14 +45,18 @@ This repo owns the graph-only generation layer built on top of
 - `abstractgraph_generative.graph_generator`
   Two-stage generator that uses edge generation over interpretation graphs and
   conditional autoregressive generation over aligned base graphs.
-- `abstractgraph_generative.interpolate`
-  Interpolation estimator helpers.
-- `abstractgraph_generative.interpolation`
-  Interpolation generator.
-- `abstractgraph_generative.optimize`
-  Optimization helpers.
+- `abstractgraph_generative.interpolation_path`
+  Interpolation path estimation and rewrite helpers.
+- `abstractgraph_generative.interpolation_generation`
+  Interpolation generation orchestration.
 - `abstractgraph_generative.repair`
   Repair-style generation utilities.
+- `abstractgraph_generative.optimize`
+  Generator-set optimization.
+- `abstractgraph_generative.dataset_selection`
+  Shortest-path dataset selection in vector space.
+- `abstractgraph_generative.generative_performance`
+  Sampling, predictive scoring, and expected-gain performance utilities.
 
 ## Common Workflows
 

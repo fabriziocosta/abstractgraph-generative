@@ -367,3 +367,10 @@ def test_conditional_generator_sample_records_stored_seed_history(monkeypatch) -
     assert generator.last_sampled_indices_ == [2, 0]
     assert generator.last_neighbor_indices_history_ == [[1], [1]]
     assert [len(graphs) for graphs in generator.last_generation_training_graphs_history_] == [1, 1]
+
+
+def test_package_root_does_not_export_moved_story_or_vgae_features():
+    import abstractgraph_generative as generative
+
+    assert not hasattr(generative, "VGAENetworkXGenerator")
+    assert not hasattr(generative, "STORY_GRAPH_SCHEMA_VERSION")
