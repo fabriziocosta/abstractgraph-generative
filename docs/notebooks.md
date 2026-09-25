@@ -33,8 +33,10 @@ Notebooks use `notebooks/_bootstrap.py` to:
 
 ## Extracted Notebooks
 
-Text-oriented notebooks were extracted to the sibling `abstractgraph-text`
-repository.
+Some text-oriented notebooks were extracted to the separate
+`abstractgraph-text` project, which is not included as a submodule in this
+ecosystem checkout.
 
-Backend-generator notebooks were extracted to the sibling
-`abstractgraph-generative-backends` repository.
+Backend-generator notebooks were extracted to the separate
+`abstractgraph-generative-backends` project, which is also outside this
+checkout.

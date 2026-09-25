@@ -30,9 +30,9 @@ For the semantic role of this repository, see [overview.md](overview.md).
 ## Notebooks
 
 - `notebooks/examples/` contains the remaining core generative workflows.
-- Text-oriented notebooks now live in the sibling `abstractgraph-text` repository.
-- Backend-generator notebooks now live in the sibling
-  `abstractgraph-generative-backends` repository.
+- Some text-oriented and backend-generator notebooks were extracted to the
+  separate `abstractgraph-text` and `abstractgraph-generative-backends`
+  projects. Those projects are not submodules of this ecosystem checkout.
 - `notebooks/research/` contains exploratory generation notebooks.
 - Example and research notebooks bootstrap imports and normalize the working
   directory automatically for the standard ecosystem layout.

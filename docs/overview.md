@@ -61,11 +61,12 @@ See [Autoregressive Generator and Rewrite](autoregressive-generator-and-rewrite.
 
 ## Extracted Workflows
 
-Text and story-graph workflows were extracted into the sibling repo
-`abstractgraph-text`.
+Some text and story-graph workflows were extracted into the separate project
+`abstractgraph-text`, which is not included as a submodule in this ecosystem
+checkout.
 
-Backend-specific generators were extracted into the sibling repo
-`abstractgraph-generative-backends`.
+Backend-specific generators were extracted into the separate project
+`abstractgraph-generative-backends`, also outside this checkout.
 
 ## Ecosystem
 
