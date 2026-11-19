@@ -483,8 +483,9 @@ fit_edge_ranker(
 )
 ```
 
-This creates `edge_rankers/edge_ranker__zinc250k.pkl`. Load and use it in later
-independent generation runs:
+This creates `edge_rankers/edge_ranker__zinc250k.pkl`. The generated model is a
+local artifact and is excluded from Git; keep or regenerate it in the same
+checkout before loading it in later independent generation runs:
 
 ```python
 generator = EdgeGenerator(
