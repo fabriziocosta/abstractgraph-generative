@@ -11,8 +11,8 @@ and repair graphs.
 
 ## Zenodo
 
-Version 0.1.0: [10.5281/zenodo.24367181](https://doi.org/10.5281/zenodo.24367181)  
-All versions: [10.5281/zenodo.24367180](https://doi.org/10.5281/zenodo.24367180)
+[![Version DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24367181.svg)](https://doi.org/10.5281/zenodo.24367181)
+[![All versions DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24367180.svg)](https://doi.org/10.5281/zenodo.24367180)
 
 Documentation lives in [docs/](docs/):
 
