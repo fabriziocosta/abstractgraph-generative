@@ -1,3 +1,5 @@
+[![All versions DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24367180.svg)](https://doi.org/10.5281/zenodo.24367180)
+
 <p align="center">
   <img src="docs/assets/AG_Logo.png" alt="AbstractGraph logo" width="220">
 </p>
@@ -8,11 +10,6 @@
 ecosystem. It uses graph semantics from `abstractgraph` and optional learned
 signals from `abstractgraph-ml` to rewrite, generate, interpolate, optimize,
 and repair graphs.
-
-## Zenodo
-
-[![Version DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24367181.svg)](https://doi.org/10.5281/zenodo.24367181)
-[![All versions DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24367180.svg)](https://doi.org/10.5281/zenodo.24367180)
 
 Documentation lives in [docs/](docs/):
 
