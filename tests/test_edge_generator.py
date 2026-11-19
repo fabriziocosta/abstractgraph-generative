@@ -201,6 +201,18 @@ def test_fit_and_load_edge_ranker_persists_dataset_metadata(tmp_path) -> None:
     }]).shape == (1,)
 
 
+
+def test_constructor_requires_role_specific_feasibility_estimators() -> None:
+    with pytest.raises(ValueError, match="both partial_feasibility_estimator"):
+        EdgeGenerator(graph_estimator=object())
+    with pytest.raises(TypeError):
+        EdgeGenerator(
+            feasibility_estimator=object(),
+            graph_estimator=object(),
+            partial_feasibility_estimator=object(),
+            final_feasibility_estimator=object(),
+        )
+
 def test_load_edge_ranker_rejects_missing_artifact(tmp_path) -> None:
     with pytest.raises(FileNotFoundError, match="No persisted edge ranker"):
         load_edge_ranker("missing", directory=tmp_path)
@@ -208,7 +220,8 @@ def test_load_edge_ranker_rejects_missing_artifact(tmp_path) -> None:
 
 def test_persisted_edge_ranker_is_added_to_candidate_selection_score() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=_RecordingFeasibilityEstimator("partial"),
+        partial_feasibility_estimator=_RecordingFeasibilityEstimator("partial"),
+        final_feasibility_estimator=_RecordingFeasibilityEstimator("partial"),
         graph_estimator=object(),
         edge_ranker=_ConstantEdgeRanker(2.0),
         edge_rank_lambda=0.5,
@@ -239,11 +252,13 @@ def test_persisted_edge_ranker_is_added_to_candidate_selection_score() -> None:
 
 
 def test_allow_infeasible_fallback_defaults_to_true() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     assert generator.allow_infeasible_fallback is True
 
     disabled = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         allow_infeasible_fallback=False,
     )
@@ -337,7 +352,8 @@ def test_infeasible_fallback_can_be_disabled() -> None:
 
 
 def test_unique_graphs_keeps_directed_edge_orientation_distinct() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     graph = _directed_path()
     reversed_graph = _reversed_directed_path()
 
@@ -352,7 +368,8 @@ def test_unique_graphs_keeps_directed_edge_orientation_distinct() -> None:
 
 
 def test_unique_graphs_keeps_node_labels_distinct() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     graph = _labeled_edge_graph(["C", "O"])
     relabeled_graph = _labeled_edge_graph(["C", "N"])
 
@@ -366,7 +383,8 @@ def test_unique_graphs_keeps_node_labels_distinct() -> None:
 
 
 def test_unique_graphs_is_node_id_permutation_invariant() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     graph = _directed_path()
     relabeled_graph = nx.relabel_nodes(graph, {0: "z", 1: "x", 2: "y"}, copy=True)
 
@@ -377,7 +395,8 @@ def test_unique_graphs_is_node_id_permutation_invariant() -> None:
 
 def test_store_keeps_reversed_directed_graphs_as_distinct_retrieval_entries() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=_GraphEstimatorWithTransformer(),
     )
 
@@ -387,7 +406,8 @@ def test_store_keeps_reversed_directed_graphs_as_distinct_retrieval_entries() ->
 
 
 def test_augment_indices_with_nearest_neighbors_adds_k_per_seed_without_duplicates() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     distance_matrix = np.asarray(
         [
             [0.0, 1.0, 2.0, 3.0, 4.0],
@@ -408,7 +428,8 @@ def test_augment_indices_with_nearest_neighbors_adds_k_per_seed_without_duplicat
 
 
 def test_augment_indices_with_nearest_neighbors_can_be_disabled() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     distance_matrix = np.asarray([[0.0, 1.0], [1.0, 0.0]])
 
     selected = generator._augment_indices_with_nearest_neighbors(
@@ -421,14 +442,16 @@ def test_augment_indices_with_nearest_neighbors_can_be_disabled() -> None:
 
 
 def test_augment_indices_with_nearest_neighbors_rejects_negative_k() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
 
     with pytest.raises(ValueError, match="n_neighbors_per_path_graph must be >= 0"):
         generator._augment_indices_with_nearest_neighbors(np.zeros((1, 1)), [0], k=-1)
 
 
 def test_path_matrix_from_distance_matrix_uses_sparse_mst_knn_graph() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     distance_matrix = np.asarray(
         [
             [0.0, 1.0, 2.0, 3.0],
@@ -447,7 +470,8 @@ def test_path_matrix_from_distance_matrix_uses_sparse_mst_knn_graph() -> None:
 
 
 def test_select_edges_for_surgical_repair_prioritizes_repeated_violations() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     graph = nx.path_graph(4)
     state = generator._make_state(
         graph,
@@ -480,7 +504,8 @@ def test_select_edges_for_surgical_repair_prioritizes_repeated_violations() -> N
 
 
 def test_make_repaired_state_removes_selected_edges_and_updates_depth() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     graph = nx.path_graph(4)
     state = generator._make_state(
         graph,
@@ -586,7 +611,8 @@ def test_build_repair_start_states_removes_one_random_edge_when_final_violations
 
 
 def test_select_edges_for_surgical_repair_requires_violation_evidence() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     graph = nx.path_graph(4)
     state = generator._make_state(
         graph,
@@ -611,7 +637,6 @@ def test_fit_uses_partial_and_final_feasibility_estimators_on_different_graph_se
     final_estimator = _RecordingFeasibilityEstimator("final")
     graph_estimator = _RecordingGraphEstimator()
     generator = EdgeGenerator(
-        feasibility_estimator=partial_estimator,
         partial_feasibility_estimator=partial_estimator,
         final_feasibility_estimator=final_estimator,
         graph_estimator=graph_estimator,
@@ -682,7 +707,8 @@ def test_fit_disables_lookahead_when_final_estimator_has_no_violation_counts() -
 
 def test_constructor_validates_lookahead_rejection_options() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
     )
     assert generator.lookahead_rejection_model == "lognormal_tail"
@@ -691,19 +717,22 @@ def test_constructor_validates_lookahead_rejection_options() -> None:
 
     with pytest.raises(ValueError, match="lookahead_rejection_model"):
         EdgeGenerator(
-            feasibility_estimator=object(),
+            partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
             graph_estimator=object(),
             lookahead_rejection_model="bad",
         )
     with pytest.raises(ValueError, match="lookahead_rejection_quantile"):
         EdgeGenerator(
-            feasibility_estimator=object(),
+            partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
             graph_estimator=object(),
             lookahead_rejection_quantile=1.0,
         )
     with pytest.raises(ValueError, match="lookahead_rejection_temperature"):
         EdgeGenerator(
-            feasibility_estimator=object(),
+            partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
             graph_estimator=object(),
             lookahead_rejection_temperature=0.0,
         )
@@ -1144,7 +1173,8 @@ def test_repair_keeps_valid_lookahead_envelope_after_local_fit(monkeypatch) -> N
 
 def test_prepare_repair_training_context_prioritizes_neighbor_label_set_coverage() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
     )
     query = _labeled_edge_graph(["A", "B"])
@@ -1179,7 +1209,8 @@ def test_prepare_repair_training_context_prioritizes_neighbor_label_set_coverage
 
 def test_prepare_repair_training_context_can_cover_query_labels_across_neighbors() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
     )
     query = _labeled_edge_graph(["A", "B"])
@@ -1206,7 +1237,8 @@ def test_prepare_repair_training_context_can_cover_query_labels_across_neighbors
 
 def test_prepare_repair_training_context_can_skip_label_compatible_filter() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         enforce_repair_label_set_coverage=False,
     )
@@ -1232,7 +1264,8 @@ def test_prepare_repair_training_context_can_skip_label_compatible_filter() -> N
 
 def test_log_search_step_reports_backtrack_when_no_feasible_candidates_remain(capsys) -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         edge_risk_estimator=_RecordingRiskEstimator(),
         edge_risk_lambda=0.25,
@@ -1265,7 +1298,8 @@ def test_log_search_step_reports_backtrack_when_no_feasible_candidates_remain(ca
 
 def test_log_search_step_reports_failed_when_no_fallback_phases_remain(capsys) -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         edge_risk_estimator=_RecordingRiskEstimator(),
         edge_risk_lambda=0.25,
@@ -1298,7 +1332,8 @@ def test_log_search_step_reports_failed_when_no_fallback_phases_remain(capsys) -
 
 def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
     )
     generator.n_tried_ = 594
@@ -1349,14 +1384,16 @@ def test_log_search_step_reports_feasibility_partition_counts(capsys) -> None:
 
 
 def test_generate_from_pair_none_none_requires_cached_session() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
 
     with pytest.raises(ValueError, match="No cached pair session is available"):
         generator.generate_from_pair(None, None)
 
 
 def test_generate_from_cached_pair_session_reuses_cached_graphs_and_target(monkeypatch) -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object(), seed=0)
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object(), seed=0)
     graph_a = nx.path_graph(3)
     graph_b = nx.path_graph(4)
     generator._cache_pair_session(
@@ -1416,7 +1453,8 @@ def test_generate_from_cached_pair_session_reuses_cached_graphs_and_target(monke
 
 def test_infer_pair_target_returns_mean_in_regression_mode() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         target_estimator_mode="regression",
     )
@@ -1426,7 +1464,8 @@ def test_infer_pair_target_returns_mean_in_regression_mode() -> None:
 
 def test_infer_pair_target_samples_endpoint_target_in_classification_mode() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         target_estimator_mode="classification",
         seed=0,
@@ -1437,7 +1476,8 @@ def test_infer_pair_target_samples_endpoint_target_in_classification_mode() -> N
 
 
 def test_log_repair_training_context_draws_query_and_neighbors_on_separate_rows() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     draw_calls = []
 
     def fake_draw(graphs, **kwargs):
@@ -1468,7 +1508,8 @@ def test_log_repair_training_context_draws_query_and_neighbors_on_separate_rows(
 
 
 def test_draw_graphs_retries_with_titles_when_layout_kwargs_are_rejected() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     draw_calls = []
 
     def fake_draw(graphs, **kwargs):
@@ -1506,7 +1547,8 @@ class _EstimatorWithDirectClasses:
 
 
 def test_class_probability_supports_estimators_exposing_classes_directly() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
 
     probs = generator._class_probability(
         _EstimatorWithDirectClasses(),
@@ -1550,7 +1592,8 @@ def test_online_graph_regressor_adapter_uses_native_partial_fit_when_available()
 
 def test_rollback_search_without_repair_logs_edge_risk_training_set_size(capsys) -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         edge_risk_estimator=_RecordingRiskEstimator(),
         edge_risk_lambda=0.25,
@@ -1585,7 +1628,8 @@ def test_rollback_search_without_repair_logs_edge_risk_training_set_size(capsys)
 
 
 def test_make_edge_risk_graph_pair_is_disjoint_and_preserves_attributes() -> None:
-    generator = EdgeGenerator(feasibility_estimator=object(), graph_estimator=object())
+    generator = EdgeGenerator(partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(), graph_estimator=object())
     parent = nx.Graph()
     parent.add_node(0, role="parent")
     parent.add_node(1, role="parent")
@@ -1605,7 +1649,8 @@ def test_make_edge_risk_graph_pair_is_disjoint_and_preserves_attributes() -> Non
 def test_close_edge_risk_training_states_uses_infeasible_descendant_ratio() -> None:
     risk_estimator = _RecordingRiskEstimator()
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         edge_risk_estimator=risk_estimator,
     )
@@ -1629,7 +1674,8 @@ def test_close_edge_risk_training_states_uses_infeasible_descendant_ratio() -> N
 def test_trace_failure_ratio_counts_completion_and_blocked_failures() -> None:
     risk_estimator = _RecordingRiskEstimator()
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         edge_risk_estimator=risk_estimator,
     )
@@ -1700,7 +1746,6 @@ def test_partition_candidates_keeps_partial_feasible_non_terminal_candidates() -
             return np.ones(len(graphs), dtype=bool)
 
     generator = EdgeGenerator(
-        feasibility_estimator=_AlwaysFeasibleEstimator(),
         partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
         final_feasibility_estimator=_AlwaysFeasibleEstimator(),
         graph_estimator=object(),
@@ -2101,7 +2146,8 @@ def test_rank_feasible_candidates_prioritizes_one_step_final_completion() -> Non
 
 def test_retain_unseen_candidates_allows_final_feasible_diversity_hit() -> None:
     generator = EdgeGenerator(
-        feasibility_estimator=object(),
+        partial_feasibility_estimator=object(),
+        final_feasibility_estimator=object(),
         graph_estimator=object(),
         enforce_diversity=True,
     )
@@ -2128,7 +2174,6 @@ def test_partition_candidates_by_feasibility_applies_edge_risk_penalty() -> None
             return np.ones(len(graphs), dtype=bool)
 
     generator = EdgeGenerator(
-        feasibility_estimator=_AlwaysFeasibleEstimator(),
         partial_feasibility_estimator=_AlwaysFeasibleEstimator(),
         final_feasibility_estimator=_AlwaysFeasibleEstimator(),
         graph_estimator=object(),

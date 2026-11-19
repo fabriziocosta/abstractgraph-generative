@@ -1,18 +1,12 @@
 # Notebooks
 
-The example folder keeps one notebook for each supported generation mode:
-edge-based generation, conditional autoregressive generation, and their
-hierarchical combination. Older, specialized, and overlapping examples are
-preserved in `notebooks/archive/`.
+The examples folder keeps maintained notebooks for edge-based generation,
+conditional autoregressive generation, and their hierarchical combination.
 
 ## Layout
 
 - `notebooks/examples/`
   The three current generator examples.
-- `notebooks/research/`
-  Exploratory generation notebooks.
-- `notebooks/archive/`
-  Older or specialized notebooks retained for reference.
 
 ## Highlighted Examples
 

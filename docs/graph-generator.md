@@ -74,8 +74,8 @@ Stored attributes:
 
 - `stored_level_graphs_[0]`: base graphs.
 - `stored_level_graphs_[i + 1]`: interpretation graphs computed by stage `i`.
-- `stored_graphs_`: compatibility alias for level `0`.
-- `stored_interpretation_graphs_`: compatibility alias for the top level.
+- `stored_graphs_`: convenience attribute containing the base graph corpus.
+- `stored_interpretation_graphs_`: convenience attribute containing the final interpretation graphs.
 - `stored_targets_`: optional targets forwarded to top edge fitting.
 
 The top retrieval index is owned by `edge_generator.store(top_level_graphs,

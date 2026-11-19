@@ -27,7 +27,6 @@ For the semantic role of this repository, see [overview.md](overview.md).
   vector space.
 - `generative_performance.py` contains sampling, scoring, and expected-gain
   performance evaluation utilities.
-- `backends/` contains backend-specific support retained in this package.
 
 ## Documentation
 
@@ -41,14 +40,11 @@ For the semantic role of this repository, see [overview.md](overview.md).
 
 ## Notebooks
 
-- `notebooks/examples/` contains maintained generation workflows.
-- `notebooks/archive/` and `notebooks/research/` retain historical and
-  exploratory workflows, including interpolation, repair, optimization, and
-  performance examples.
+- `notebooks/examples/` contains maintained end-to-end generation workflows.
 - Some text-oriented and backend-generator notebooks were extracted to the
   separate `abstractgraph-text` and `abstractgraph-generative-backends`
   projects. Those projects are not submodules of this ecosystem checkout.
-- Example and research notebooks bootstrap imports and normalize the working
+- Example notebooks bootstrap imports and normalize the working
   directory automatically for the standard ecosystem layout.
 
 ## Install

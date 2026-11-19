@@ -63,7 +63,6 @@ class EdgeGenerator:
 
     def __init__(
         self,
-        feasibility_estimator=None,
         graph_estimator=None,
         target_estimator=None,
         edge_risk_estimator=None,
@@ -107,9 +106,6 @@ class EdgeGenerator:
 
         Parameters
         ----------
-        feasibility_estimator : object, optional
-            Backward-compatible estimator used for both partial and final
-            feasibility if separate estimators are not provided.
         graph_estimator : object
             Estimator scoring which partially built graphs look most promising
             during beam search.
@@ -218,14 +214,11 @@ class EdgeGenerator:
             self.partial_feasibility_estimator,
             self.final_feasibility_estimator,
         ) = self._resolve_feasibility_estimators(
-            feasibility_estimator=feasibility_estimator,
             partial_feasibility_estimator=partial_feasibility_estimator,
             final_feasibility_estimator=final_feasibility_estimator,
         )
         if graph_estimator is None:
             raise ValueError("graph_estimator is required")
-        # Backward-compatible alias for code that still expects one search-time estimator.
-        self.feasibility_estimator = self.partial_feasibility_estimator
         self.graph_estimator = graph_estimator
         self.target_estimator = target_estimator
         self.edge_risk_estimator = edge_risk_estimator
@@ -333,24 +326,15 @@ class EdgeGenerator:
     def _resolve_feasibility_estimators(
         self,
         *,
-        feasibility_estimator,
         partial_feasibility_estimator,
         final_feasibility_estimator,
     ):
-        resolved_partial = (
-            partial_feasibility_estimator
-            if partial_feasibility_estimator is not None
-            else feasibility_estimator
-        )
-        resolved_final = (
-            final_feasibility_estimator
-            if final_feasibility_estimator is not None
-            else feasibility_estimator
-        )
+        resolved_partial = partial_feasibility_estimator
+        resolved_final = final_feasibility_estimator
         if resolved_partial is None or resolved_final is None:
             raise ValueError(
-                "Provide feasibility_estimator or both partial_feasibility_estimator "
-                "and final_feasibility_estimator"
+                "Provide both partial_feasibility_estimator and "
+                "final_feasibility_estimator"
             )
         if resolved_partial is resolved_final:
             resolved_final = copy.deepcopy(resolved_final)

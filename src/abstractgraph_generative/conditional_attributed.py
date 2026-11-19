@@ -87,7 +87,7 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
                 union of anchor-centered neighborhoods.
             num_context_rewirings: Number of legal rewiring branches to score
                 before sampling a preferred branch.
-            n_jobs: Reserved for API compatibility.
+            n_jobs: Maximum parallel workers during generation.
             debug: If True, print generation diagnostics.
             debug_level: Debug verbosity level.
 
@@ -110,12 +110,11 @@ class AttributedConditionalAutoregressiveGenerator(ConditionalAutoregressiveGene
         self._component_context_embeddings: dict[int, object] = {}
         self._full_graph_context_embeddings: dict[int, object] = {}
 
-    def fit(self, graphs: Sequence[nx.Graph], **_) -> "AttributedConditionalAutoregressiveGenerator":
+    def fit(self, graphs: Sequence[nx.Graph]) -> "AttributedConditionalAutoregressiveGenerator":
         """Fit components and cache per-component context embeddings.
 
         Args:
             graphs: Training base graphs.
-            **_: Ignored compatibility kwargs from previous versions.
 
         Returns:
             AttributedConditionalAutoregressiveGenerator: Self.

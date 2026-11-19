@@ -37,6 +37,7 @@ from sklearn.linear_model import SGDRegressor
 from abstractgraph.vectorize import AbstractGraphTransformer
 from abstractgraph_ml.estimators import GraphEstimator
 from abstractgraph_generative.edge_generator import EdgeGenerator
+from abstractgraph_ml.feasibility import ConcreteFeasibilityEstimator
 
 transformer = AbstractGraphTransformer(
     nbits=14,
@@ -44,6 +45,9 @@ transformer = AbstractGraphTransformer(
     return_dense=True,
     n_jobs=-1,
 )
+
+partial_feasibility_estimator = ConcreteFeasibilityEstimator()
+final_feasibility_estimator = ConcreteFeasibilityEstimator()
 
 graph_estimator = GraphEstimator(
     transformer=transformer,
@@ -79,7 +83,8 @@ edge_risk_estimator = GraphEstimator(
 fit_targets = [max(dict(graph.degree()).values(), default=0) for graph in fit_graphs]
 
 generator = EdgeGenerator(
-    feasibility_estimator=feasibility_estimator,
+    partial_feasibility_estimator=partial_feasibility_estimator,
+    final_feasibility_estimator=final_feasibility_estimator,
     graph_estimator=graph_estimator,
     target_estimator=target_estimator,
     edge_risk_estimator=edge_risk_estimator,
@@ -224,12 +229,8 @@ For example, an intermediate graph may temporarily contain aromatic bonds that
 do not yet form a full aromatic cycle, while the final graph must satisfy that
 constraint.
 
-Backward compatibility:
-
-- if you pass only `feasibility_estimator=...`, the generator uses it as the
-  partial estimator and deep-copies it for the final estimator
-- lookahead pruning is disabled automatically if the final estimator does not
-  implement `number_of_violations(graphs)`
+Lookahead pruning is disabled automatically if the final estimator does not
+implement `number_of_violations(graphs)`.
 
 Training behavior:
 

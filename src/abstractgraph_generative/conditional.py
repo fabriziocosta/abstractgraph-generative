@@ -278,7 +278,7 @@ class ConditionalAutoregressiveGenerator:
             context_vectorizer: Optional graph vectorizer used for context scoring.
             base_context_radius: Radius of the anchor-context neighborhood union.
                 If None, embed the full base graph instead.
-            n_jobs: Reserved for API compatibility.
+            n_jobs: Maximum parallel workers during generation.
             debug: If True, print generation diagnostics.
             debug_level: Debug verbosity level.
                 - 0: disabled
@@ -1127,12 +1127,11 @@ class ConditionalAutoregressiveGenerator:
         self._dbg(1, "coverage_failed", rejected=rejected)
         return []
 
-    def fit(self, graphs: Sequence[nx.Graph], **_) -> "ConditionalAutoregressiveGenerator":
+    def fit(self, graphs: Sequence[nx.Graph]) -> "ConditionalAutoregressiveGenerator":
         """Fit components and retrieval indexes from training graphs.
 
         Args:
             graphs: Training base graphs.
-            **_: Ignored compatibility kwargs from previous versions.
 
         Returns:
             ConditionalAutoregressiveGenerator: Self.
